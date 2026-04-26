@@ -1,0 +1,15 @@
+node_modules/
+runs/
+.env
+.env.*.local
+*.log
+.DS_Store
+dist/
+coverage/
+.vitest/
+.idea/
+.claude/
+.context-guardian/
+.plans/
+.serena/
+docs/

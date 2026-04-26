@@ -1,0 +1,237 @@
+/**
+ * spawn-agent-v2: launches a single agent's exploration session against
+ * v2's direct-API loop.
+ *
+ * Differences vs v1's spawn-agent.ts:
+ *
+ *   - Direct Anthropic SDK only — no Claude Code subprocess path. Subscription
+ *     auth (`claude` CLI) is unsupported because the v2 loop manages messages
+ *     end-to-end. Spawn fails fast if no API key is available.
+ *   - No engagement gate — playbooks bundle the multi-action flows so we no
+ *     longer need a per-route action-counter to keep agents engaged. See
+ *     spec §8.4.
+ *   - Receives a shared `SiteMapAccessor` from the orchestrator. The loop's
+ *     per-turn user message renders snapshots from this accessor and the
+ *     browser-server v2's playbook handlers record outcomes through it.
+ *   - No chunked compaction — runs one continuous conversation per agent.
+ */
+
+import { acquireSession } from '../auth/session-pool.ts';
+import type { AuthConfig } from '../config/types.ts';
+import type { SiteMapAccessor } from '../crawler/types.ts';
+import { persistJourney } from '../findings/persist.ts';
+import type { Logger } from '../logging/logger.ts';
+import { buildDefaultRegistry } from '../playbooks/index.ts';
+import { BROWSER_TOOL_NAMES_V2, createBrowserMcpServerV2 } from '../tools/browser-server-v2.ts';
+import { createHarnessMcpServer } from '../tools/findings-server.ts';
+import type { ResolvedAgent } from '../types/agent.ts';
+import type { Journey } from '../types/journey.ts';
+import { runAgentLoopV2 } from './loop-v2.ts';
+import { registerAgent, setStatus, updateOnAction } from './registry.ts';
+import { SummaryMemory } from './summary-memory.ts';
+
+export interface SpawnAgentV2Input {
+  runId: string;
+  runDir: string;
+  targetUrl: string;
+  allowedHosts: string[];
+  auth: AuthConfig;
+  agent: ResolvedAgent;
+  /** Anthropic API key — REQUIRED for v2. Subscription auth is not supported
+   * on the direct-API loop because we manage messages ourselves. */
+  apiKey: string;
+  /** Shared sitemap accessor. Built by run-v2 before any agent spawns. */
+  siteMap: SiteMapAccessor;
+  logger: Logger;
+  /** External abort signal — forwarded so Ctrl-C / SIGTERM cancels in-flight
+   * SDK calls and tool handlers. */
+  abortSignal?: AbortSignal;
+}
+
+export interface SpawnAgentV2Result {
+  journey: Journey;
+}
+
+/** The exact tool names the agent's allowlist will see — v2 browser primitives
+ *  + harness tools. Playbook tool names are dynamic per-registry and not in
+ *  this list; the loop accepts them via the rawTools bridge. */
+export const ALLOWED_TOOL_NAMES_V2: readonly string[] = [
+  'mcp__harness__report_finding',
+  'mcp__harness__end_session',
+  ...BROWSER_TOOL_NAMES_V2,
+];
+
+/**
+ * Acquire a tab on the shared session, build the in-process tool stack, and
+ * run the v2 agent loop. Persists the resulting journey before returning.
+ */
+export async function spawnAgentV2(input: SpawnAgentV2Input): Promise<SpawnAgentV2Result> {
+  const { runId, runDir, targetUrl, allowedHosts, auth, agent, apiKey, logger, abortSignal } =
+    input;
+  const { budget } = agent;
+
+  const childLogger = logger.child({ agentId: agent.id });
+  registerAgent(agent.id, agent.profileName);
+
+  // 1. Initial journey state.
+  const journey: Journey = {
+    runId,
+    agentId: agent.id,
+    startedAt: new Date().toISOString(),
+    startUrl: targetUrl,
+    turns: 0,
+    findings: [],
+    tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    costUsd: 0,
+    terminationReason: undefined,
+  };
+
+  // 2. Acquire an authenticated tab. Multiple agents in the same credential
+  // group share a single browser process — saves the 5-8s login on every
+  // additional agent in that group.
+  let livePage: Awaited<ReturnType<typeof acquireSession>>['page'] | null = null;
+  let releaseSession: (() => Promise<void>) | null = null;
+  try {
+    const acquired = await acquireSession({
+      targetUrl,
+      auth,
+      allowedHosts,
+      credentials: agent.credentials,
+      runDir,
+      agentId: agent.id,
+      logger: childLogger,
+    });
+    livePage = acquired.page;
+    releaseSession = acquired.release;
+  } catch (err) {
+    childLogger.error('login.failed', {
+      agentId: agent.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    journey.terminationReason = 'error';
+    journey.endedAt = new Date().toISOString();
+    await persistJourney(runDir, journey);
+    return { journey };
+  }
+
+  // 3. In-process MCP servers — harness (findings) + browser-v2 (PageModel +
+  // playbooks). The browser-v2 server hosts the playbook registry as MCP
+  // tools and records outcomes back into the shared SiteMap.
+  const playbookRegistry = buildDefaultRegistry();
+  const harnessKit = createHarnessMcpServer({
+    journey,
+    logger: childLogger,
+    getPage: () => {
+      if (!livePage) throw new Error('Browser page is no longer available');
+      return livePage;
+    },
+    runDir,
+  });
+  const browserKit = createBrowserMcpServerV2({
+    getPage: () => {
+      if (!livePage) throw new Error('Browser page is no longer available');
+      return livePage;
+    },
+    logger: childLogger,
+    agentId: agent.id,
+    persona: agent.personality,
+    runDir,
+    siteMap: input.siteMap,
+    playbookRegistry,
+    onAction: (patch) => updateOnAction(agent.id, patch),
+  });
+
+  // 4. AbortController — combines the per-agent wall-clock timeout with the
+  // external signal forwarded from run-v2.
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), budget.max_minutes * 60_000);
+  const onExternalAbort = () => abortController.abort();
+  abortSignal?.addEventListener('abort', onExternalAbort, { once: true });
+
+  // 5. System prompt — persona-driven, time-saturating. The v2 prompt is
+  // shorter than v1's because we no longer need the engagement-gate caveat
+  // or the chunked-loop framing. Playbooks are a tool category; the agent
+  // picks them like any other tool.
+  const systemPrompt = buildSystemPrompt({ targetUrl, agent });
+
+  // 6. Per-agent summary memory — the loop pushes one entry per playbook
+  // invocation so older turns can be elided without losing the "what have
+  // I tried" context.
+  const summaryMemory = new SummaryMemory();
+
+  try {
+    childLogger.info('agent.loop.mode', { mode: 'direct-api-v2' });
+    await runAgentLoopV2({
+      agent,
+      targetUrl,
+      systemPrompt,
+      apiKey,
+      rawTools: [...harnessKit.rawTools, ...browserKit.rawTools],
+      journey,
+      abortSignal: abortController.signal,
+      logger: childLogger,
+      siteMap: input.siteMap,
+      summaryMemory,
+    });
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      journey.terminationReason = abortSignal?.aborted ? 'signal' : 'timeout';
+    } else {
+      journey.terminationReason = 'error';
+      childLogger.error('agent.error', {
+        agentId: agent.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } finally {
+    clearTimeout(timeoutHandle);
+    abortSignal?.removeEventListener('abort', onExternalAbort);
+    if (releaseSession) {
+      await releaseSession().catch((closeErr) => {
+        childLogger.warn('session.release.failed', {
+          error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+        });
+      });
+    }
+    journey.endedAt ??= new Date().toISOString();
+    journey.terminationReason ??= 'max-turns';
+    setStatus(agent.id, journey.terminationReason === 'error' ? 'errored' : 'finished');
+    await persistJourney(runDir, journey);
+  }
+
+  return { journey };
+}
+
+/** Build the system prompt for v2. Consciously shorter than v1 because the
+ *  playbook layer absorbs most of the "what to do" guidance. */
+function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): string {
+  const { targetUrl, agent } = args;
+  return [
+    `You are NOT a QA agent. You are a real human user of ${targetUrl} — your character is described at the bottom of this prompt and you BEHAVE like that person.`,
+    '',
+    `OUTPUT FORMAT — emit TOOL CALLS ONLY. Zero prose. Zero narration. Every word of prose you generate is wasted latency. The ONLY exceptions: report_finding arguments and end_session detail.`,
+    '',
+    `You have ${agent.budget.max_minutes} minutes (and ${agent.budget.max_turns} turns). Use ALL of it. When you finish one thing, immediately start a different one.`,
+    '',
+    `Your browser is already open and authenticated. The orchestrator logged in for you. NEVER attempt to log in. If you ever land on a login page mid-session, that is a finding.`,
+    '',
+    'TOOL CATEGORIES:',
+    '',
+    'PLAYBOOKS (`mcp__playbooks__*`) — high-level, deterministic flows. Prefer these for ANY non-trivial action. Each playbook bundles multi-step orchestration (form fill + submit + verify) into a single tool call. The sitemap snapshot in your user message lists what is left to test.',
+    '',
+    'BROWSER PRIMITIVES (`mcp__browser__*`) — fall-back when no playbook fits. `find_and_click`, `fill_form`, `read_recent`, `snapshot`, `navigate`, `click`, `type`, `select_option`, `press_key`, `back`, `console_errors`, `evaluate`.',
+    '',
+    'HARNESS:',
+    '- `mcp__harness__report_finding` — file ANY finding the moment you see it. Be concrete. Then KEEP USING THE APP. A finding is NEVER a reason to stop. ONE finding per occurrence — never aggregate.',
+    '- `mcp__harness__end_session` — STRICT HARD-FLOOR USE ONLY: `auth_wall`, `site_unreachable`, `browser_dead`. NEVER call because you "finished exploring".',
+    '',
+    'HARD RULES:',
+    '1. Stay in character. Do not summarise.',
+    '2. Read every status line — `⚠️ ... net: 4xx/5xx ...` or `console: [pageerror] ...` is a probable finding.',
+    '3. Batch tool calls aggressively — emit multiple in one turn when the actions are independent.',
+    '4. The user message you receive each turn lists unvisited routes / untested forms / untested tables / untested modals. Pick something from that list (or invent your own).',
+    '',
+    'YOUR CHARACTER (this is who you ARE — embody them, do not narrate them):',
+    agent.personality,
+  ].join('\n');
+}

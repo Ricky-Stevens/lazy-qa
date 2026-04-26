@@ -1,0 +1,158 @@
+# regress-harness — reference config.
+#
+# Run with: bun run scan config/example.yaml
+# Output:   runs/<runId>/{findings.json, review.md, summary.md, journeys/}
+#
+# Every commented-out section below is OPTIONAL — uncomment to override the
+# default. The required sections are: target, anthropic, agents.
+
+target:
+  url: https://staging.example.com/
+
+  # Allowlist of hosts agents may visit. Every entry MUST also appear in the
+  # operator-controlled REGRESS_TRUSTED_HOSTS env var; the harness refuses to
+  # start otherwise. Include the auth provider's domain too (Auth0, Okta, etc.)
+  # so the login redirect works.
+  allowed_hosts:
+    - staging.example.com
+    - your-tenant.auth0.com
+
+  auth:
+    # 'form' (orchestrator fills the login form) | 'none' (public site OR
+    # supply your own pre-built storage_state_path for SSO/MFA flows).
+    type: form
+
+    # Defaults to target.url if omitted. Set when the login page is at a
+    # different URL or you want to skip a redirect.
+    # login_url: https://staging.example.com/login
+
+    # Form selectors. Sensible defaults work for most apps; override only when
+    # the login form uses non-standard input names.
+    username_selector: 'input[name="username"]'
+    password_selector: 'input[name="password"]'
+    submit_selector: 'button[type="submit"]'
+
+    # Login verification — set ONE if the default heuristic ("URL changed
+    # after submit") doesn't fit your app.
+    success_url_pattern: '^https://staging\.example\.com'
+    # wait_for_selector: '[data-testid="user-menu"]'
+
+    # For 'type: none' with a pre-built session (interactively generated via
+    # `bunx playwright codegen`, then saved):
+    # storage_state_path: ./fixtures/staging-session.json
+
+anthropic:
+  # Env var holding the API key. OPTIONAL: when unset, agents fall back to the
+  # local `claude` CLI's cached subscription auth (free dev runs on Pro/Max).
+  # Note: the supervisor and post-run reviewer require the API key path; they
+  # are skipped on subscription auth.
+  api_key_env: ANTHROPIC_API_KEY
+
+  # Default model for agents (overridable per-agent below).
+  default_model: claude-haiku-4-5-20251001
+
+  # Direct Anthropic SDK path: bypasses the Claude Code subprocess for the
+  # agent loop. Faster (~0.5–1s/turn saved) and parallelises tool execution
+  # within a single turn. Requires ANTHROPIC_API_KEY. Default: false.
+  direct_api: true
+
+# Always-on supervisor agent — watches all explorers, calls relogin_session
+# on auth-walls, pause_agents on backend storms, nudge_agent on stuck agents.
+# Costs ~$0.15/run on Sonnet. Defaults shown; remove the block to keep them.
+# supervisor:
+#   enabled: true
+#   model: claude-sonnet-4-6
+#   max_minutes: 10
+#   max_usd: 0.5
+#   max_turns: 60
+
+# Post-run reviewer — critic LLM classifies each finding (confirmed_bug /
+# likely_bug / duplicate / environmental / not_a_bug) and writes review.md.
+# ~$0.05–0.15/run on Sonnet. Defaults shown.
+# review:
+#   enabled: true
+#   model: claude-sonnet-4-6
+
+run:
+  # Total budget warning threshold across all agents. Informational only —
+  # individual per-agent budgets enforce the hard cap.
+  max_budget_usd: 5
+
+  # Where runs are written (must resolve within cwd).
+  output_dir: ./runs
+
+agents:
+  # Five built-in profiles ship: power-user, chaos-clicker, confused-newcomer,
+  # completionist, insider-attacker. Add your own in src/profiles/<slug>.md.
+  #
+  # Per-agent fields:
+  #   model               override anthropic.default_model
+  #   max_thinking_tokens 0 = off (fastest); >=1024 = enabled (API floor).
+  #                       Haiku at 1024 helps multi-step coherence; Sonnet
+  #                       attacker/completionist want 2000+.
+  #   planner_model       optional smarter model for one-shot plan calls
+  #                       between chunks; the cheap executor follows the plan
+  #   override_personality inline string to bypass the profile file
+  #   credentials         env-var names (values stay in .env)
+  #   budget              per-agent caps (turns, USD, minutes)
+
+  - id: power-user
+    profile: power-user
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: PORTAL_USER
+      password_env: PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  - id: chaos
+    profile: chaos-clicker
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: PORTAL_USER
+      password_env: PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  - id: confused
+    profile: confused-newcomer
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: PORTAL_USER
+      password_env: PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  # Sonnet for personas where multi-step coherence + chained reasoning pays off.
+  - id: completionist
+    profile: completionist
+    model: claude-sonnet-4-6
+    max_thinking_tokens: 1500
+    credentials:
+      username_env: PORTAL_USER
+      password_env: PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 200
+      max_usd: 2.0
+
+  - id: attacker
+    profile: insider-attacker
+    model: claude-sonnet-4-6
+    max_thinking_tokens: 2000
+    credentials:
+      username_env: PORTAL_USER
+      password_env: PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 200
+      max_usd: 2.0

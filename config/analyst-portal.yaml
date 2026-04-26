@@ -1,0 +1,98 @@
+# Analyst Portal — full persona-driven scan, 5 parallel agents.
+#
+# Each agent is a real user, not a tester. They have a personality (defined in
+# src/profiles/<slug>.md) and use the app the way that person would — until
+# their time runs out. No predefined workflows; they self-direct.
+#
+# Models per persona: Haiku 4.5 for fast/shallow (chaos, confused, power-user);
+# Sonnet 4.6 where multi-step coherence pays off (completionist, attacker).
+# All five share the same multi-tab pool — one Chrome login, five tabs.
+
+target:
+  url: https://hq.dev.ip-house.com/
+
+  allowed_hosts:
+    - hq.dev.ip-house.com
+    - ip-house-dev.uk.auth0.com
+
+  auth:
+    type: form
+    login_url: https://hq.dev.ip-house.com/
+    username_selector: 'input[name="username"]'
+    password_selector: 'input[name="password"]'
+    submit_selector: 'button[type="submit"]'
+    success_url_pattern: '^https://hq\.dev\.ip-house\.com'
+
+anthropic:
+  api_key_env: ANTHROPIC_API_KEY
+  default_model: claude-haiku-4-5-20251001
+  # Direct Anthropic SDK path: bypasses the Claude Code subprocess for the
+  # agent loop. Saves ~0.5–1s/turn AND parallelises tool execution within a
+  # single turn. Requires ANTHROPIC_API_KEY (subscription auth flows only
+  # through the Claude Code CLI, which this skips).
+  direct_api: true
+
+run:
+  max_budget_usd: 8
+  output_dir: ./runs
+
+agents:
+  - id: power-user
+    profile: power-user
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: ANALYST_PORTAL_USER
+      password_env: ANALYST_PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  - id: chaos
+    profile: chaos-clicker
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: ANALYST_PORTAL_USER
+      password_env: ANALYST_PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  - id: confused
+    profile: confused-newcomer
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: ANALYST_PORTAL_USER
+      password_env: ANALYST_PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 250
+      max_usd: 1.0
+
+  - id: completionist
+    profile: completionist
+    model: claude-sonnet-4-6
+    max_thinking_tokens: 1500
+    credentials:
+      username_env: ANALYST_PORTAL_USER
+      password_env: ANALYST_PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 200
+      max_usd: 2.0
+
+  - id: attacker
+    profile: insider-attacker
+    model: claude-sonnet-4-6
+    max_thinking_tokens: 2000
+    credentials:
+      username_env: ANALYST_PORTAL_USER
+      password_env: ANALYST_PORTAL_PASS
+    budget:
+      max_minutes: 5
+      max_turns: 200
+      max_usd: 2.0
