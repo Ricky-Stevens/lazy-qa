@@ -51,11 +51,6 @@ anthropic:
   # Default model for agents (overridable per-agent below).
   default_model: claude-haiku-4-5-20251001
 
-  # Direct Anthropic SDK path: bypasses the Claude Code subprocess for the
-  # agent loop. Faster (~0.5–1s/turn saved) and parallelises tool execution
-  # within a single turn. Requires ANTHROPIC_API_KEY. Default: false.
-  direct_api: true
-
 # Always-on supervisor agent — watches all explorers, calls relogin_session
 # on auth-walls, pause_agents on backend storms, nudge_agent on stuck agents.
 # Costs ~$0.15/run on Sonnet. Defaults shown; remove the block to keep them.

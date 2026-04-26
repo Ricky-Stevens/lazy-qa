@@ -1,11 +1,10 @@
 /**
- * Tests for the v2 browser MCP server.
+ * Tests for the browser MCP server.
  *
  * Coverage:
  *   - End-to-end: chromium + a stub SiteMapAccessor + an empty PlaybookRegistry
  *     → snapshot returns a serialized PageModel string.
- *   - No engagement gate: navigate twice in a row across different routes
- *     succeeds without REFUSED.
+ *   - Navigation: navigate twice in a row across different routes succeeds.
  *   - Playbook mounting: registering a stub playbook yields an
  *     `mcp__playbooks__stub` raw tool, and invoking it records into siteMap.
  */
@@ -13,19 +12,15 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { type Browser, type Page, chromium } from 'playwright';
+import { type Browser, chromium, type Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import type { SiteMap, SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
-import { type PageModel } from '../page-model/types.ts';
-import {
-  type Playbook,
-  type PlaybookContext,
-  PlaybookRegistry,
-} from '../playbooks/framework.ts';
+import type { PageModel } from '../page-model/types.ts';
+import { type Playbook, type PlaybookContext, PlaybookRegistry } from '../playbooks/framework.ts';
 import { ok as okOutcome } from '../playbooks/outcome.ts';
-import { createBrowserMcpServerV2 } from './browser-server-v2.ts';
+import { createBrowserMcpServer } from './browser-server.ts';
 
 /** Silent logger satisfying the Logger interface. */
 function makeSilentLogger(): Logger {
@@ -84,13 +79,13 @@ function makeFakeSiteMap(): {
   return { accessor, outcomes };
 }
 
-describe('createBrowserMcpServerV2', () => {
+describe('createBrowserMcpServer', () => {
   let browser: Browser;
   let runDir: string;
 
   beforeAll(async () => {
     browser = await chromium.launch({ headless: true });
-    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-v2-test-'));
+    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-test-'));
   });
 
   afterAll(async () => {
@@ -117,7 +112,7 @@ describe('createBrowserMcpServerV2', () => {
     );
 
     const { accessor: siteMap } = makeFakeSiteMap();
-    const { rawTools } = createBrowserMcpServerV2({
+    const { rawTools } = createBrowserMcpServer({
       getPage: () => page,
       logger: makeSilentLogger(),
       runDir,
@@ -148,7 +143,7 @@ describe('createBrowserMcpServerV2', () => {
     const urlB = 'data:text/html,<html><body><h1>B</h1></body></html>';
 
     const { accessor: siteMap } = makeFakeSiteMap();
-    const { rawTools } = createBrowserMcpServerV2({
+    const { rawTools } = createBrowserMcpServer({
       getPage: () => page,
       logger: makeSilentLogger(),
       runDir,
@@ -200,7 +195,7 @@ describe('createBrowserMcpServerV2', () => {
     registry.register(stub);
 
     const { accessor: siteMap, outcomes } = makeFakeSiteMap();
-    const { rawTools } = createBrowserMcpServerV2({
+    const { rawTools } = createBrowserMcpServer({
       getPage: () => page,
       logger: makeSilentLogger(),
       runDir,

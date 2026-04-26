@@ -26,11 +26,6 @@ target:
 anthropic:
   api_key_env: ANTHROPIC_API_KEY
   default_model: claude-haiku-4-5-20251001
-  # Direct Anthropic SDK path: bypasses the Claude Code subprocess for the
-  # agent loop. Saves ~0.5–1s/turn AND parallelises tool execution within a
-  # single turn. Requires ANTHROPIC_API_KEY (subscription auth flows only
-  # through the Claude Code CLI, which this skips).
-  direct_api: true
 
 run:
   max_budget_usd: 8

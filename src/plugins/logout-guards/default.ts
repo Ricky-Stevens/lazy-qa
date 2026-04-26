@@ -1,9 +1,9 @@
 /**
- * Default logout guard. Ports the regex set from
- * `src/tools/browser-server.ts` (lines ~320-365). Used to suppress click
- * attempts at the tool layer — a recurring failure mode is that a broken
- * page renders ONLY a "Log out" link in the header, the agent clicks it
- * (it's the only thing on screen), and the whole shared session cascades.
+ * Default logout guard. Detects logout/sign-out controls by text, href, aria-label,
+ * title, and data-testid patterns. Used to suppress click attempts at the tool layer
+ * — a recurring failure mode is that a broken page renders ONLY a "Log out" link in
+ * the header, the agent clicks it (it's the only thing on screen), and the whole
+ * shared session cascades.
  *
  * Whole-string text matching is DELIBERATE: links titled "Logout audit log"
  * or "Sign out attempts (admin)" must remain clickable.

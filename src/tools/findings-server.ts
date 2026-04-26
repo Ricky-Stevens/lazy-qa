@@ -3,14 +3,10 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
+import type { RawToolDef } from '../playbooks/framework.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
-import type { EngagementTracker, RawToolDef } from './browser-server.ts';
 import { captureScreenshot } from './screenshot.ts';
-
-/** Filing a finding is a real, costly engagement. Worth this many "actions"
- * against the engagement gate so the agent isn't trapped on a broken page. */
-const FINDING_ENGAGEMENT_WEIGHT = 4;
 
 /**
  * Throttle: max findings an agent may file in this rolling window. When the
@@ -25,35 +21,22 @@ const FINDINGS_RATE_WINDOW_MS = 60_000;
 export interface HarnessServerInput {
   journey: Journey;
   logger: Logger;
-  /** Shared with the browser server so report_finding can also count toward
-   * the per-route engagement gate. Optional for back-compat. */
-  engagement?: EngagementTracker;
   /** Returns the live Playwright page. Required for `attach_screenshot`. */
   getPage?: () => Page;
   /** Run directory used to materialise screenshot files. Required for `attach_screenshot`. */
   runDir?: string;
 }
 
-function routeOf(rawUrl: string | undefined): string | null {
-  if (!rawUrl) return null;
-  try {
-    const u = new URL(rawUrl);
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return null;
-  }
-}
-
 export function createHarnessMcpServer(
   inputOrJourney: HarnessServerInput | Journey,
   loggerArg?: Logger,
 ) {
-  // Back-compat: old call shape was (journey, logger). New shape is ({journey, logger, engagement}).
+  // Back-compat: old call shape was (journey, logger). New shape is ({journey, logger, getPage, runDir}).
   const input: HarnessServerInput =
     'journey' in inputOrJourney
       ? inputOrJourney
       : { journey: inputOrJourney, logger: loggerArg as Logger };
-  const { journey, logger, engagement, getPage, runDir } = input;
+  const { journey, logger, getPage, runDir } = input;
   const rawTools: RawToolDef[] = [];
   function defTool<S extends Record<string, z.ZodTypeAny>>(
     name: string,
@@ -198,12 +181,6 @@ export function createHarnessMcpServer(
             severity: args.severity,
             title: args.title,
           });
-          // Filing a finding counts as engagement on the route the finding
-          // describes. Stops broken pages from trapping the navigate gate.
-          const route = routeOf(args.route);
-          if (engagement && route) {
-            engagement.bump(route, FINDING_ENGAGEMENT_WEIGHT);
-          }
           return {
             content: [
               {

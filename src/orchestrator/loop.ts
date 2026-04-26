@@ -1,8 +1,8 @@
 /**
- * Agent loop v2 — direct Anthropic SDK loop with continuous conversation,
+ * Agent loop — direct Anthropic SDK loop with continuous conversation,
  * sliding-window history compaction, and per-turn sitemap injection.
  *
- * Differences vs v1's direct-loop / spawn-agent SDK path:
+ * Orchestration model:
  *
  *   - One continuous conversation (no chunked restart). The system prompt is
  *     1h-cached so the per-turn input cost stays bounded.
@@ -14,8 +14,7 @@
  *   - Per-turn user message includes a sitemap snapshot — top-N unvisited
  *     routes, untested forms/tables/modals — so the agent always has fresh
  *     "what's left to do" context without having to call ask_sitemap.
- *   - Direct API only. Subscription auth (claude CLI) is not supported on
- *     this path. Spawn-agent-v2 enforces that an API key is set.
+ *   - Direct API only. Subscription auth (claude CLI) is not supported.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -48,7 +47,7 @@ const MAX_OUTPUT_TOKENS = 4096;
 /** Playbook tool prefix the registry uses. Must match `PlaybookRegistry.toMcpTools`. */
 const PLAYBOOK_TOOL_PREFIX = 'mcp__playbooks__';
 
-export interface LoopV2Input {
+export interface LoopInput {
   agent: ResolvedAgent;
   targetUrl: string;
   systemPrompt: string;
@@ -68,7 +67,7 @@ export interface LoopV2Input {
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
  * errors are recorded into `journey.terminationReason`. */
-export async function runAgentLoopV2(input: LoopV2Input): Promise<void> {
+export async function runAgentLoop(input: LoopInput): Promise<void> {
   const client = new Anthropic({ apiKey: input.apiKey });
   const { agent, journey, logger, rawTools, siteMap, summaryMemory } = input;
 
@@ -567,7 +566,7 @@ function extractTargetId(input: Record<string, unknown>): string | null {
 }
 
 /** Extract a route from a PlaybookOutcome's evidence, when present. The
- *  browser server v2's playbook handler is expected to inject this. */
+ *  browser server's playbook handler is expected to inject this. */
 function extractRoute(outcome: PlaybookOutcome): string | null {
   const ev = outcome.evidence;
   if (!ev) return null;

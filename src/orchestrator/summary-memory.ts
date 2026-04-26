@@ -2,7 +2,7 @@
  * SummaryMemory — a per-agent rolling log of recently-attempted playbooks.
  *
  * Replaces the chunked-conversation history-compaction trick from v1. The
- * agent loop v2 keeps one continuous Anthropic conversation and prepends a
+ * agent loop keeps one continuous Anthropic conversation and prepends a
  * compact textual summary of past playbook attempts to every turn's user
  * message, so the agent always knows what they've already tried even when
  * the older turn-pairs have been elided by the sliding-window compaction.

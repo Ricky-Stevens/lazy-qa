@@ -1,6 +1,6 @@
 /**
  * Generic form-login AuthProvider. Wraps the existing `performLogin` /
- * `fillAuthForm` helpers in `src/auth/login.ts` so the rest of the v2 wiring
+ * `fillAuthForm` helpers in `src/auth/login.ts` so the orchestrator
  * can talk to a uniform `AuthProvider` interface.
  *
  * Recovery opens a fresh tab on the existing context, navigates to targetUrl,

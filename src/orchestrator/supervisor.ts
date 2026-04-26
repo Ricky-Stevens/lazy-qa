@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import { recoverAllSessions } from '../auth/session-pool.ts';
 import type { Logger } from '../logging/logger.ts';
-import type { RawToolDef } from '../tools/browser-server.ts';
+import type { RawToolDef } from '../playbooks/framework.ts';
 import { computeCostUsd } from './cost.ts';
 import {
   count4xxIn,

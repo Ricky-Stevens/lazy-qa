@@ -200,11 +200,6 @@ export const AnthropicConfigSchema = z.object({
   api_key_env: z.string().min(1).optional(),
   // Default model for agents
   default_model: ModelSchema.default('claude-sonnet-4-6'),
-  // OPT-IN. When true AND the api key is set, the agent loop uses the direct
-  // Anthropic SDK path (faster: bypasses the Claude Code subprocess). When
-  // false or the api key is missing, falls back to the Claude Code SDK path
-  // (which supports subscription auth). Default: false.
-  direct_api: z.boolean().default(false),
 });
 export type AnthropicConfig = z.infer<typeof AnthropicConfigSchema>;
 

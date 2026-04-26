@@ -1,5 +1,5 @@
 /**
- * loop-v2 regression tests.
+ * Loop regression tests.
  *
  * The headline test pins the bug found in run cd49622f's predecessor: when
  * the sliding window stripped a leading assistant message, it left the
@@ -11,7 +11,7 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { describe, expect, it } from 'vitest';
 import { createLogger } from '../logging/logger.ts';
-import { compactSlidingWindow } from './loop-v2.ts';
+import { compactSlidingWindow } from './loop.ts';
 import { SummaryMemory } from './summary-memory.ts';
 
 const logger = createLogger({ runId: 'test' });
@@ -75,8 +75,7 @@ describe('compactSlidingWindow', () => {
       const m = msgs[i];
       if (!m || typeof m.content === 'string') continue;
       const toolResults = m.content.filter(
-        (b): b is Anthropic.ToolResultBlockParam =>
-          (b as { type: string }).type === 'tool_result',
+        (b): b is Anthropic.ToolResultBlockParam => (b as { type: string }).type === 'tool_result',
       );
       if (toolResults.length === 0) continue;
       const prev = msgs[i - 1];
@@ -107,9 +106,7 @@ describe('compactSlidingWindow', () => {
     // content array carries tool_result blocks.
     const m1 = msgs[1];
     if (m1 && typeof m1.content !== 'string') {
-      const hasToolResults = m1.content.some(
-        (b) => (b as { type: string }).type === 'tool_result',
-      );
+      const hasToolResults = m1.content.some((b) => (b as { type: string }).type === 'tool_result');
       expect(hasToolResults).toBe(false);
     }
   });
