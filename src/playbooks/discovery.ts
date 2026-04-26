@@ -272,6 +272,7 @@ export const discoverRouteAffordances: Playbook<DiscoverRouteAffordancesInput> =
 
     const discovered = await probeAffordances(ctx.page, model, {
       logger: ctx.logger,
+      allowedHosts: ctx.allowedHosts,
     });
 
     // Persist into the SiteMap so other agents see this on their next snapshot.

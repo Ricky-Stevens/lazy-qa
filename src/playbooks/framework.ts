@@ -41,6 +41,11 @@ export interface PlaybookContext {
   /** Run directory — for screenshot writes etc. */
   runDir: string;
   logger: Logger;
+  /** Hosts the agent is permitted to navigate to (post-login allowlist).
+   * Empty array = no restriction. Populated from target.allowed_hosts.
+   * (WP1.5 scope: this field is the single source of truth for all
+   * allowlist-aware playbooks.) */
+  allowedHosts: string[];
 }
 
 /** A playbook definition. The framework registers these and exposes them as

@@ -142,6 +142,21 @@ type PlaywrightRoute = {
   continue: () => Promise<void>;
 };
 
+/**
+ * Check whether a URL's hostname matches the run's allowed-hosts list.
+ * Allows exact-match hosts AND subdomains of allowed hosts (so an entry
+ * `staging.example.com` permits `cdn.staging.example.com`). Returns false
+ * for invalid URLs.
+ */
+export function isHostAllowed(url: string, allowedHosts: string[]): boolean {
+  try {
+    const { hostname } = new URL(url);
+    return allowedHosts.some((h) => hostname === h || hostname.endsWith(`.${h}`));
+  } catch {
+    return false;
+  }
+}
+
 export function createNetworkAllowlistRoute(allowedHosts: string[]) {
   const set = new Set(allowedHosts);
   return async (route: PlaywrightRoute) => {

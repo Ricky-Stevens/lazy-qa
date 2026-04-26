@@ -47,7 +47,7 @@ function scrubString(s: string): string {
   return s;
 }
 
-function deepRedact(obj: unknown): unknown {
+export function deepRedact(obj: unknown): unknown {
   if (obj == null) return obj;
   if (typeof obj === 'string') return scrubString(obj);
   if (typeof obj !== 'object') return obj;
@@ -57,6 +57,27 @@ function deepRedact(obj: unknown): unknown {
     out[k] = SECRET_KEY_RE.test(k) ? redact(v) : deepRedact(v);
   }
   return out;
+}
+
+const DEFAULT_LLM_RESULT_BYTES = 8 * 1024;
+
+/**
+ * Redact secret-shaped fields and truncate to a byte cap before handing to
+ * the LLM. Use for any tool result that returns app-controlled content
+ * (evaluate, read_recent, page snapshots that include user-rendered text).
+ *
+ * Strings pass through (subject to byte cap). Objects/arrays are
+ * deep-redacted then JSON-stringified. Truncation uses character slicing,
+ * which may overshoot the byte cap by a few bytes at the truncation
+ * boundary if the byte at maxBytes happens to be in the middle of a UTF-8
+ * multi-byte sequence — acceptable for an LLM input cap (off by ≤3 bytes).
+ */
+export function redactForLlm(value: unknown, maxBytes: number = DEFAULT_LLM_RESULT_BYTES): string {
+  const redacted =
+    typeof value === 'string' ? value : (JSON.stringify(deepRedact(value)) ?? 'undefined');
+  if (Buffer.byteLength(redacted, 'utf8') <= maxBytes) return redacted;
+  const truncated = redacted.slice(0, maxBytes);
+  return `${truncated}\n[truncated at ${maxBytes} bytes]`;
 }
 
 export interface Logger {

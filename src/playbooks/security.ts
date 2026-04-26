@@ -10,6 +10,7 @@
  */
 
 import { z } from 'zod';
+import { isHostAllowed } from '../safety/guards.ts';
 import type { Playbook, PlaybookContext, PlaybookRegistry } from './framework.ts';
 import { type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
@@ -54,22 +55,23 @@ const DEFAULT_SENSITIVE_PATHS = [
   '/backup',
 ];
 
-/** Resolve a candidate URL/path against the current page origin. Returns null
- * if the candidate points off-origin (we never probe off-host). */
-function resolveOnOrigin(candidate: string, currentUrl: string): string | null {
-  let pageOrigin: string;
+/** Resolve a candidate URL/path against the run's allowed hosts. Returns
+ * the resolved absolute URL when on-allowlist, or `null` when the
+ * resolved URL would land off-allowlist. The `currentUrl` argument is
+ * used only as the base for relative-path resolution — it does NOT
+ * define the allowlist. */
+function resolveOnOrigin(
+  candidate: string,
+  currentUrl: string,
+  allowedHosts: string[],
+): string | null {
+  let absolute: URL;
   try {
-    pageOrigin = new URL(currentUrl).origin;
+    absolute = new URL(candidate, currentUrl);
   } catch {
     return null;
   }
-  try {
-    const u = new URL(candidate, pageOrigin);
-    if (u.origin !== pageOrigin) return null;
-    return u.toString();
-  } catch {
-    return null;
-  }
+  return isHostAllowed(absolute.toString(), allowedHosts) ? absolute.toString() : null;
 }
 
 /** Replace the id segment in a route. UUID match takes precedence; falls back
@@ -174,7 +176,7 @@ const idorProbe: Playbook<IdorProbeInput> = {
         });
         continue;
       }
-      const targetUrl = resolveOnOrigin(probedRoute, ctx.page.url());
+      const targetUrl = resolveOnOrigin(probedRoute, ctx.page.url(), ctx.allowedHosts);
       if (!targetUrl) {
         steps.push({
           label: `skip ${candidate}`,
@@ -253,7 +255,7 @@ const roleEscalationProbe: Playbook<RoleEscalationInput> = {
     const steps: PlaybookStep[] = [];
     const probed: Array<Record<string, unknown>> = [];
     for (const p of paths) {
-      const target = resolveOnOrigin(p, ctx.page.url());
+      const target = resolveOnOrigin(p, ctx.page.url(), ctx.allowedHosts);
       if (!target) {
         steps.push({ label: `skip ${p}`, ok: true, detail: 'off-origin — refused' });
         continue;
@@ -309,7 +311,7 @@ const sessionInvalidationProbe: Playbook<Record<string, never>> = {
     const steps: PlaybookStep[] = [];
     const evidence: Record<string, unknown> = { authedUrl };
 
-    const logoutUrl = resolveOnOrigin('/logout', authedUrl);
+    const logoutUrl = resolveOnOrigin('/logout', authedUrl, ctx.allowedHosts);
     if (!logoutUrl) {
       steps.push({
         label: 'logout',
@@ -480,7 +482,7 @@ const csrfProbe: Playbook<CsrfProbeInput> = {
     actionUrl: z.string(),
   },
   async run(input, ctx) {
-    const target = resolveOnOrigin(input.actionUrl, ctx.page.url());
+    const target = resolveOnOrigin(input.actionUrl, ctx.page.url(), ctx.allowedHosts);
     if (!target) {
       return buildOutcome(
         csrfProbe.name,
@@ -542,7 +544,7 @@ const openRedirectProbe: Playbook<OpenRedirectInput> = {
   },
   async run(input, ctx) {
     const evil = 'https://evil.example.com';
-    const base = resolveOnOrigin(input.routeWithRedirect, ctx.page.url());
+    const base = resolveOnOrigin(input.routeWithRedirect, ctx.page.url(), ctx.allowedHosts);
     if (!base) {
       return buildOutcome(
         openRedirectProbe.name,
@@ -640,7 +642,7 @@ const clickjackingProbe: Playbook<ClickjackingInput> = {
     url: z.string(),
   },
   async run(input, ctx) {
-    const target = resolveOnOrigin(input.url, ctx.page.url());
+    const target = resolveOnOrigin(input.url, ctx.page.url(), ctx.allowedHosts);
     if (!target) {
       return buildOutcome(
         clickjackingProbe.name,
@@ -706,7 +708,7 @@ const sensitiveUrlAudit: Playbook<SensitiveAuditInput> = {
     const steps: PlaybookStep[] = [];
     const probed: Array<Record<string, unknown>> = [];
     for (const p of paths) {
-      const target = resolveOnOrigin(p, ctx.page.url());
+      const target = resolveOnOrigin(p, ctx.page.url(), ctx.allowedHosts);
       if (!target) {
         steps.push({ label: `skip ${p}`, ok: true, detail: 'off-origin — refused' });
         continue;
@@ -759,6 +761,7 @@ export {
   csrfProbe,
   idorProbe,
   openRedirectProbe,
+  resolveOnOrigin,
   roleEscalationProbe,
   sensitiveUrlAudit,
   sessionInvalidationProbe,

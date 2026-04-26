@@ -20,6 +20,9 @@ export interface ExpandRouteOptions {
   probe?: boolean;
   /** Optional logger forwarded to the probe. */
   logger?: Logger;
+  /** Forwarded to the affordance probe so it can skip navigation to off-host
+   * URLs discovered behind buttons/menus. Empty array = no restriction. */
+  allowedHosts?: string[];
 }
 
 function deriveRoute(rawUrl: string): string {
@@ -60,6 +63,7 @@ export async function expandRoute(
       if (refreshedModel) {
         const discovered = await probeAffordances(page, refreshedModel, {
           ...(options.logger ? { logger: options.logger } : {}),
+          ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
         });
         const updatedModel = { ...refreshedModel, discovered };
         const updatedEntry: RouteEntry = {
@@ -81,6 +85,7 @@ export async function expandRoute(
   if (probe) {
     discovered = await probeAffordances(page, model, {
       ...(options.logger ? { logger: options.logger } : {}),
+      ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
     });
   }
   const enrichedModel = { ...model, discovered };

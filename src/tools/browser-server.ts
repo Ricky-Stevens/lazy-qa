@@ -17,6 +17,7 @@ import { z } from 'zod';
 import { expandRoute } from '../crawler/expand.ts';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
+import { redactForLlm } from '../logging/logger.ts';
 import {
   count4xxIn,
   getEffectivePauseUntil,
@@ -34,6 +35,7 @@ import {
 } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
 import { defaultLogoutGuard } from '../plugins/logout-guards/default.ts';
+import { isHostAllowed } from '../safety/guards.ts';
 
 /** Per-agent backoff thresholds (carried over from v1). */
 const BACKOFF_4XX_THRESHOLD = 5;
@@ -85,6 +87,11 @@ export interface BrowserServerInput {
   playbookRegistry: PlaybookRegistry;
   /** Hook invoked on every action with current url + tool name + auth-wall flag. */
   onAction?: (patch: { url: string; toolName: string; authWalled: boolean }) => void;
+  /** Hosts the agent is allowed to navigate/fetch to. document/xhr/fetch
+   * requests to hosts not on this list are refused with a text error result.
+   * Subresources (css, font, image, etc.) are always allowed so CDN-backed
+   * staging portals continue to work. */
+  allowedHosts?: string[];
 }
 
 /** Strip query/fragment so /clients?page=2 and /clients/123 count as the same area. */
@@ -167,12 +174,9 @@ function serializeOutcome(outcome: PlaybookOutcome): string {
   if (evidenceKeys.length > 0) {
     let evidenceJson: string;
     try {
-      evidenceJson = JSON.stringify(outcome.evidence);
+      evidenceJson = redactForLlm(outcome.evidence, 1500);
     } catch {
       evidenceJson = '[unserializable]';
-    }
-    if (evidenceJson.length > 1500) {
-      evidenceJson = `${evidenceJson.slice(0, 1500)}…`;
     }
     lines.push(`evidence: ${evidenceJson}`);
   }
@@ -193,7 +197,17 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
   mcpServer: ReturnType<typeof createSdkMcpServer>;
   rawTools: RawToolDef[];
 } {
-  const { getPage, logger, agentId, persona, runDir, siteMap, playbookRegistry, onAction } = input;
+  const {
+    getPage,
+    logger,
+    agentId,
+    persona,
+    runDir,
+    siteMap,
+    playbookRegistry,
+    onAction,
+    allowedHosts = [],
+  } = input;
 
   // Console + network buffers. Drained into PageModel.signals on each parse,
   // and surfaced via the dedicated console_errors tool. Listeners re-attached
@@ -476,7 +490,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         } else {
           model = await getOrParseModel();
         }
-        return textResult(serializeForAgent(model));
+        return textResult(redactForLlm(serializeForAgent(model)));
       },
     ),
 
@@ -485,6 +499,15 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       'Navigate to a URL. Returns a status line. Records anomalies (4xx/5xx/console) seen since the last action.',
       { url: z.string().url() },
       async ({ url }) => {
+        if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
+          let hostname = url;
+          try {
+            hostname = new URL(url).hostname;
+          } catch {
+            /* invalid url — use raw */
+          }
+          return textResult(`navigate refused: ${hostname} not in allowed_hosts`);
+        }
         const page = ensureListeners();
         await awaitPauseIfNeeded();
         invalidateModelCache();
@@ -504,7 +527,10 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         // the next agent's snapshot sees this route. Best-effort — sitemap
         // failures must not break navigation.
         try {
-          await expandRoute(siteMap, page, page.url());
+          await expandRoute(siteMap, page, page.url(), {
+            logger,
+            allowedHosts,
+          });
         } catch (err) {
           logger.debug('navigate.expand.error', {
             error: err instanceof Error ? err.message : String(err),
@@ -628,8 +654,8 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         if (consoleBuffer.length === 0) {
           return textResult('No console errors since last check.');
         }
-        const lines = consoleBuffer.map(
-          (e) => `[${e.level}] ${e.url ? `${e.url} — ` : ''}${e.text}`,
+        const lines = consoleBuffer.map((e) =>
+          redactForLlm(`[${e.level}] ${e.url ? `${e.url} — ` : ''}${e.text}`, 1024),
         );
         consoleBuffer.length = 0;
         return textResult(`${lines.length} console events:\n${lines.join('\n')}`);
@@ -648,7 +674,18 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           const result = await (page.evaluate as unknown as (fn: string) => Promise<string>)(
             wrapped,
           );
-          return textResult(`evaluate result: ${result}`);
+          // result is the JSON.stringify output from the page. Parse it back so
+          // deepRedact can walk the object tree and strip secret-keyed fields.
+          // If the result is not valid JSON (e.g. the String() fallback fired),
+          // fall back to treating it as a plain string.
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(result);
+          } catch {
+            parsed = result;
+          }
+          const safeResult = redactForLlm(parsed);
+          return textResult(`evaluate result: ${safeResult}`);
         } catch (err) {
           logger.warn('browser.evaluate.failed', {
             expression,
@@ -798,11 +835,13 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         ensureListeners();
         await awaitPauseIfNeeded();
         const model = await getOrParseModel();
-        const snap = serializeForAgent(model);
+        const snap = redactForLlm(serializeForAgent(model));
         const errors =
           consoleBuffer.length === 0
             ? 'none'
-            : consoleBuffer.map((e) => `[${e.level}] ${e.text.slice(0, 200)}`).join(' | ');
+            : consoleBuffer
+                .map((e) => redactForLlm(`[${e.level}] ${e.text.slice(0, 200)}`, 1024))
+                .join(' | ');
         consoleBuffer.length = 0;
         const networkSummary =
           model.network.length === 0
@@ -834,6 +873,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         persona: persona ?? '',
         runDir,
         logger,
+        allowedHosts,
       };
 
       // Invalidate before the playbook runs because most playbooks mutate the

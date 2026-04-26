@@ -13,7 +13,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { type Browser, chromium, type Page } from 'playwright';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { SiteMap, SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
@@ -224,5 +224,128 @@ describe('createBrowserMcpServer', () => {
     expect(outcomes[0]?.status).toBe('ok');
 
     await ctx.close();
+  });
+});
+
+describe('evaluate handler — redaction', () => {
+  let browser: Browser;
+  let runDir: string;
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-evaluate-test-'));
+  });
+
+  afterAll(async () => {
+    await browser.close();
+    await rm(runDir, { recursive: true, force: true });
+  });
+
+  it('evaluate handler redacts secret-shaped values in result', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.setContent(
+      '<html><body><script>window.__sec = {apiKey: "sk-leaked-XYZ"};</script></body></html>',
+    );
+
+    const { accessor: siteMap } = makeFakeSiteMap();
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbookRegistry: new PlaybookRegistry(),
+    });
+
+    const evaluate = rawTools.find((t) => t.name === 'evaluate');
+    if (!evaluate) throw new Error('evaluate tool not registered');
+
+    const result = await evaluate.handler({ expression: 'window.__sec' });
+    const text = result.content[0]?.text ?? '';
+
+    expect(text).not.toContain('sk-leaked-XYZ');
+    expect(text).toMatch(/evaluate result/);
+
+    await ctx.close();
+  });
+});
+
+describe('navigate handler — host allowlist', () => {
+  let browser: Browser;
+  let runDir: string;
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-allowlist-test-'));
+  });
+
+  afterAll(async () => {
+    await browser.close();
+    await rm(runDir, { recursive: true, force: true });
+  });
+
+  it('returns refusal when target host is not in allowedHosts', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+
+    const { accessor: siteMap } = makeFakeSiteMap();
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbookRegistry: new PlaybookRegistry(),
+      allowedHosts: ['staging.example.com'],
+    });
+
+    const navigate = rawTools.find((t) => t.name === 'navigate');
+    if (!navigate) throw new Error('navigate tool not registered');
+
+    const result = await navigate.handler({ url: 'https://attacker.example/path' });
+    const text = result.content[0]?.text ?? '';
+    expect(text).toMatch(/navigate refused.*not in allowed_hosts/);
+
+    await ctx.close();
+  });
+
+  it('allows on-host navigation when host is in allowedHosts', async () => {
+    const { accessor: siteMap } = makeFakeSiteMap();
+
+    // Stub page — avoids real Chromium network while still exercising the
+    // allowlist guard pass-through. parseFresh/speculate failures are
+    // caught and logged at debug level by the server, so they don't break
+    // the test.
+    // biome-ignore lint/suspicious/noExplicitAny: stub Page only implements the subset used by navigate
+    const stubPage: any = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      waitForLoadState: vi.fn().mockResolvedValue(undefined),
+      waitForTimeout: vi.fn().mockResolvedValue(undefined),
+      url: vi.fn().mockReturnValue('https://staging.example.com/admin'),
+      on: vi.fn(),
+    };
+
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => stubPage as Page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbookRegistry: new PlaybookRegistry(),
+      allowedHosts: ['staging.example.com'],
+    });
+
+    const navigate = rawTools.find((t) => t.name === 'navigate');
+    if (!navigate) throw new Error('navigate tool not registered');
+
+    const result = await navigate.handler({ url: 'https://staging.example.com/admin' });
+    const text = result.content[0]?.text ?? '';
+
+    // Guard passed — must NOT be a refusal
+    expect(text).not.toContain('REFUSED');
+    expect(text).not.toContain('not in allowed_hosts');
+    // page.goto must have been called with the in-allowlist URL
+    expect(stubPage.goto).toHaveBeenCalledWith(
+      'https://staging.example.com/admin',
+      expect.anything(),
+    );
   });
 });

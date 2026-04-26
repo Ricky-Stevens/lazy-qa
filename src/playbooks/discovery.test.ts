@@ -103,6 +103,7 @@ function makeContext(
     persona: '',
     runDir: '/tmp/test',
     logger: createLogger({ level: 'error' }),
+    allowedHosts: [],
   };
 }
 

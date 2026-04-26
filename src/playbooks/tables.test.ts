@@ -97,6 +97,7 @@ function makeContext(page: Page, table: TableSpec): PlaybookContext {
     persona: 'test',
     runDir: '/tmp/regress-test',
     logger: noopLogger,
+    allowedHosts: [],
   };
 }
 

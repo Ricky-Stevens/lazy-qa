@@ -4,7 +4,7 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { chromium } from 'playwright';
 import type { AuthConfig } from '../config/types.ts';
 import type { Logger } from '../logging/logger.ts';
-import { createNetworkAllowlistRoute } from '../safety/guards.ts';
+import { createNetworkAllowlistRoute, isHostAllowed } from '../safety/guards.ts';
 
 /**
  * Fill an Auth0-style login form on an already-navigated page and verify the
@@ -172,10 +172,25 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
     await fillAuthForm(page, auth, credentials);
 
-    // Drop the route handler before handing the page to the agent. The exploration
-    // phase relies on operator-level guards (REGRESS_TRUSTED_HOSTS, the YAML
-    // allowed_hosts) plus the agent's prompt — not Playwright route filtering.
+    // Replace the login-phase allowlist handler with a post-login handler that
+    // continues to block off-allowlist document/xhr/fetch requests but allows
+    // all subresource types (css, font, image, media, etc.) so staging portals
+    // that pull assets from third-party CDNs continue to function correctly.
     await context.unroute('**/*');
+    await context.route('**/*', async (route) => {
+      const req = route.request();
+      const type = req.resourceType();
+      // Allow all subresources — blocking these breaks staging portals that
+      // use third-party CDNs for fonts, images, stylesheets, etc.
+      if (type !== 'document' && type !== 'xhr' && type !== 'fetch') {
+        return route.continue();
+      }
+      if (isHostAllowed(req.url(), allowedHosts)) {
+        return route.continue();
+      }
+      logger.warn('browser.route.blocked', { url: req.url(), type });
+      return route.abort('blockedbyclient');
+    });
 
     // Persist a forensic snapshot for post-mortem only.
     await context.storageState({ path: storageStatePath, indexedDB: true }).catch(() => undefined);

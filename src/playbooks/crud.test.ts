@@ -96,6 +96,7 @@ function makeContext(page: Page, network: NetworkAnomaly[] = []): PlaybookContex
     persona: '',
     runDir: '/tmp/test',
     logger: createLogger({ level: 'error' }),
+    allowedHosts: [],
   };
 }
 

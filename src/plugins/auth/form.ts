@@ -12,7 +12,7 @@
 import type { BrowserContext, Page } from 'playwright';
 import { fillAuthForm } from '../../auth/login.ts';
 import type { AuthConfig } from '../../config/types.ts';
-import { createNetworkAllowlistRoute } from '../../safety/guards.ts';
+import { createNetworkAllowlistRoute, isHostAllowed } from '../../safety/guards.ts';
 import type { AuthLoginOpts, AuthProvider, AuthRecoveryOpts, RecoveryOutcome } from '../types.ts';
 
 /** Coerce the YAML-shaped `auth` blob into the form-specific AuthConfig the
@@ -55,7 +55,25 @@ export const formAuthProvider: AuthProvider = {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await fillAuthForm(page, auth, credentials);
     } finally {
+      // Replace the strict login-phase handler with a post-login handler that
+      // allows subresources to any host (CDNs) but blocks off-allowlist
+      // document/xhr/fetch requests to stop the agent exfiltrating data or
+      // fetching attacker-controlled content after login.
       await context.unroute('**/*').catch(() => undefined);
+      await context.route('**/*', async (route) => {
+        const req = route.request();
+        const type = req.resourceType();
+        // Allow all subresources — blocking these breaks staging portals that
+        // use third-party CDNs for fonts, images, stylesheets, etc.
+        if (type !== 'document' && type !== 'xhr' && type !== 'fetch') {
+          return route.continue();
+        }
+        if (isHostAllowed(req.url(), opts.allowedHosts)) {
+          return route.continue();
+        }
+        opts.logger.warn('browser.route.blocked', { url: req.url(), type });
+        return route.abort('blockedbyclient');
+      });
     }
 
     opts.logger.info('plugin.auth.form.login.success', { currentUrl: page.url() });

@@ -79,6 +79,7 @@ function makeCtx(page: Page, model: PageModel): PlaybookContext {
     persona: '',
     runDir: '/tmp/regress-test',
     logger: noopLogger(),
+    allowedHosts: [],
   };
 }
 

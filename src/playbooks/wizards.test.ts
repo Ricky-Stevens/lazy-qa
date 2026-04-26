@@ -243,6 +243,7 @@ function buildContext(page: Page, opts: { hasWizard?: boolean } = {}): PlaybookC
     persona: '',
     runDir: '/tmp/wizards-test',
     logger: noopLogger,
+    allowedHosts: [],
     pageModel: async (): Promise<PageModel> => {
       const url = page.url();
       const totalSteps = (await readTotalSteps(page)) || 3;

@@ -18,13 +18,14 @@
  */
 
 import type { Page } from 'playwright';
+import type { Logger } from '../logging/logger.ts';
 import type {
   ActionRef,
   AffordanceOutcome,
   DiscoveredAffordance,
   PageModel,
 } from '../page-model/types.ts';
-import type { Logger } from '../logging/logger.ts';
+import { isHostAllowed } from '../safety/guards.ts';
 
 export interface AffordanceProbeOptions {
   /** Per-click timeout (ms). Default 600ms. */
@@ -39,6 +40,11 @@ export interface AffordanceProbeOptions {
   maxRowActionProbes: number;
   /** Logger. */
   logger?: Logger;
+  /** Hosts the probe is allowed to navigate to. If set and non-empty, any
+   * restore-navigation to an off-allowlist URL is skipped rather than executed.
+   * This guards against a prior navigation having landed on an off-allowlist URL
+   * that we should not revisit. */
+  allowedHosts?: string[];
 }
 
 const DEFAULT_OPTIONS: AffordanceProbeOptions = {
@@ -297,9 +303,19 @@ async function dismissOpened(page: Page): Promise<void> {
  * Deliberately uses domcontentloaded only — Next.js apps stream analytics
  * beacons that keep `networkidle` from settling, which would burn the
  * probe's per-click budget on a state-restoration step. */
-async function restoreUrlIfNeeded(page: Page, baselineUrl: string): Promise<void> {
+async function restoreUrlIfNeeded(
+  page: Page,
+  baselineUrl: string,
+  allowedHosts: string[],
+): Promise<void> {
   try {
     if (page.url() !== baselineUrl) {
+      // Skip restore if the baseline URL is off-allowlist — this shouldn't
+      // happen in normal operation but is a safety net if the allowlist changes
+      // mid-probe or the page was already on an unexpected host.
+      if (allowedHosts.length > 0 && !isHostAllowed(baselineUrl, allowedHosts)) {
+        return;
+      }
       await page.goto(baselineUrl, { timeout: 5_000, waitUntil: 'domcontentloaded' });
     }
   } catch {
@@ -413,13 +429,14 @@ export async function probeAffordances(
     out.push({ trigger: ref, context, outcome });
 
     // Best-effort cleanup so the next probe starts from baseline state.
+    const probeAllowedHosts = opts.allowedHosts ?? [];
     if (outcome.kind === 'navigation') {
-      await restoreUrlIfNeeded(page, baselineUrl);
+      await restoreUrlIfNeeded(page, baselineUrl, probeAllowedHosts);
     } else if (outcome.kind !== 'inert' && outcome.kind !== 'error') {
       await dismissOpened(page);
       // If dismiss didn't fully take and URL drifted, restore.
       if (page.url() !== baselineUrl) {
-        await restoreUrlIfNeeded(page, baselineUrl);
+        await restoreUrlIfNeeded(page, baselineUrl, probeAllowedHosts);
       }
     }
   }

@@ -138,6 +138,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     siteMap: input.siteMap,
     playbookRegistry,
     onAction: (patch) => updateOnAction(agent.id, patch),
+    allowedHosts,
   });
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the
