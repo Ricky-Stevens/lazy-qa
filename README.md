@@ -9,11 +9,11 @@ The pitch: instead of writing brittle E2E scripts that test what *you* thought t
 ```bash
 cp .env.example .env
 # edit .env: ANTHROPIC_API_KEY, REGRESS_TRUSTED_HOSTS, your portal creds
-npm install      # or: bun install
-npm run scan config/example.yaml      # or: bun run scan config/example.yaml
+bun install
+bun run scan config/example.yaml
 ```
 
-**Runtime:** Node 20+ recommended. Bun 1.x also supported (project was originally Bun-first).
+**Runtime:** Bun 1.x (primary). Node 20+ also supported via `tsx`.
 
 When the run finishes you'll have:
 
@@ -21,6 +21,7 @@ When the run finishes you'll have:
 - `runs/<runId>/review.md` — the critic's triage report (confirmed bugs / likely / duplicate / not-a-bug + themes)
 - `runs/<runId>/journeys/*.meta.json` — per-agent metadata (turns, cost, termination reason)
 - `runs/<runId>/summary.md` — quick run summary
+- `runs/<runId>/sitemap.json` — pre-run crawler snapshot
 - `runs/last` — symlink to the most recent run
 
 Re-review a past run without re-running it:
@@ -31,20 +32,85 @@ bun run review runs/<runId>
 
 ## How it works
 
-Each agent gets its own tab on a single shared Chrome session. The orchestrator logs in once via Playwright and saves the session into a tab; subsequent agents acquire fresh tabs on the same authenticated context (no per-agent login). Credentials are filled by the orchestrator before the LLM loop starts and never enter the model's prompt.
+### 1. Pre-run crawler
 
-Each agent then runs an LLM loop with two MCP tool servers (both in-process — no subprocesses):
+Before any agent starts, the orchestrator opens a temporary authenticated tab and runs a BFS crawler (`src/crawler/crawl.ts`). It walks the link graph up to depth 2, capping at 60 routes and 30 seconds of wall-clock time. For each route it parses a `PageModel` — a structured summary of the page's forms, tables, modals, wizards, toolbars, and nav links — and stores it in the shared `SiteMap`. The crawler is read-only: it never clicks buttons, submits forms, or mutates application state.
 
-- **`browser`** — `snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `console_errors`, `evaluate`, `read_recent`. Snapshots default to a diff (only what changed since last call). Actions return one-line statuses and pre-compute the next snapshot in the background while the model is thinking.
-- **`harness`** — `report_finding` (rate-limited to 8/60s/agent) and `end_session` (gated to a hard-floor enum: `auth_wall` / `site_unreachable` / `browser_dead` only).
+The `SiteMap` (`src/crawler/sitemap.ts`) is the live mutable store agents share at runtime. As agents navigate and call playbooks, they record visits and outcomes back into the sitemap. The `navigate` tool also expands the sitemap on-demand when an agent reaches a route the pre-run crawler missed.
 
-A sixth always-on **supervisor agent** watches the runtime registry and intervenes:
+### 2. PageModel
 
-- Auth-walled agent → calls `relogin_session` (re-auths the shared context, reloads sibling tabs to flush stale in-memory tokens)
-- 4xx storm across multiple agents → calls `pause_agents` (everyone sleeps, gives the backend a breather)
-- Stuck or tunneling agent → `nudge_agent` queues a one-shot prompt prepended to the agent's next chunk
+Every snapshot call and every playbook invocation pulls the current page's `PageModel` from a short-lived cache (`src/page-model/parser.ts`). The parser runs a single `page.evaluate` round-trip that extracts all interactive structure in one pass — forms (fields, labels, submit targets), tables (columns, row count), modals, wizards, toolbars, nav links, and bare interactives. After each action the browser server speculatively kicks off a fresh parse in the background so the next `snapshot` call is instant.
 
-After all explorers finish, the post-run reviewer reads the journeys + findings and classifies each finding via a single batched LLM call: `confirmed_bug` / `likely_bug` / `duplicate` / `environmental` / `not_a_bug`, with severity-correction suggestions and theme clustering. Output is `review.md` + `review.json`.
+### 3. Persona agents
+
+Each agent gets its own tab on a single shared Chrome session. The orchestrator logs in once; subsequent agents acquire fresh tabs on the same authenticated context. Credentials are filled by the orchestrator before the LLM loop starts and never enter the model's prompt.
+
+Each agent runs a direct Anthropic SDK loop (`src/orchestrator/loop.ts`): one continuous conversation with a 1-hour prompt-cache on the system prompt. History is managed with a sliding window — once the conversation exceeds the compaction threshold (14 messages), the head is replaced with a single synthetic summary derived from the per-agent `SummaryMemory` (which records one entry per playbook invocation), and the most recent 12 messages are kept verbatim. This keeps per-turn input cost bounded without losing "what have I tried" context.
+
+The per-turn user message includes a sitemap snapshot listing unvisited routes, untested forms/tables/modals, and affordance hints (what's behind buttons and kebabs that the link-graph crawler cannot see). Tool calls within a turn execute in parallel.
+
+### 4. Browser MCP tools
+
+The browser server (`src/tools/browser-server.ts`) exposes 12 primitive/macro tools:
+
+| Tool | Purpose |
+|---|---|
+| `snapshot` | Structured PageModel snapshot (forms, tables, modals, wizards, toolbars, nav) |
+| `navigate` | Go to a URL; refuses off-allowlist hosts; expands the sitemap |
+| `back` | Browser back |
+| `click` | Click an element by Playwright selector; logout controls refused |
+| `type` | Type text into a field; optional append / Enter submit |
+| `press_key` | Press a keyboard key (Tab, Enter, Escape, ArrowDown, F5) |
+| `select_option` | Pick a `<select>` option by label or value |
+| `console_errors` | Return buffered console errors and page errors since last call |
+| `evaluate` | Run a read-only JS expression; result is redacted and truncated |
+| `fill_form` | Fill multiple fields + optional submit in one round-trip |
+| `find_and_click` | Find a button or link by visible text; tries multiple selector strategies; logout controls refused |
+| `read_recent` | One-call sweep: PageModel + console errors + last 5 network anomalies |
+
+Playbook tools (`mcp__playbooks__*`) are mounted dynamically from the playbook registry and cover CRUD flows, table sorting, modal lifecycles, form validation, pagination, wizard traversal, security probes, and more.
+
+### 5. Harness MCP tools
+
+The findings server (`src/tools/findings-server.ts`) exposes two tools:
+
+- `report_finding` — file a finding (severity, category, steps to reproduce, confidence). Rate-limited to 8 per agent per 60 seconds to prevent cascade thrashing.
+- `end_session` — hard-floor exit only: `auth_wall`, `site_unreachable`, `browser_dead`. Gated at the enum level; the agent cannot pass any other reason.
+
+### 6. Supervisor
+
+A sixth always-on supervisor agent (`src/orchestrator/supervisor.ts`) watches the explorer agents via the runtime registry and intervenes:
+
+- **Auth-walled** — agent URL is on an Auth0 login/logout page → calls `relogin_session` (re-auths the shared context, reloads sibling tabs), then nudges the agent to reload the dashboard.
+- **Backend storm** — two or more agents have ≥5 recent 4xx responses, or any single agent has ≥10 → calls `pause_agents` (agents sleep on their next action; default 60 s, hard ceiling 180 s), giving the backend time to recover.
+- **No progress** — agent hasn't taken a browser action in over 60 seconds → `nudge_agent` with a specific suggestion referencing their current URL and recent tools.
+- **Repetitive loop** — same tool called 5+ times with no new findings → `nudge_agent` to try something different.
+- **Page tunneling** — agent on the same route for over 120 seconds with no new findings → `nudge_agent` to move on.
+
+The supervisor is best-effort: a crash never fails the run.
+
+### 7. Post-run critic LLM
+
+After all agents finish, the post-run reviewer (`src/findings/review.ts`) reads the persisted findings and journey metadata and asks a single batched LLM call to classify each finding: `confirmed_bug` / `likely_bug` / `duplicate` / `environmental` / `not_a_bug`. It also clusters findings by theme and suggests severity corrections. Output is `review.md` + `review.json`. Best-effort — a reviewer crash never fails the run; the raw findings are already on disk.
+
+### 8. Output layout
+
+```
+runs/<runId>/
+  findings.json           all deduplicated findings
+  review.md               critic's triage report
+  review.json             structured review data
+  summary.md              quick per-agent summary table
+  sitemap.json            pre-run crawler snapshot
+  coverage.md             per-route + playbook coverage report
+  manifest.json           run metadata
+  journeys/
+    <agentId>.meta.json   per-agent journey (turns, cost, token usage, findings)
+  auth/
+    <agentId>/
+      storage-state.json  forensic session snapshot (chmod 0600)
+```
 
 ## Personas
 
@@ -78,9 +144,6 @@ target:
 anthropic:
   api_key_env: ANTHROPIC_API_KEY
   default_model: claude-haiku-4-5-20251001
-  # Skip the Claude Code subprocess; talk to the Anthropic API directly.
-  # Faster + parallel tool execution per turn; needs ANTHROPIC_API_KEY.
-  direct_api: true
 
 supervisor:
   enabled: true
@@ -112,42 +175,73 @@ Per-agent knobs:
 
 - `model` — overrides `anthropic.default_model`
 - `max_thinking_tokens` — `0` (off, fastest) or `≥1024`. Useful at `1024` on Haiku for multi-step coherence; `2000+` on Sonnet for the security/completionist personas
-- `planner_model` — optional smarter model that runs a one-shot plan call between chunks; the cheap executor model then follows it
+- `planner_model` — optional smarter model for one-shot plan calls between chunks; the cheap executor model then follows the plan. Omit for single-model mode (faster per chunk, less directed)
 - `override_personality` — inline string to bypass the profile file
 - `budget` — per-agent caps (turns, USD, minutes)
 
 ## Auth modes
 
 - **`type: form`** (default) — Playwright fills the form. Works for Auth0, generic SSO login pages, anything with username + password + submit. Set `success_url_pattern` or `wait_for_selector` if the post-submit heuristic doesn't fit.
-- **`type: none`** with `storage_state_path` — supply your own pre-built `storageState.json` for MFA / passkey / non-form flows. Generate it once interactively with `playwright codegen`, then reuse.
-- **API key vs subscription** — set `ANTHROPIC_API_KEY` for billed runs (CI must use this) or leave it unset to fall back to the local `claude` CLI's cached subscription auth (free dev runs on Pro/Max). Note: the supervisor and the post-run reviewer both require the API key path; they're skipped on subscription auth.
+- **`type: none`** with `storage_state_path` — supply your own pre-built `storageState.json` for MFA / passkey / non-form flows. Generate it once interactively with `bunx playwright codegen`, then reuse.
+- **API key required** — set `ANTHROPIC_API_KEY` in your environment. The direct-API loop does not support subscription auth via the `claude` CLI. The supervisor and post-run reviewer also require the API key.
 
 ## Safety
 
-- **Operator allowlist** — `REGRESS_TRUSTED_HOSTS` env var is required. Every host in the YAML's `target.allowed_hosts` must appear there. Stops a malicious YAML from steering credentials at attacker hosts.
-- **Non-prod check** — target hostname must match `localhost` / `staging.` / `dev.` / `qa.` / `test.` / `preview.` prefixes, or be in `REGRESS_NONPROD_HOST_PATTERNS`. Don't point this at production.
-- **Credentials never enter the LLM context** — the orchestrator owns the Playwright login; the agent only sees an already-authenticated browser handle.
-- **Credential env-var names are filtered** — must match `^[A-Z][A-Z0-9_]*$` and must NOT start with `ANTHROPIC_`, `AWS_`, `GH_`, `GITHUB_`, `AZURE_`, `GCP_`, etc. Stops a malicious YAML referencing an infrastructure secret as a "password".
-- **Logout suppression** — `click` and `find_and_click` refuse to click anything matching logout heuristics (text, aria-label, href, testid). Prevents one agent's stray click from terminating the shared session for everyone.
-- **Pre-login network allowlist** — Playwright `route()` blocks off-allowlist requests during the credential-fill phase.
-- **Forensic storage state** is written to `runs/<runId>/auth/<agentId>/storage-state.json` at `chmod 0600` for post-mortem only — not used for handoff.
+- **Operator allowlist** — `REGRESS_TRUSTED_HOSTS` env var is required.
+  Every host in the YAML's `target.allowed_hosts` must appear there.
+  Stops a malicious YAML from steering credentials at attacker hosts.
+- **Non-prod check** — target hostname must match `localhost` /
+  `staging.` / `dev.` / `qa.` / `test.` / `preview.` prefixes, or be in
+  `REGRESS_NONPROD_HOST_PATTERNS`.
+- **Network allowlist enforced for the whole run** — Playwright `route()`
+  blocks document/xhr/fetch requests to off-allowlist hosts both during
+  the credential-fill phase and post-login. Subresources (CSS, fonts,
+  images) are allowed off-host so legitimate CDN-backed staging portals
+  work.
+- **Per-action host check** — the `navigate` tool refuses URLs whose
+  hostname is not in `target.allowed_hosts`, returning a status-line
+  failure rather than allowing the route handler to silently abort.
+- **Pre-login form credentials never enter the LLM context** — the
+  orchestrator owns the Playwright login; the agent only sees an
+  already-authenticated browser handle. Post-login content the
+  application itself exposes (storage, console, headers visible to JS)
+  *can* reach the model — use the `storage_inspect` playbook (which
+  surfaces matches by kind, never values) when probing storage. Raw
+  `evaluate()` results, `read_recent`, `console_errors`, snapshot, and
+  playbook evidence are all redacted (secret-shaped fields masked) and
+  truncated to 8 KB before being handed to the LLM.
+- **Credential env-var names are filtered** — must match
+  `^[A-Z][A-Z0-9_]*$` and must NOT start with `ANTHROPIC_`, `AWS_`,
+  `GH_`, `GITHUB_`, `AZURE_`, `GCP_`, etc.
+- **Logout suppression** — `click` and `find_and_click` refuse to click
+  anything matching logout heuristics (text, aria-label, href, testid).
+- **Security playbooks are origin-scoped** — IDOR / role-escalation /
+  sensitive-path probes refuse off-allowlist URLs, so an open-redirect
+  cannot drift the attacker persona onto a third-party host.
+- **Forensic storage state** is written to
+  `runs/<runId>/auth/<agentId>/storage-state.json` at `chmod 0600` for
+  post-mortem only — not used for handoff.
 
 ## Project structure
 
 - `src/config/` — YAML schema + loader (Zod)
-- `src/auth/` — Pre-agent login + the shared multi-tab session pool
-- `src/profiles/` — Persona markdown files
+- `src/auth/` — Pre-agent login, shared multi-tab session pool, recovery
+- `src/crawler/` — BFS pre-run crawler, on-demand route expansion, SiteMap
+- `src/page-model/` — Single round-trip DOM parser (PageModel), serializer for agent prompts
+- `src/playbooks/` — Pluggable playbook framework + built-in playbooks (CRUD, security, tables, modals, wizards, etc.)
+- `src/plugins/` — Auth provider plugins (`form`, `none`), link extractors, logout guard
+- `src/profiles/` — Persona markdown files (5 built-in)
 - `src/tools/` — In-process MCP servers (`browser-server.ts`, `findings-server.ts`)
-- `src/orchestrator/` — `run.ts`, `spawn-agent.ts`, `direct-loop.ts`, `supervisor.ts`, `registry.ts`, cost compute
-- `src/findings/` — `review.ts` (critic LLM), `report.ts` (markdown writer), `persist.ts`
+- `src/orchestrator/` — `run.ts`, `spawn-agent.ts`, `loop.ts`, `supervisor.ts`, `registry.ts`, cost compute
+- `src/findings/` — `review.ts` (critic LLM), `report.ts` (markdown writer), `persist.ts`, `coverage.ts`
 - `src/safety/` — Allowlist checks, non-prod gate, credential-name validation
-- `src/logging/` — Structured JSON logger with secret redaction
+- `src/logging/` — Structured JSON logger with `redactForLlm` (secret masking + 8 KB truncation)
 - `bin/` — `regress.ts` (scan), `regress-review.ts` (re-review)
 
 ## Commands
 
 ```bash
-bun run scan <config.yaml>      # full run: explorers + supervisor + post-run review
+bun run scan <config.yaml>      # full run: crawler + explorers + supervisor + post-run review
 bun run review <runDir>         # re-review a past run with a fresh critic pass
 bun run typecheck               # TypeScript check
 bun run lint                    # Biome check
@@ -155,10 +249,27 @@ bun run lint:fix                # Biome format + safe-fix
 bun run test                    # Vitest
 ```
 
+## Roadmap (active April 2026)
+
+regress-harness is pre-launch. The strategic review at
+`docs/superpowers/specs/2026-04-26-regress-harness-strategic-review.md`
+captures the v3 direction:
+
+- **Phase 2 (next):** simplify the playbook framework from 30+ scripted
+  flows to ~9 primitives + utilities. Persona-driven exploration takes
+  the lead; remaining playbooks cover only what LLMs do unreliably
+  (security probes that need response-header inspection; pagination /
+  wizard traversal helpers).
+- **Phase 3:** prompt caching, model routing (Haiku for action / Sonnet
+  for planning + critic), Anthropic Memory tool for cross-run learning,
+  Agent Skills as the format for personas + playbooks.
+- **Phase 4:** critic LLM with browser access (re-runs suspect findings
+  to confirm), event-sourced replay.
+- **Phase 5:** end-to-end validation against OWASP Juice Shop.
+
 ## Tuning notes
 
-- **Speed / cost** — flip `direct_api: true` and use Haiku 4.5 with `max_thinking_tokens: 0` for cheapest exploration. Add the supervisor on top for unblocking; it costs ~$0.15/run regardless of how many explorers you run.
+- **Speed / cost** — use Haiku 4.5 with `max_thinking_tokens: 0` for cheapest exploration. Add the supervisor on top for unblocking; it costs ~$0.15/run regardless of how many explorers you run.
 - **Coverage** — more parallel agents = more breadth, not more depth. Personas diverge naturally (the same persona twice will explore differently each run).
 - **Coherence** — if Haiku is "scatterbrained" and clicking randomly, raise its `max_thinking_tokens` to `1024`. If Sonnet is over-thinking, lower it.
-- **Engagement gate** — the harness refuses cross-route navigation until 6 actions on the current route or 60 seconds elapsed. Stops nav-flicking. Bypasses: filing a finding (counts as +4 actions) or a near-empty page (<8 interactive elements, auto-allow).
 - **Findings throttle** — 8 findings per agent per 60s. Past that the harness drops them silently (the reviewer dedupes anyway, so cascade-thrashing was costing tokens for nothing).
