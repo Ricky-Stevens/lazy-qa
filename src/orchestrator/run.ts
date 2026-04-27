@@ -27,7 +27,7 @@ import { writeReviewArtefacts } from '../findings/report.ts';
 import { reviewRun } from '../findings/review.ts';
 import type { Logger } from '../logging/logger.ts';
 import { createLogger } from '../logging/logger.ts';
-import { defaultLinkExtractor } from '../plugins/index.ts';
+import { extractLinks } from '../crawler/extract-links.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
@@ -160,7 +160,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       maxRoutes: CRAWL_MAX_ROUTES,
       maxWallClockMs: CRAWL_MAX_WALL_CLOCK_MS,
       allowedHosts: cfg.target.allowed_hosts,
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: crawlerLogger,
     });
   } catch (err) {

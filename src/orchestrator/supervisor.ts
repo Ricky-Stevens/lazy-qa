@@ -19,8 +19,7 @@ import {
  * Detects (aggressive mode):
  *   - auth_walled (URL on Auth0 login/logout) → call relogin_session, nudge
  *   - no progress in 60s → nudge with a specific suggestion
- *   - repetitive loop (last 5 tools same on same area, no findings) → nudge
- *   - page tunneling (>120s on same route, no new findings) → nudge to move on
+ *   - 4xx storm (multi-agent or per-agent threshold) → pause_agents
  *
  * Tools available: list_agents, relogin_session, nudge_agent, wait, end_session.
  * No browser tools. No findings tools. The supervisor does NOT explore.
@@ -79,12 +78,6 @@ DETECTION RULES (intervene aggressively, don't second-guess):
 
 3. NO PROGRESS — Date.now() - agent.lastActionAt > 60_000 (>60s since last browser action) AND status === 'active' AND NOT currently paused
    → ACTION: nudge_agent(agentId, "You haven't taken an action in over a minute. Try a completely different approach: <reference their recentTools and currentUrl to suggest something specific, e.g. 'open a kebab menu on a table row' or 'navigate to the dashboard and pick a different module'>.")
-
-4. REPETITIVE LOOP — recentTools shows the SAME tool name 5+ times AND findingsCount has not increased in those turns
-   → ACTION: nudge_agent(agentId, "You're stuck repeating <tool>. Stop and try something different: navigate to a sibling page, or use find_and_click with a different hint, or open a row's actions menu. Whatever you've been doing for the last 5 turns is not working.")
-
-5. PAGE TUNNELING — same currentUrl for >120s with high turnsCompleted relative to startedAt and no new findings in that window
-   → ACTION: nudge_agent(agentId, "You've been on <route> for over 2 minutes without finding anything new. There are other modules/areas — move on. Navigate to a sibling area in the nav or to the dashboard, then pick a different feature to investigate.")
 
 WHEN TO STOP:
 - All agents have status='finished' or 'errored' → call end_session({reason: "all explorers done"}).

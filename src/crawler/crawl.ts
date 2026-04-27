@@ -8,6 +8,7 @@
 
 import type { Page } from 'playwright';
 import { parsePage } from '../page-model/parser.ts';
+import { extractLinks } from './extract-links.ts';
 import { buildRouteEntry, SiteMapImpl } from './sitemap.ts';
 import type { CrawlOptions, RouteEntry, SiteMap } from './types.ts';
 
@@ -55,7 +56,13 @@ function hostOf(rawUrl: string): string | undefined {
 
 /** True if `url`'s host matches one of the allowedHosts. We support exact
  * host match plus port-stripped match (so `localhost:3001` is allowed by
- * `localhost`). */
+ * `localhost`).
+ *
+ * TODO(phase-3-followup): reconcile with isHostAllowed in safety/guards.ts —
+ * current semantics (port-stripped, no subdomains) differ from isHostAllowed
+ * (subdomains allowed, no port handling). Dedup only after resolving which
+ * policy is correct for crawl-time host validation.
+ */
 function isAllowedHost(url: string, allowedHosts: string[]): boolean {
   if (allowedHosts.length === 0) return true;
   const host = hostOf(url);
@@ -209,7 +216,7 @@ export async function crawlSite(page: Page, opts: CrawlOptions): Promise<SiteMap
 
     let links: string[] = [];
     try {
-      links = await opts.linkExtractor.extract(page);
+      links = await (opts.linkExtractor ?? extractLinks)(page);
     } catch (err) {
       opts.logger.debug('crawl.extractError', {
         url: next.url,

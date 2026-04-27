@@ -1,57 +1,53 @@
 /**
- * Table playbook tests. Each playbook gets:
- *   1. A happy-path scenario where the orchestrated action visibly works.
- *   2. A broken-app scenario that should produce a `suspicious` outcome
- *      (or `failed` if the affordance is entirely missing).
+ * Tests for the `walk_pagination` table playbook (WP2.D).
  *
- * We drive a real Chromium via Playwright + `setContent`, and stub out the
- * `PlaybookContext` with a hand-built `PageModel` containing one `TableSpec`.
+ * Uses real Chromium via Playwright + `setContent`. The `PlaybookContext` is
+ * stubbed following the same pattern as forms.test.ts.
  */
 
 import { type Browser, chromium, type Page } from 'playwright';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { SiteMapAccessor } from '../crawler/types.ts';
+import { createLogger } from '../logging/logger.ts';
 import type { PageModel, TableSpec } from '../page-model/types.ts';
 import type { PlaybookContext } from './framework.ts';
-import { PlaybookRegistry } from './framework.ts';
-import {
-  registerTablePlaybooks,
-  tableColumnVisibility,
-  tableExportDownload,
-  tableFilterSearch,
-  tablePaginateWalk,
-  tableRowActionsAudit,
-  tableSelectAllBulk,
-  tableSortEachColumn,
-} from './tables.ts';
+import { walkPagination } from './tables.ts';
 
-let browser: Browser;
+// ---------------------------------------------------------------------------
+// Stub SiteMapAccessor — pattern-matched from forms.test.ts
+// ---------------------------------------------------------------------------
 
-beforeAll(async () => {
-  browser = await chromium.launch({ headless: true });
-});
-
-afterAll(async () => {
-  await browser?.close();
-});
+const stubSitemap: SiteMapAccessor = {
+  listUnvisitedRoutes: () => [],
+  listAllRoutes: () => [],
+  listFormsUntested: () => [],
+  listTablesUntested: () => [],
+  listModalsUntested: () => [],
+  listWizardsUntested: () => [],
+  getRoute: () => undefined,
+  getPageModel: () => undefined,
+  upsertRoute: () => {},
+  recordVisit: () => {},
+  recordPlaybookOutcome: () => {},
+  serialize: () => ({
+    startedAt: new Date().toISOString(),
+    rootUrl: 'about:blank',
+    routes: {},
+    pageModels: {},
+  }),
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const noopLogger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  child() {
-    return this;
-  },
-};
-
-function makeTableSpec(overrides: Partial<TableSpec> = {}): TableSpec {
+// TableSpec uses `tableLocator` (not `selector`).
+// TableSpec.pagination is `{ locator: string; currentPage?: number; totalPages?: number }`.
+// There is no `pagination.next` ActionRef — next-button detection is heuristic.
+function makeTable(overrides: Partial<TableSpec> = {}): TableSpec {
   return {
-    id: 't1',
-    tableLocator: 'table',
+    id: 'tbl-1',
+    tableLocator: '#data-table',
     name: 'Test table',
     columns: [],
     rowCount: 0,
@@ -62,11 +58,11 @@ function makeTableSpec(overrides: Partial<TableSpec> = {}): TableSpec {
   };
 }
 
-function makePageModel(table: TableSpec): PageModel {
-  return {
-    url: 'about:blank',
-    route: 'about:blank',
-    title: 'test',
+function makeContext(page: Page, table: TableSpec): PlaybookContext {
+  const model: PageModel = {
+    url: page.url(),
+    route: page.url(),
+    title: 'Test',
     forms: [],
     tables: [table],
     modals: [],
@@ -76,650 +72,170 @@ function makePageModel(table: TableSpec): PageModel {
     bareInteractives: [],
     network: [],
     console: [],
-    textHash: 'x',
+    textHash: '',
     looksBroken: false,
     interactiveCount: 0,
     capturedAt: new Date().toISOString(),
   };
-}
-
-function makeContext(page: Page, table: TableSpec): PlaybookContext {
   return {
     page,
-    pageModel: async () => makePageModel(table),
-    siteMap: {
-      // Only the methods used by playbooks need real implementations; we don't
-      // touch siteMap in any of the seven table playbooks, so stubs that throw
-      // would be louder, but stubs that no-op are friendlier when we add new
-      // callers later. They are typed as never-callable in this test scope.
-    } as unknown as PlaybookContext['siteMap'],
-    agentId: 'test-agent',
+    pageModel: () => Promise.resolve(model),
+    siteMap: stubSitemap,
+    agentId: 'test',
     persona: 'test',
-    runDir: '/tmp/regress-test',
-    logger: noopLogger,
+    runDir: '/tmp',
+    logger: createLogger(),
     allowedHosts: [],
   };
 }
 
 // ---------------------------------------------------------------------------
-// Registration
+// Tests
 // ---------------------------------------------------------------------------
 
-describe('registerTablePlaybooks', () => {
-  it('registers all seven table playbooks', () => {
-    const r = new PlaybookRegistry();
-    registerTablePlaybooks(r);
-    const names = r.list().map((p) => p.name);
-    expect(names).toEqual(
-      expect.arrayContaining([
-        'table_sort_each_column',
-        'table_paginate_walk',
-        'table_filter_search',
-        'table_select_all_bulk',
-        'table_row_actions_audit',
-        'table_column_visibility',
-        'table_export_download',
-      ]),
-    );
-    expect(r.size()).toBe(7);
-  });
-});
+describe('walk_pagination', () => {
+  let browser: Browser;
+  let page: Page;
 
-// ---------------------------------------------------------------------------
-// 1. table_sort_each_column
-// ---------------------------------------------------------------------------
-
-describe('table_sort_each_column', () => {
-  it('returns ok when clicking the header reorders rows', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table>
-          <thead>
-            <tr><th id="hName" data-sort-state="0">Name</th></tr>
-          </thead>
-          <tbody>
-            <tr><td>Charlie</td></tr>
-            <tr><td>Alice</td></tr>
-            <tr><td>Bob</td></tr>
-          </tbody>
-        </table>
-        <script>
-          document.getElementById('hName').addEventListener('click', () => {
-            const tbody = document.querySelector('tbody');
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-            rows.sort((a, b) => a.cells[0].textContent.localeCompare(b.cells[0].textContent));
-            for (const r of rows) tbody.appendChild(r);
-          });
-        </script>
-      `);
-      const table = makeTableSpec({
-        columns: [{ label: 'Name', headerLocator: '#hName', sortable: true }],
-        rowCount: 3,
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tableSortEachColumn.run({ tableId: 't1' }, ctx);
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as { perColumn: Array<{ changed: boolean }> };
-      expect(ev.perColumn[0].changed).toBe(true);
-    } finally {
-      await page.close();
-    }
+  beforeEach(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage();
   });
 
-  it('returns suspicious when header click does nothing', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table>
-          <thead>
-            <tr><th id="hName">Name</th></tr>
-          </thead>
-          <tbody>
-            <tr><td>Charlie</td></tr>
-            <tr><td>Alice</td></tr>
-            <tr><td>Bob</td></tr>
-          </tbody>
-        </table>
-      `);
-      const table = makeTableSpec({
-        columns: [{ label: 'Name', headerLocator: '#hName', sortable: true }],
-        rowCount: 3,
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tableSortEachColumn.run({ tableId: 't1' }, ctx);
-      expect(outcome.status).toBe('suspicious');
-      expect(outcome.summary).toMatch(/no effect/i);
-    } finally {
-      await page.close();
-    }
+  afterEach(async () => {
+    await browser.close();
   });
 
-  it('returns ok with note when no sortable columns exist', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent('<table><thead><tr><th>x</th></tr></thead><tbody></tbody></table>');
-      const table = makeTableSpec({
-        columns: [{ label: 'x', headerLocator: 'th', sortable: false }],
-      });
-      const outcome = await tableSortEachColumn.run({ tableId: 't1' }, makeContext(page, table));
-      expect(outcome.status).toBe('ok');
-      expect(outcome.summary).toMatch(/no sortable/i);
-    } finally {
-      await page.close();
-    }
+  it('returns failed when tableId is not in the page model', async () => {
+    await page.setContent('<div>no tables here</div>');
+    const table = makeTable();
+    const ctx = makeContext(page, table);
+    const result = await walkPagination.run({ tableId: 'nonexistent-table' }, ctx);
+    expect(result.status).toBe('failed');
+    expect(result.summary).toMatch(/not found/);
+    expect(result.summary).toContain('nonexistent-table');
   });
-});
 
-// ---------------------------------------------------------------------------
-// 2. table_paginate_walk
-// ---------------------------------------------------------------------------
-
-describe('table_paginate_walk', () => {
-  it('returns ok when each page shows distinct rows', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t">
-          <thead><tr><th>id</th></tr></thead>
-          <tbody id="body">
-            <tr><td>p1-row1</td></tr>
-            <tr><td>p1-row2</td></tr>
-          </tbody>
-        </table>
-        <div id="pg">
-          <button data-page="1">1</button>
-          <button data-page="2">2</button>
-          <button data-page="3">3</button>
-          <button aria-label="Last page">Last</button>
-        </div>
-        <script>
-          const pages = {
-            1: ['p1-row1', 'p1-row2'],
-            2: ['p2-row1', 'p2-row2'],
-            3: ['p3-row1', 'p3-row2'],
-          };
-          function render(p) {
-            const body = document.getElementById('body');
-            body.innerHTML = '';
-            for (const r of pages[p]) {
-              const tr = document.createElement('tr');
+  it('walks 3 pages and returns ok when content changes each page', async () => {
+    // Each click on Next replaces tbody content with distinct rows.
+    await page.setContent(`
+      <table id="data-table">
+        <tbody id="tbody">
+          <tr><td>page-1-row-A</td></tr>
+          <tr><td>page-1-row-B</td></tr>
+        </tbody>
+      </table>
+      <nav id="pagination">
+        <button id="next-btn" aria-label="Next page">Next</button>
+      </nav>
+      <script>
+        let currentPage = 1;
+        const pages = {
+          1: [['page-1-row-A'], ['page-1-row-B']],
+          2: [['page-2-row-A'], ['page-2-row-B']],
+          3: [['page-3-row-A'], ['page-3-row-B']],
+        };
+        function render(p) {
+          const tbody = document.getElementById('tbody');
+          tbody.innerHTML = '';
+          for (const cells of pages[p]) {
+            const tr = document.createElement('tr');
+            for (const text of cells) {
               const td = document.createElement('td');
-              td.textContent = r;
+              td.textContent = text;
               tr.appendChild(td);
-              body.appendChild(tr);
             }
+            tbody.appendChild(tr);
           }
-          for (const b of document.querySelectorAll('#pg button')) {
-            b.addEventListener('click', () => {
-              const p = b.getAttribute('data-page');
-              if (p) render(p);
-              else if (b.getAttribute('aria-label') === 'Last page') render(3);
-            });
+        }
+        document.getElementById('next-btn').addEventListener('click', () => {
+          if (currentPage < 3) {
+            currentPage++;
+            render(currentPage);
           }
-        </script>
-      `);
-      const table = makeTableSpec({
-        tableLocator: '#t',
-        pagination: { locator: '#pg' },
-        rowCount: 2,
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tablePaginateWalk.run({ tableId: 't1' }, ctx);
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as { overlaps: unknown[]; pagesVisited: unknown[] };
-      expect(ev.overlaps).toHaveLength(0);
-      expect(ev.pagesVisited.length).toBeGreaterThanOrEqual(2);
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('returns suspicious when the same row appears on two pages', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t">
-          <thead><tr><th>id</th></tr></thead>
-          <tbody id="body">
-            <tr><td>shared-row</td></tr>
-            <tr><td>p1-only</td></tr>
-          </tbody>
-        </table>
-        <div id="pg">
-          <button data-page="1">1</button>
-          <button data-page="2">2</button>
-        </div>
-        <script>
-          const pages = {
-            1: ['shared-row', 'p1-only'],
-            2: ['shared-row', 'p2-only'],
-          };
-          function render(p) {
-            const body = document.getElementById('body');
-            body.innerHTML = '';
-            for (const r of pages[p]) {
-              const tr = document.createElement('tr');
-              const td = document.createElement('td');
-              td.textContent = r;
-              tr.appendChild(td);
-              body.appendChild(tr);
-            }
+          if (currentPage >= 3) {
+            document.getElementById('next-btn').setAttribute('disabled', 'disabled');
           }
-          for (const b of document.querySelectorAll('#pg button')) {
-            b.addEventListener('click', () => {
-              const p = b.getAttribute('data-page');
-              if (p) render(p);
-            });
-          }
-        </script>
-      `);
-      const table = makeTableSpec({
-        tableLocator: '#t',
-        pagination: { locator: '#pg' },
-        rowCount: 2,
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tablePaginateWalk.run({ tableId: 't1', maxPages: 3 }, ctx);
-      expect(outcome.status).toBe('suspicious');
-      const ev = outcome.evidence as { overlaps: Array<{ rowId: string }> };
-      expect(ev.overlaps.length).toBeGreaterThan(0);
-      expect(ev.overlaps[0].rowId).toBe('shared-row');
-    } finally {
-      await page.close();
-    }
+        });
+      </script>
+    `);
+
+    const table = makeTable({
+      pagination: { locator: '#pagination' },
+      rowCount: 2,
+    });
+    const ctx = makeContext(page, table);
+    const result = await walkPagination.run({ tableId: 'tbl-1', maxPages: 3 }, ctx);
+
+    expect(result.status).toBe('ok');
+    expect(result.summary).toMatch(/3 page\(s\)/);
+    const snapshots = result.evidence.snapshots as Array<{
+      index: number;
+      rowCount: number;
+      firstRowText: string;
+    }>;
+    expect(snapshots).toHaveLength(3);
+    expect(snapshots[0].firstRowText).toContain('page-1-row-A');
+    expect(snapshots[1].firstRowText).toContain('page-2-row-A');
+    expect(snapshots[2].firstRowText).toContain('page-3-row-A');
+    expect(result.evidence.duplicatePages).toEqual([]);
+    expect(result.evidence.emptyAfterNonempty).toBe(false);
   });
 
-  it('returns ok with note when no pagination exists', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent('<table><tbody><tr><td>a</td></tr></tbody></table>');
-      const outcome = await tablePaginateWalk.run(
-        { tableId: 't1' },
-        makeContext(page, makeTableSpec()),
-      );
-      expect(outcome.status).toBe('ok');
-      expect(outcome.summary).toMatch(/no pagination/i);
-    } finally {
-      await page.close();
-    }
-  });
-});
+  it('flags suspicious when Next button is present but clicking it does not change rows', async () => {
+    // Next button exists and is enabled, but clicking it does nothing —
+    // the rows stay identical across pages.
+    await page.setContent(`
+      <table id="data-table">
+        <tbody>
+          <tr><td>frozen-row-A</td></tr>
+          <tr><td>frozen-row-B</td></tr>
+        </tbody>
+      </table>
+      <nav id="pagination">
+        <button id="next-btn" aria-label="Next page">Next</button>
+      </nav>
+      <script>
+        // Intentionally does nothing on click.
+        document.getElementById('next-btn').addEventListener('click', () => {});
+      </script>
+    `);
 
-// ---------------------------------------------------------------------------
-// 3. table_filter_search
-// ---------------------------------------------------------------------------
+    const table = makeTable({
+      pagination: { locator: '#pagination' },
+      rowCount: 2,
+    });
+    const ctx = makeContext(page, table);
+    // maxPages=3 so it attempts to click Next twice; both clicks leave rows unchanged.
+    const result = await walkPagination.run({ tableId: 'tbl-1', maxPages: 3 }, ctx);
 
-describe('table_filter_search', () => {
-  it('captures rowCount per query when filter input changes visible rows', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <input type="search" id="filter" placeholder="Filter">
-        <table id="t">
-          <thead><tr><th>name</th></tr></thead>
-          <tbody id="body">
-            <tr><td>Apple</td></tr>
-            <tr><td>Banana</td></tr>
-            <tr><td>Cherry</td></tr>
-          </tbody>
-        </table>
-        <script>
-          const all = ['Apple', 'Banana', 'Cherry'];
-          const input = document.getElementById('filter');
-          input.addEventListener('input', () => {
-            const q = input.value.toLowerCase();
-            const body = document.getElementById('body');
-            body.innerHTML = '';
-            for (const v of all) {
-              if (!q || v.toLowerCase().includes(q)) {
-                const tr = document.createElement('tr');
-                const td = document.createElement('td');
-                td.textContent = v;
-                tr.appendChild(td);
-                body.appendChild(tr);
-              }
-            }
-          });
-        </script>
-      `);
-      const table = makeTableSpec({
-        tableLocator: '#t',
-        filters: [
-          {
-            locator: '#filter',
-            label: 'Filter',
-            type: 'input',
-            disabled: false,
-            intent: 'action',
-          },
-        ],
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tableFilterSearch.run(
-        { tableId: 't1', queries: ['', 'app', 'zzz-no-match'] },
-        ctx,
-      );
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as {
-        perQuery: Array<{ query: string; rowCount: number }>;
-      };
-      const byQuery = Object.fromEntries(ev.perQuery.map((p) => [p.query, p.rowCount]));
-      expect(byQuery['']).toBe(3);
-      expect(byQuery.app).toBe(1);
-      expect(byQuery['zzz-no-match']).toBe(0);
-    } finally {
-      await page.close();
-    }
+    expect(result.status).toBe('suspicious');
+    expect(result.summary).toMatch(/anomaly/i);
+    const dupes = result.evidence.duplicatePages as number[];
+    expect(dupes.length).toBeGreaterThan(0);
   });
 
-  it('returns ok with note when no filter input is present', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent('<table id="t"><tbody><tr><td>a</td></tr></tbody></table>');
-      const outcome = await tableFilterSearch.run(
-        { tableId: 't1' },
-        makeContext(page, makeTableSpec({ tableLocator: '#t' })),
-      );
-      expect(outcome.status).toBe('ok');
-      expect(outcome.summary).toMatch(/no filter/i);
-    } finally {
-      await page.close();
-    }
+  it('returns ok when no Next button exists at all (single-page table)', async () => {
+    // A table with no pagination whatsoever — single-page, normal terminal state.
+    await page.setContent(`
+      <table id="data-table">
+        <tbody>
+          <tr><td>only-row-A</td></tr>
+          <tr><td>only-row-B</td></tr>
+        </tbody>
+      </table>
+    `);
+
+    const table = makeTable({ rowCount: 2 });
+    const ctx = makeContext(page, table);
+    const result = await walkPagination.run({ tableId: 'tbl-1' }, ctx);
+
+    expect(result.status).toBe('ok');
+    // Should walk 1 page and stop cleanly.
+    const snapshots = result.evidence.snapshots as Array<{ rowCount: number }>;
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0].rowCount).toBe(2);
+    // Steps should mention pagination ended.
+    expect(result.steps.some((s) => s.label.includes('pagination ended'))).toBe(true);
   });
-});
-
-// ---------------------------------------------------------------------------
-// 4. table_select_all_bulk
-// ---------------------------------------------------------------------------
-
-describe('table_select_all_bulk', () => {
-  it('clicks select-all and the named bulk action', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t">
-          <thead>
-            <tr>
-              <th><input type="checkbox" data-testid="select-all" id="sa"></th>
-              <th>name</th>
-            </tr>
-          </thead>
-          <tbody id="body">
-            <tr><td><input type="checkbox" class="rb"></td><td>r1</td></tr>
-            <tr><td><input type="checkbox" class="rb"></td><td>r2</td></tr>
-          </tbody>
-        </table>
-        <button id="bulk-delete">Delete selected</button>
-        <script>
-          document.getElementById('sa').addEventListener('change', (e) => {
-            for (const cb of document.querySelectorAll('.rb')) cb.checked = e.target.checked;
-          });
-          document.getElementById('bulk-delete').addEventListener('click', () => {
-            for (const cb of document.querySelectorAll('.rb')) {
-              if (cb.checked) cb.closest('tr').remove();
-            }
-          });
-        </script>
-      `);
-      const table = makeTableSpec({
-        tableLocator: '#t',
-        bulkActions: [
-          {
-            locator: '#bulk-delete',
-            label: 'Delete selected',
-            type: 'button',
-            disabled: false,
-            intent: 'action',
-          },
-        ],
-        rowCount: 2,
-      });
-      const ctx = makeContext(page, table);
-      const outcome = await tableSelectAllBulk.run({ tableId: 't1', action: 'Delete' }, ctx);
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as { beforeRowCount: number; afterRowCount: number };
-      expect(ev.beforeRowCount).toBe(2);
-      expect(ev.afterRowCount).toBe(0);
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('returns suspicious when no matching bulk action is found', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t">
-          <thead><tr><th><input type="checkbox" data-testid="select-all"></th></tr></thead>
-          <tbody><tr><td><input type="checkbox"></td></tr></tbody>
-        </table>
-      `);
-      const table = makeTableSpec({ tableLocator: '#t', rowCount: 1 });
-      const outcome = await tableSelectAllBulk.run(
-        { tableId: 't1', action: 'NoSuchAction' },
-        makeContext(page, table),
-      );
-      expect(outcome.status).toBe('suspicious');
-      expect(outcome.summary).toMatch(/no bulk action/i);
-    } finally {
-      await page.close();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 5. table_row_actions_audit
-// ---------------------------------------------------------------------------
-
-describe('table_row_actions_audit', () => {
-  it('opens kebab menus and records menu items as evidence', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <style>
-          [role=menu] { display: none; }
-          [role=menu][data-state=open] { display: block; }
-        </style>
-        <table id="t">
-          <thead><tr><th>name</th><th>actions</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>r1</td>
-              <td>
-                <button aria-label="Open menu" data-row="1">⋮</button>
-                <div role="menu" data-row="1">
-                  <button role="menuitem">Edit</button>
-                  <button role="menuitem">Delete</button>
-                  <button role="menuitem">Duplicate</button>
-                </div>
-              </td>
-            </tr>
-            <tr>
-              <td>r2</td>
-              <td>
-                <button aria-label="Open menu" data-row="2">⋮</button>
-                <div role="menu" data-row="2">
-                  <button role="menuitem">Edit</button>
-                  <button role="menuitem">Delete</button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <script>
-          document.addEventListener('click', (e) => {
-            const t = e.target;
-            if (t && t.getAttribute && t.getAttribute('aria-label') === 'Open menu') {
-              for (const m of document.querySelectorAll('[role=menu]')) {
-                m.removeAttribute('data-state');
-              }
-              const row = t.getAttribute('data-row');
-              const menu = document.querySelector('[role=menu][data-row="' + row + '"]');
-              if (menu) menu.setAttribute('data-state', 'open');
-            }
-          });
-          document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-              for (const m of document.querySelectorAll('[role=menu]')) m.removeAttribute('data-state');
-            }
-          });
-        </script>
-      `);
-      const table = makeTableSpec({ tableLocator: '#t', rowCount: 2 });
-      const outcome = await tableRowActionsAudit.run(
-        { tableId: 't1', maxRows: 2 },
-        makeContext(page, table),
-      );
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as {
-        perRow: Array<{ rowIndex: number; menuOpened: boolean; menuItems: string[] }>;
-      };
-      expect(ev.perRow).toHaveLength(2);
-      expect(ev.perRow[0].menuOpened).toBe(true);
-      expect(ev.perRow[0].menuItems).toEqual(
-        expect.arrayContaining(['Edit', 'Delete', 'Duplicate']),
-      );
-      expect(ev.perRow[1].menuItems).toEqual(expect.arrayContaining(['Edit', 'Delete']));
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('records error when no row-actions trigger exists', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t">
-          <tbody><tr><td>r1</td></tr></tbody>
-        </table>
-      `);
-      const outcome = await tableRowActionsAudit.run(
-        { tableId: 't1', maxRows: 1 },
-        makeContext(page, makeTableSpec({ tableLocator: '#t', rowCount: 1 })),
-      );
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as {
-        perRow: Array<{ menuOpened: boolean; error?: string }>;
-      };
-      expect(ev.perRow[0].menuOpened).toBe(false);
-      expect(ev.perRow[0].error).toBeDefined();
-    } finally {
-      await page.close();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 6. table_column_visibility
-// ---------------------------------------------------------------------------
-
-describe('table_column_visibility', () => {
-  it('toggles columns and reports a changed visible-set', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <button data-testid="column-toggle" id="ct">Columns</button>
-        <div role="menu" id="cmenu" style="display:none">
-          <button role="menuitemcheckbox" data-col="A">A</button>
-          <button role="menuitemcheckbox" data-col="B">B</button>
-        </div>
-        <table id="t">
-          <thead><tr><th data-col="A">A</th><th data-col="B">B</th></tr></thead>
-          <tbody><tr><td>1</td><td>2</td></tr></tbody>
-        </table>
-        <script>
-          document.getElementById('ct').addEventListener('click', () => {
-            document.getElementById('cmenu').style.display = 'block';
-          });
-          for (const b of document.querySelectorAll('#cmenu [role=menuitemcheckbox]')) {
-            b.addEventListener('click', () => {
-              const c = b.getAttribute('data-col');
-              for (const el of document.querySelectorAll('[data-col="' + c + '"]')) {
-                if (el.tagName === 'TH' || el.tagName === 'TD') {
-                  el.style.display = el.style.display === 'none' ? '' : 'none';
-                }
-              }
-            });
-          }
-        </script>
-      `);
-      const table = makeTableSpec({ tableLocator: '#t', rowCount: 1 });
-      const outcome = await tableColumnVisibility.run({ tableId: 't1' }, makeContext(page, table));
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as {
-        perToggle: Array<{ before: number; after: number; changed: boolean }>;
-      };
-      expect(ev.perToggle.some((t) => t.changed)).toBe(true);
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('returns ok with note when no column-visibility control exists', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(
-        '<table id="t"><thead><tr><th>x</th></tr></thead><tbody></tbody></table>',
-      );
-      const outcome = await tableColumnVisibility.run(
-        { tableId: 't1' },
-        makeContext(page, makeTableSpec({ tableLocator: '#t' })),
-      );
-      expect(outcome.status).toBe('ok');
-      expect(outcome.summary).toMatch(/no column-visibility/i);
-    } finally {
-      await page.close();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 7. table_export_download
-// ---------------------------------------------------------------------------
-
-describe('table_export_download', () => {
-  it('captures filename when export triggers a download', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t"><tbody><tr><td>r1</td></tr></tbody></table>
-        <a id="dl" download="export.csv" href="data:text/csv;charset=utf-8,foo%2Cbar%0A1%2C2">Export</a>
-        <script>
-          // Wrap the link so the playbook's button-text matcher finds it:
-          const wrap = document.createElement('button');
-          wrap.textContent = 'Export';
-          wrap.addEventListener('click', () => document.getElementById('dl').click());
-          document.body.appendChild(wrap);
-        </script>
-      `);
-      const table = makeTableSpec({ tableLocator: '#t', rowCount: 1 });
-      const outcome = await tableExportDownload.run({ tableId: 't1' }, makeContext(page, table));
-      expect(outcome.status).toBe('ok');
-      const ev = outcome.evidence as { suggestedFilename?: string };
-      expect(ev.suggestedFilename).toBe('export.csv');
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('returns suspicious when click does not produce a download', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <table id="t"><tbody><tr><td>r1</td></tr></tbody></table>
-        <button id="dl">Export</button>
-        <script>
-          // Click does nothing — no download fires.
-          document.getElementById('dl').addEventListener('click', () => {});
-        </script>
-      `);
-      const table = makeTableSpec({ tableLocator: '#t', rowCount: 1 });
-      const outcome = await tableExportDownload.run({ tableId: 't1' }, makeContext(page, table));
-      expect(outcome.status).toBe('suspicious');
-      expect(outcome.summary).toMatch(/no download event/i);
-    } finally {
-      await page.close();
-    }
-  }, 15_000);
 });

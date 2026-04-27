@@ -1,39 +1,24 @@
 /**
- * Plugin registry. Exposes `resolveAuthProvider` (used by the orchestrator's
- * pre-login layer) plus default LinkExtractor / LogoutGuard singletons.
- *
- * The shipped providers map to the `target.auth.type` values referenced in
- * §11 of the v2 spec. `'none'` is back-compat: existing v1 YAMLs use it for
- * "no pre-login, optionally attach storage state", which is exactly what
- * the storage-state provider does.
+ * Plugin registry. Auth providers only — link extraction and logout detection
+ * are plain functions in `src/crawler/extract-links.ts` and
+ * `src/safety/logout-guard.ts` respectively.
  */
 
-import { auth0Provider } from './auth/auth0.ts';
-import { bearerTokenProvider } from './auth/bearer-token.ts';
 import { formAuthProvider } from './auth/form.ts';
 import { storageStateProvider } from './auth/storage-state.ts';
-import { defaultLinkExtractor } from './link-extractors/default.ts';
-import { defaultLogoutGuard } from './logout-guards/default.ts';
-import type { AuthProvider, LinkExtractor, LogoutGuard } from './types.ts';
+import type { AuthProvider } from './types.ts';
 
-export {
-  auth0Provider,
-  bearerTokenProvider,
-  defaultLinkExtractor,
-  defaultLogoutGuard,
-  formAuthProvider,
-  storageStateProvider,
-};
+export { formAuthProvider, storageStateProvider };
 
 const PROVIDERS: Record<string, AuthProvider> = {
   form: formAuthProvider,
-  auth0: auth0Provider,
   'storage-state': storageStateProvider,
-  bearer: bearerTokenProvider,
-  // Back-compat with v1 YAML: `auth.type: none` historically meant "skip
-  // pre-login, optionally attach storage_state_path". The storage-state
-  // provider implements exactly that.
+  // Back-compat: pre-V3 YAML used `auth.type: none` for "skip pre-login,
+  // optionally attach storage_state_path", which is exactly storage-state.
   none: storageStateProvider,
+  // Auth0 is a form login. Use `auth.type: form` with the Auth0 selectors,
+  // OR use `auth.type: auth0` and we route to formAuthProvider.
+  auth0: formAuthProvider,
 };
 
 export function resolveAuthProvider(name: string): AuthProvider {
@@ -44,10 +29,8 @@ export function resolveAuthProvider(name: string): AuthProvider {
   return p;
 }
 
-/** Names of every built-in provider, in registration order. Useful for
- * surfacing the catalog in error messages without leaking the singletons. */
 export function listAuthProviderNames(): string[] {
   return Object.keys(PROVIDERS);
 }
 
-export type { AuthProvider, LinkExtractor, LogoutGuard };
+export type { AuthProvider };

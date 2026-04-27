@@ -4,9 +4,9 @@
  * as agents discover new routes at runtime.
  */
 
-import type { PageModel } from '../page-model/types.ts';
-import type { LinkExtractor } from '../plugins/types.ts';
+import type { Page } from 'playwright';
 import type { Logger } from '../logging/logger.ts';
+import type { PageModel } from '../page-model/types.ts';
 
 export interface RouteEntry {
   url: string;
@@ -52,8 +52,8 @@ export interface CrawlOptions {
   maxWallClockMs: number;
   /** Allowed-host filter from config. */
   allowedHosts: string[];
-  /** Pluggable link extractor. */
-  linkExtractor: LinkExtractor;
+  /** Optional custom link extractor. Defaults to built-in same-origin walker. */
+  linkExtractor?: (page: Page) => Promise<string[]>;
   logger: Logger;
 }
 

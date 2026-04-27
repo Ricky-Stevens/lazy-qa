@@ -270,6 +270,70 @@ describe('evaluate handler — redaction', () => {
   });
 });
 
+describe('storage_inspect handler — redaction', () => {
+  let browser: Browser;
+  let runDir: string;
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-storage-test-'));
+  });
+
+  afterAll(async () => {
+    await browser.close();
+    await rm(runDir, { recursive: true, force: true });
+  });
+
+  it('storage_inspect redacts secret-shaped values', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    // Navigate to a routed URL so localStorage is accessible (data:/about: contexts block it).
+    await ctx.route('**/storage-test', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<html><body><h1>Storage</h1></body></html>',
+      });
+    });
+    await page.goto('https://app.test/storage-test');
+
+    await page.evaluate(() => {
+      localStorage.setItem('auth_token', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.x.y');
+      localStorage.setItem('theme', 'dark');
+    });
+
+    const { accessor: siteMap } = makeFakeSiteMap();
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbookRegistry: new PlaybookRegistry(),
+    });
+
+    const tool = rawTools.find((t) => t.name === 'storage_inspect');
+    expect(tool, 'storage_inspect tool not registered').toBeDefined();
+    if (!tool) {
+      await ctx.close();
+      return;
+    }
+
+    const result = await tool.handler({});
+    const text = result.content[0]?.text ?? '';
+
+    expect(text).toContain('localStorage:');
+    // theme is a non-secret key — value passes through unmodified
+    expect(text).toContain('theme: dark');
+    // auth_token matches SECRET_KEY_RE — value is fingerprinted (not the raw JWT)
+    // Fingerprint format: first4…last4
+    expect(text).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.x.y');
+    // Fingerprint starts with "eyJh" (first 4 chars of the JWT header)
+    expect(text).toMatch(/auth_token: eyJh…/);
+
+    await ctx.close();
+  });
+});
+
 describe('navigate handler — host allowlist', () => {
   let browser: Browser;
   let runDir: string;

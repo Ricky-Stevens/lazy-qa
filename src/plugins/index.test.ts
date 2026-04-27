@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  auth0Provider,
-  bearerTokenProvider,
   formAuthProvider,
   listAuthProviderNames,
   resolveAuthProvider,
@@ -13,16 +11,12 @@ describe('resolveAuthProvider', () => {
     expect(resolveAuthProvider('form')).toBe(formAuthProvider);
   });
 
-  it("returns the auth0 provider for 'auth0'", () => {
-    expect(resolveAuthProvider('auth0')).toBe(auth0Provider);
+  it("routes 'auth0' to form provider for v2 back-compat", () => {
+    expect(resolveAuthProvider('auth0')).toBe(formAuthProvider);
   });
 
   it("returns the storage-state provider for 'storage-state'", () => {
     expect(resolveAuthProvider('storage-state')).toBe(storageStateProvider);
-  });
-
-  it("returns the bearer provider for 'bearer'", () => {
-    expect(resolveAuthProvider('bearer')).toBe(bearerTokenProvider);
   });
 
   it("aliases 'none' to storage-state for v1 back-compat", () => {
@@ -46,7 +40,6 @@ describe('listAuthProviderNames', () => {
     expect(names).toContain('form');
     expect(names).toContain('auth0');
     expect(names).toContain('storage-state');
-    expect(names).toContain('bearer');
     expect(names).toContain('none');
   });
 });

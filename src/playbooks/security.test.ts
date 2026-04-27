@@ -11,15 +11,10 @@ import type { Logger } from '../logging/logger.ts';
 import type { PlaybookContext } from './framework.ts';
 import {
   __internal,
-  clickjackingProbe,
-  csrfProbe,
+  headerAudit,
   idorProbe,
-  openRedirectProbe,
   resolveOnOrigin,
-  roleEscalationProbe,
-  sensitiveUrlAudit,
-  sessionInvalidationProbe,
-  storageInspect,
+  sensitivePathAudit,
 } from './security.ts';
 
 const APP_ORIGIN = 'https://app.test';
@@ -86,7 +81,7 @@ beforeEach(async () => {
 });
 
 // -----------------------------------------------------------------------------
-// internal helpers
+// internal helpers — resolveOnOrigin
 // -----------------------------------------------------------------------------
 
 describe('internal helpers', () => {
@@ -110,6 +105,72 @@ describe('internal helpers', () => {
 
   it('replaceIdSegment returns null when no id segment present', () => {
     expect(__internal.replaceIdSegment('/dashboard', '1')).toBeNull();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// internal helpers — auditHeaders
+// -----------------------------------------------------------------------------
+
+describe('auditHeaders (internal)', () => {
+  it('flags anti-clickjacking when neither X-Frame-Options nor CSP frame-ancestors is set', () => {
+    const result = __internal.auditHeaders(
+      { 'content-security-policy': "default-src 'self'" },
+      false,
+    );
+    expect(result.missingCritical).toContain('anti-clickjacking');
+  });
+
+  it('is satisfied by X-Frame-Options alone', () => {
+    const result = __internal.auditHeaders({ 'x-frame-options': 'DENY' }, false);
+    expect(result.missingCritical).not.toContain('anti-clickjacking');
+  });
+
+  it('is satisfied by CSP frame-ancestors', () => {
+    const result = __internal.auditHeaders(
+      { 'content-security-policy': "frame-ancestors 'self'" },
+      false,
+    );
+    expect(result.missingCritical).not.toContain('anti-clickjacking');
+  });
+
+  it('skips HSTS check on non-HTTPS', () => {
+    // No HSTS header but HTTP — should NOT flag hsts.
+    const result = __internal.auditHeaders({ 'x-frame-options': 'DENY' }, false);
+    expect(result.missingCritical).not.toContain('hsts');
+  });
+
+  it('flags HSTS as missing on HTTPS when header absent', () => {
+    const result = __internal.auditHeaders({ 'x-frame-options': 'DENY' }, true);
+    expect(result.missingCritical).toContain('hsts');
+  });
+
+  it('does not flag HSTS when header is present on HTTPS', () => {
+    const result = __internal.auditHeaders(
+      { 'x-frame-options': 'DENY', 'strict-transport-security': 'max-age=31536000' },
+      true,
+    );
+    expect(result.missingCritical).not.toContain('hsts');
+  });
+
+  it('reports missing nice-to-have headers', () => {
+    const result = __internal.auditHeaders({ 'x-frame-options': 'DENY' }, false);
+    expect(result.missingNiceToHave).toContain('x-content-type-options');
+    expect(result.missingNiceToHave).toContain('referrer-policy');
+    expect(result.missingNiceToHave).toContain('content-security-policy');
+  });
+
+  it('does not include nice-to-have headers that are present', () => {
+    const result = __internal.auditHeaders(
+      {
+        'x-frame-options': 'DENY',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+        'content-security-policy': "default-src 'self'",
+      },
+      false,
+    );
+    expect(result.missingNiceToHave).toHaveLength(0);
   });
 });
 
@@ -160,136 +221,27 @@ describe('idor_probe', () => {
     const outcome = await idorProbe.run({ routeWithId: '/dashboard' }, ctx);
     expect(outcome.status).toBe('ok');
   });
-});
 
-// -----------------------------------------------------------------------------
-// storage_inspect
-// -----------------------------------------------------------------------------
-
-describe('storage_inspect', () => {
-  it('flags JWT-like value in localStorage as suspicious', async () => {
-    await context.route('**/storage-test', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Storage</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/storage-test`);
-    await page.evaluate(() => {
-      // Realistic JWT shape: header.payload.signature (base64-ish).
-      // biome-ignore lint/suspicious/noExplicitAny: DOM globals
-      const w = globalThis as any;
-      w.localStorage.setItem(
-        'auth_token',
-        'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature',
-      );
-      w.sessionStorage.setItem('benign', 'just-a-flag');
-    });
-    const ctx = makeCtx(page);
-    const outcome = await storageInspect.run({}, ctx);
-    expect(outcome.status).toBe('suspicious');
-    const findings = outcome.evidence.findings as Array<{ kind: string; key: string }>;
-    expect(findings.some((f) => f.kind === 'jwt' && f.key === 'auth_token')).toBe(true);
-  });
-
-  it('returns ok when storage has no sensitive values', async () => {
-    await context.route('**/storage-test', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Storage</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/storage-test`);
-    await page.evaluate(() => {
-      // biome-ignore lint/suspicious/noExplicitAny: DOM globals
-      const w = globalThis as any;
-      w.localStorage.setItem('theme', 'dark');
-      w.localStorage.setItem('lang', 'en');
-    });
-    const ctx = makeCtx(page);
-    const outcome = await storageInspect.run({}, ctx);
-    expect(outcome.status).toBe('ok');
+  it('name is idor_probe', () => {
+    expect(idorProbe.name).toBe('idor_probe');
   });
 });
 
 // -----------------------------------------------------------------------------
-// clickjacking_probe
+// header_audit — playbook integration
 // -----------------------------------------------------------------------------
+// Note: page.request.get() is Playwright's APIRequestContext which bypasses
+// context.route() intercepts. Integration tests therefore test behaviors that
+// don't depend on intercepted HTTP: off-allowlist skipping, fetch-failed
+// fallback (→ ok), and evidence shape. The detection logic itself is covered
+// thoroughly by the auditHeaders unit tests above.
 
-describe('clickjacking_probe', () => {
-  // TODO(WP2): wire up; spec'd but never implemented — page.request.fetch() bypasses
-  // context.route() intercepts (APIRequestContext is separate from browser routing).
-  it.skip('flags suspicious when neither X-Frame-Options nor frame-ancestors is set', async () => {
-    await context.route('**/page', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        // Note: no X-Frame-Options, no Content-Security-Policy frame-ancestors.
-        headers: { 'content-security-policy': "default-src 'self'" },
-        body: '<html><body><h1>Page</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/page`);
-    const ctx = makeCtx(page);
-    const outcome = await clickjackingProbe.run({ url: '/page' }, ctx);
-    expect(outcome.status).toBe('suspicious');
+describe('header_audit', () => {
+  it('name is header_audit', () => {
+    expect(headerAudit.name).toBe('header_audit');
   });
 
-  it('returns ok when X-Frame-Options is set', async () => {
-    await context.route('**/safe', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        headers: { 'x-frame-options': 'DENY' },
-        body: '<html><body><h1>Safe</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/safe`);
-    const ctx = makeCtx(page);
-    const outcome = await clickjackingProbe.run({ url: '/safe' }, ctx);
-    expect(outcome.status).toBe('ok');
-  });
-
-  it('returns ok when CSP frame-ancestors is set', async () => {
-    await context.route('**/csp-safe', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        headers: { 'content-security-policy': "frame-ancestors 'self'" },
-        body: '<html><body><h1>Safe</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/csp-safe`);
-    const ctx = makeCtx(page);
-    const outcome = await clickjackingProbe.run({ url: '/csp-safe' }, ctx);
-    expect(outcome.status).toBe('ok');
-  });
-});
-
-// -----------------------------------------------------------------------------
-// csrf_probe
-// -----------------------------------------------------------------------------
-
-describe('csrf_probe', () => {
-  // TODO(WP2): wire up; spec'd but never implemented — page.request.post() bypasses
-  // context.route() intercepts (APIRequestContext is separate from browser routing).
-  it.skip('returns ok when backend rejects with 403', async () => {
-    await context.route('**/api/transfer', async (route) => {
-      // Properly-protected: rejects POSTs with attacker referer.
-      if (route.request().method() === 'POST') {
-        await route.fulfill({
-          status: 403,
-          contentType: 'application/json',
-          body: '{"error":"forbidden"}',
-        });
-        return;
-      }
-      await route.continue();
-    });
-    await page.goto(`data:text/html,<html><body><h1>Origin</h1></body></html>`);
-    // Need a real origin for resolveOnOrigin — navigate to the app first.
+  it('records off-allowlist path as skipped and returns ok', async () => {
     await context.route('**/start', async (route) => {
       await route.fulfill({
         status: 200,
@@ -299,21 +251,15 @@ describe('csrf_probe', () => {
     });
     await page.goto(`${APP_ORIGIN}/start`);
     const ctx = makeCtx(page);
-    const outcome = await csrfProbe.run({ actionUrl: '/api/transfer' }, ctx);
+    const outcome = await headerAudit.run({ paths: ['https://evil.example.com/x'] }, ctx);
+    // Off-allowlist path has no missingCritical, so status is ok.
     expect(outcome.status).toBe('ok');
-    expect(outcome.evidence.status).toBe(403);
+    const results = outcome.evidence.results as Array<{ skipped?: string; path: string }>;
+    expect(results[0]?.skipped).toBe('off-allowlist');
+    expect(results[0]?.path).toBe('https://evil.example.com/x');
   });
 
-  // TODO(WP2): wire up; spec'd but never implemented — page.request.post() bypasses
-  // context.route() intercepts (APIRequestContext is separate from browser routing).
-  it.skip('flags suspicious when backend accepts 200', async () => {
-    await context.route('**/api/transfer', async (route) => {
-      if (route.request().method() === 'POST') {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
-        return;
-      }
-      await route.continue();
-    });
+  it('records fetch-failed paths as skipped and returns ok', async () => {
     await context.route('**/start', async (route) => {
       await route.fulfill({
         status: 200,
@@ -323,18 +269,20 @@ describe('csrf_probe', () => {
     });
     await page.goto(`${APP_ORIGIN}/start`);
     const ctx = makeCtx(page);
-    const outcome = await csrfProbe.run({ actionUrl: '/api/transfer' }, ctx);
-    expect(outcome.status).toBe('suspicious');
-    expect(outcome.evidence.status).toBe(200);
+    // /nonexistent on https://app.test will fail to connect (no real server).
+    // The probe catches the error and records it as fetch-failed.
+    const outcome = await headerAudit.run({ paths: ['/nonexistent-path-for-test'] }, ctx);
+    // fetch-failed paths have missingCritical: [] so status is ok.
+    expect(outcome.status).toBe('ok');
+    const results = outcome.evidence.results as Array<{
+      skipped?: string;
+      missingCritical: string[];
+    }>;
+    expect(results[0]?.skipped).toBe('fetch-failed');
+    expect(results[0]?.missingCritical).toHaveLength(0);
   });
-});
 
-// -----------------------------------------------------------------------------
-// role_escalation_probe (light coverage)
-// -----------------------------------------------------------------------------
-
-describe('role_escalation_probe', () => {
-  it('flags suspicious when /admin returns 200 with real content', async () => {
+  it('collects evidence for multiple paths with mixed results', async () => {
     await context.route('**/start', async (route) => {
       await route.fulfill({
         status: 200,
@@ -342,70 +290,30 @@ describe('role_escalation_probe', () => {
         body: '<html><body><h1>Start</h1></body></html>',
       });
     });
-    await context.route('**/admin', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Admin Console</h1><p>Users list</p></body></html>',
-      });
-    });
-    // Other paths → 404
-    await context.route('**/internal', async (route) => {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/html',
-        body: '<html><body><h1>Not Found</h1></body></html>',
-      });
-    });
-    await context.route('**/debug', async (route) => {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/html',
-        body: '<html><body><h1>Not Found</h1></body></html>',
-      });
-    });
-    await context.route('**/api/users', async (route) => {
-      await route.fulfill({
-        status: 401,
-        contentType: 'application/json',
-        body: '{"error":"unauthorized"}',
-      });
-    });
-    await context.route('**/api/swagger', async (route) => {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/html',
-        body: '<html><body><h1>Not Found</h1></body></html>',
-      });
-    });
-    await context.route('**/.git/HEAD', async (route) => {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/html',
-        body: '<html><body><h1>Not Found</h1></body></html>',
-      });
-    });
-    await context.route('**/api/admin', async (route) => {
-      await route.fulfill({
-        status: 404,
-        contentType: 'text/html',
-        body: '<html><body><h1>Not Found</h1></body></html>',
-      });
-    });
     await page.goto(`${APP_ORIGIN}/start`);
     const ctx = makeCtx(page);
-    const outcome = await roleEscalationProbe.run({}, ctx);
-    expect(outcome.status).toBe('suspicious');
-    const flagged = outcome.steps.filter((s) => !s.ok);
-    expect(flagged.some((s) => s.label.includes('/admin'))).toBe(true);
+    const outcome = await headerAudit.run(
+      {
+        paths: ['https://evil.example.com/x', '/nonexistent-path-for-test'],
+      },
+      ctx,
+    );
+    const results = outcome.evidence.results as Array<{ skipped?: string }>;
+    expect(results).toHaveLength(2);
+    expect(results[0]?.skipped).toBe('off-allowlist');
+    expect(results[1]?.skipped).toBe('fetch-failed');
   });
 });
 
 // -----------------------------------------------------------------------------
-// sensitive_url_audit (light coverage)
+// sensitive_path_audit (light coverage)
 // -----------------------------------------------------------------------------
 
-describe('sensitive_url_audit', () => {
+describe('sensitive_path_audit', () => {
+  it('name is sensitive_path_audit', () => {
+    expect(sensitivePathAudit.name).toBe('sensitive_path_audit');
+  });
+
   it('flags 200 on /.git/HEAD even without heading content', async () => {
     await context.route('**/start', async (route) => {
       await route.fulfill({
@@ -444,92 +352,10 @@ describe('sensitive_url_audit', () => {
     }
     await page.goto(`${APP_ORIGIN}/start`);
     const ctx = makeCtx(page);
-    const outcome = await sensitiveUrlAudit.run({ paths: ['/.git/HEAD', '/admin'] }, ctx);
+    const outcome = await sensitivePathAudit.run({ paths: ['/.git/HEAD', '/admin'] }, ctx);
     expect(outcome.status).toBe('suspicious');
     const flagged = outcome.steps.filter((s) => !s.ok);
     expect(flagged.some((s) => s.label.includes('.git'))).toBe(true);
-  });
-});
-
-// -----------------------------------------------------------------------------
-// session_invalidation_probe (smoke — verifies redirect-to-login = ok)
-// -----------------------------------------------------------------------------
-
-describe('session_invalidation_probe', () => {
-  it('returns ok when revisit redirects to login', async () => {
-    let loggedOut = false;
-    await context.route('**/dashboard', async (route) => {
-      if (loggedOut) {
-        // Redirect to login.
-        await route.fulfill({
-          status: 302,
-          headers: { location: `${APP_ORIGIN}/login` },
-          body: '',
-        });
-        return;
-      }
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Dashboard</h1></body></html>',
-      });
-    });
-    await context.route('**/login', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Login</h1></body></html>',
-      });
-    });
-    await context.route('**/logout', async (route) => {
-      loggedOut = true;
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
-    });
-
-    await page.goto(`${APP_ORIGIN}/dashboard`);
-    const ctx = makeCtx(page);
-    const outcome = await sessionInvalidationProbe.run({}, ctx);
-    expect(outcome.status).toBe('ok');
-  });
-
-  // TODO(WP2): wire up; spec'd but never implemented — page.request.post() bypasses
-  // context.route() intercepts, so the logout POST side-effect never fires and
-  // the probe exits early on error rather than reaching the revisit step.
-  it.skip('flags suspicious when revisit still returns 200 outside /login', async () => {
-    await context.route('**/dashboard', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Dashboard</h1></body></html>',
-      });
-    });
-    await context.route('**/logout', async (route) => {
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
-    });
-    await page.goto(`${APP_ORIGIN}/dashboard`);
-    const ctx = makeCtx(page);
-    const outcome = await sessionInvalidationProbe.run({}, ctx);
-    expect(outcome.status).toBe('suspicious');
-  });
-});
-
-// -----------------------------------------------------------------------------
-// open_redirect_probe (smoke)
-// -----------------------------------------------------------------------------
-
-describe('open_redirect_probe', () => {
-  it('returns ok when app strips evil redirect and stays on origin', async () => {
-    await context.route('**/login**', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: '<html><body><h1>Login</h1></body></html>',
-      });
-    });
-    await page.goto(`${APP_ORIGIN}/login`);
-    const ctx = makeCtx(page);
-    const outcome = await openRedirectProbe.run({ routeWithRedirect: '/login' }, ctx);
-    expect(outcome.status).toBe('ok');
   });
 });
 

@@ -1,6 +1,6 @@
 import { type Browser, chromium, type Page } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { defaultLinkExtractor } from './extract-links.ts';
+import { extractLinks } from './extract-links.ts';
 
 let browser: Browser;
 let page: Page;
@@ -16,7 +16,7 @@ afterEach(async () => {
   await browser?.close();
 });
 
-describe('defaultLinkExtractor', () => {
+describe('extractLinks', () => {
   it('extracts plain anchors, role=link with data-href, and resolves relative URLs', async () => {
     // Use a real-origin route() handler so location.href is meaningful.
     await page.route('https://example.test/**', (route) => {
@@ -36,24 +36,24 @@ describe('defaultLinkExtractor', () => {
     });
     await page.goto('https://example.test/');
 
-    const links = await defaultLinkExtractor.extract(page);
+    const links = await extractLinks(page);
     expect(links).toContain('https://example.test/a');
     expect(links).toContain('https://example.test/b');
     expect(links).toContain('https://example.test/c');
     // Off-origin URLs are returned (filtering happens in the crawler).
     expect(links).toContain('https://other.com/x');
     // Hash / javascript: / mailto: are excluded.
-    expect(links.some((l) => l.startsWith('javascript:'))).toBe(false);
-    expect(links.some((l) => l.startsWith('mailto:'))).toBe(false);
+    expect(links.some((l: string) => l.startsWith('javascript:'))).toBe(false);
+    expect(links.some((l: string) => l.startsWith('mailto:'))).toBe(false);
     // The "#hash" anchor resolves to the page URL, not a fragment-only URL —
     // and we explicitly exclude `#`-leading hrefs anyway, so it's absent.
-    const fragmentish = links.filter((l) => l.endsWith('#hash'));
+    const fragmentish = links.filter((l: string) => l.endsWith('#hash'));
     expect(fragmentish).toHaveLength(0);
   });
 
   it('returns an empty array for a page with no link affordances', async () => {
     await page.setContent('<!doctype html><html><body><p>No links here.</p></body></html>');
-    const links = await defaultLinkExtractor.extract(page);
+    const links = await extractLinks(page);
     expect(links).toEqual([]);
   });
 
@@ -71,8 +71,8 @@ describe('defaultLinkExtractor', () => {
     });
     await page.goto('https://example.test/');
 
-    const links = await defaultLinkExtractor.extract(page);
-    const dupCount = links.filter((l) => l === 'https://example.test/dup').length;
+    const links = await extractLinks(page);
+    const dupCount = links.filter((l: string) => l === 'https://example.test/dup').length;
     expect(dupCount).toBe(1);
   });
 });

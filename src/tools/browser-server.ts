@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { expandRoute } from '../crawler/expand.ts';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
-import { redactForLlm } from '../logging/logger.ts';
+import { deepRedact, redactForLlm } from '../logging/logger.ts';
 import {
   count4xxIn,
   getEffectivePauseUntil,
@@ -34,8 +34,8 @@ import {
   runPlaybook,
 } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
-import { defaultLogoutGuard } from '../plugins/logout-guards/default.ts';
 import { isHostAllowed } from '../safety/guards.ts';
+import { isLogoutLink } from '../safety/logout-guard.ts';
 
 /** Per-agent backoff thresholds (carried over from v1). */
 const BACKOFF_4XX_THRESHOLD = 5;
@@ -117,7 +117,7 @@ export function isAuthWallUrl(rawUrl: string): boolean {
 
 /** Cheap hint-level logout check — used by find_and_click before any DOM lookup. */
 function hintLooksLikeLogout(hint: string): boolean {
-  return defaultLogoutGuard.isLogout({
+  return isLogoutLink({
     text: hint,
     ariaLabel: '',
     href: '',
@@ -145,7 +145,7 @@ async function locatorIsLogout(
       const title = (el.getAttribute?.('title') ?? '') as string;
       return { text, ariaLabel, href, testid, title };
     });
-    return defaultLogoutGuard.isLogout(info);
+    return isLogoutLink(info);
   } catch {
     // Inspection failed — be permissive (don't block on inspection error).
     return { matched: false };
@@ -855,6 +855,77 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         );
       },
     ),
+
+    defTool(
+      'storage_inspect',
+      'Read browser storage (localStorage, sessionStorage, cookies). Values pass through redactForLlm so secrets stay out of the LLM context. Use this instead of `evaluate` when inspecting storage.',
+      {
+        kinds: z.array(z.enum(['localStorage', 'sessionStorage', 'cookies'])).optional(),
+        includeValues: z.boolean().optional(),
+      },
+      async ({ kinds, includeValues }) => {
+        const resolvedKinds =
+          kinds ??
+          (['localStorage', 'sessionStorage', 'cookies'] as const as Array<
+            'localStorage' | 'sessionStorage' | 'cookies'
+          >);
+        const resolvedInclude = includeValues ?? true;
+        const page = ensureListeners();
+        const lines: string[] = [];
+
+        if (resolvedKinds.includes('localStorage') || resolvedKinds.includes('sessionStorage')) {
+          const dump = await page.evaluate(
+            ({ wantLocal, wantSession }: { wantLocal: boolean; wantSession: boolean }) => {
+              const out: { kind: string; entries: Array<[string, string]> }[] = [];
+              if (wantLocal)
+                out.push({
+                  kind: 'localStorage',
+                  entries: Object.entries({ ...localStorage }),
+                });
+              if (wantSession)
+                out.push({
+                  kind: 'sessionStorage',
+                  entries: Object.entries({ ...sessionStorage }),
+                });
+              return out;
+            },
+            {
+              wantLocal: resolvedKinds.includes('localStorage'),
+              wantSession: resolvedKinds.includes('sessionStorage'),
+            },
+          );
+
+          for (const { kind, entries } of dump) {
+            lines.push(`${kind}: ${entries.length} key(s)`);
+            for (const [k, v] of entries) {
+              // Use deepRedact with the key name so SECRET_KEY_RE can match
+              // key names like "auth_token", "api_key", etc. and redact their values.
+              const rendered = resolvedInclude
+                ? redactForLlm((deepRedact({ [k]: v }) as Record<string, unknown>)[k], 256)
+                : '[hidden]';
+              lines.push(`  - ${k}: ${rendered}`);
+            }
+          }
+        }
+
+        if (resolvedKinds.includes('cookies')) {
+          const browserCtx = page.context();
+          const cookies = await browserCtx.cookies(page.url()).catch(() => []);
+          lines.push(`cookies: ${cookies.length} cookie(s)`);
+          for (const c of cookies) {
+            const rendered = resolvedInclude
+              ? redactForLlm(
+                  (deepRedact({ [c.name]: c.value }) as Record<string, unknown>)[c.name],
+                  256,
+                )
+              : '[hidden]';
+            lines.push(`  - ${c.name}: ${rendered}`);
+          }
+        }
+
+        return textResult(lines.join('\n') || 'no storage entries');
+      },
+    ),
   ];
 
   // ─── Playbook tools ──────────────────────────────────────────────────────
@@ -951,4 +1022,5 @@ export const BROWSER_TOOL_NAMES = [
   'mcp__browser__fill_form',
   'mcp__browser__find_and_click',
   'mcp__browser__read_recent',
+  'mcp__browser__storage_inspect',
 ] as const;

@@ -52,7 +52,7 @@ The per-turn user message includes a sitemap snapshot listing unvisited routes, 
 
 ### 4. Browser MCP tools
 
-The browser server (`src/tools/browser-server.ts`) exposes 12 primitive/macro tools:
+The browser server (`src/tools/browser-server.ts`) exposes 13 primitive/macro tools:
 
 | Tool | Purpose |
 |---|---|
@@ -68,8 +68,9 @@ The browser server (`src/tools/browser-server.ts`) exposes 12 primitive/macro to
 | `fill_form` | Fill multiple fields + optional submit in one round-trip |
 | `find_and_click` | Find a button or link by visible text; tries multiple selector strategies; logout controls refused |
 | `read_recent` | One-call sweep: PageModel + console errors + last 5 network anomalies |
+| `storage_inspect` | Surface storage keys by kind (cookie / localStorage / sessionStorage); values are redacted by default |
 
-Playbook tools (`mcp__playbooks__*`) are mounted dynamically from the playbook registry and cover CRUD flows, table sorting, modal lifecycles, form validation, pagination, wizard traversal, security probes, and more.
+Playbook tools (`mcp__playbooks__*`) are mounted dynamically from the playbook registry. The persona drives exploration; playbooks are deterministic shortcuts for the turns that are tedious to do step-by-step.
 
 ### 5. Harness MCP tools
 
@@ -85,8 +86,6 @@ A sixth always-on supervisor agent (`src/orchestrator/supervisor.ts`) watches th
 - **Auth-walled** — agent URL is on an Auth0 login/logout page → calls `relogin_session` (re-auths the shared context, reloads sibling tabs), then nudges the agent to reload the dashboard.
 - **Backend storm** — two or more agents have ≥5 recent 4xx responses, or any single agent has ≥10 → calls `pause_agents` (agents sleep on their next action; default 60 s, hard ceiling 180 s), giving the backend time to recover.
 - **No progress** — agent hasn't taken a browser action in over 60 seconds → `nudge_agent` with a specific suggestion referencing their current URL and recent tools.
-- **Repetitive loop** — same tool called 5+ times with no new findings → `nudge_agent` to try something different.
-- **Page tunneling** — agent on the same route for over 120 seconds with no new findings → `nudge_agent` to move on.
 
 The supervisor is best-effort: a crash never fails the run.
 
@@ -205,8 +204,8 @@ Per-agent knobs:
   orchestrator owns the Playwright login; the agent only sees an
   already-authenticated browser handle. Post-login content the
   application itself exposes (storage, console, headers visible to JS)
-  *can* reach the model — use the `storage_inspect` playbook (which
-  surfaces matches by kind, never values) when probing storage. Raw
+  *can* reach the model — use the `mcp__browser__storage_inspect` primitive (which
+  surfaces storage keys by kind, never values) when probing storage. Raw
   `evaluate()` results, `read_recent`, `console_errors`, snapshot, and
   playbook evidence are all redacted (secret-shaped fields masked) and
   truncated to 8 KB before being handed to the LLM.
@@ -228,7 +227,7 @@ Per-agent knobs:
 - `src/auth/` — Pre-agent login, shared multi-tab session pool, recovery
 - `src/crawler/` — BFS pre-run crawler, on-demand route expansion, SiteMap
 - `src/page-model/` — Single round-trip DOM parser (PageModel), serializer for agent prompts
-- `src/playbooks/` — Pluggable playbook framework + built-in playbooks (CRUD, security, tables, modals, wizards, etc.)
+- `src/playbooks/` — 9 surviving playbooks: 3 discovery (`ask_sitemap`, `route_404_probe`, `discover_route_affordances`), 3 utility (`fill_and_verify`, `walk_pagination`, `walk_wizard`), 3 security (`idor_probe`, `header_audit`, `sensitive_path_audit`). The persona drives flow; playbooks are deterministic shortcuts for the bits that are tedious turn-by-turn.
 - `src/plugins/` — Auth provider plugins (`form`, `none`), link extractors, logout guard
 - `src/profiles/` — Persona markdown files (5 built-in)
 - `src/tools/` — In-process MCP servers (`browser-server.ts`, `findings-server.ts`)
@@ -255,11 +254,11 @@ regress-harness is pre-launch. The strategic review at
 `docs/superpowers/specs/2026-04-26-regress-harness-strategic-review.md`
 captures the v3 direction:
 
-- **Phase 2 (next):** simplify the playbook framework from 30+ scripted
-  flows to ~9 primitives + utilities. Persona-driven exploration takes
-  the lead; remaining playbooks cover only what LLMs do unreliably
-  (security probes that need response-header inspection; pagination /
-  wizard traversal helpers).
+- **Phase 2 (done):** simplified the playbook framework from 31 scripted
+  flows to 9 focused playbooks. Persona-first system prompt — primitives
+  are the default action vocabulary; playbooks are deterministic shortcuts
+  when they fit exactly. Supervisor trimmed to 3 intervention modes;
+  `storage_inspect` primitive replaces the deleted playbook.
 - **Phase 3:** prompt caching, model routing (Haiku for action / Sonnet
   for planning + critic), Anthropic Memory tool for cross-run learning,
   Agent Skills as the format for personas + playbooks.

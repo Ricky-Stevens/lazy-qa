@@ -1,18 +1,16 @@
 /**
- * Security playbooks. Each is a deterministic Playwright probe that checks
- * one OWASP-flavoured concern (IDOR, role escalation, session invalidation,
- * client-side storage hygiene, CSRF, open redirect, clickjacking headers,
- * sensitive URL audit). All probes are non-destructive: GET-only for IDOR /
- * role / sensitive paths; CSRF probe issues a POST but with garbage data.
+ * Security playbooks — 3 probes:
+ *   - `idor_probe`: walk a numeric resource ID range and detect access to records the agent shouldn't see.
+ *   - `header_audit`: fetch paths and inspect security-related response headers.
+ *   - `sensitive_path_audit`: probe well-known sensitive paths (e.g. /admin, /.env, /api/keys) with the agent's session and flag 200 OK responses.
  *
- * On-origin only: every URL is resolved against the current page origin and
- * any cross-origin candidate is skipped (recorded as a non-suspicious step).
+ * All probes resolve candidate URLs via `resolveOnOrigin(candidate, currentUrl, allowedHosts)` so they cannot drift to off-allowlist hosts even if a redirect lands the agent there.
  */
 
 import { z } from 'zod';
 import { isHostAllowed } from '../safety/guards.ts';
 import type { Playbook, PlaybookContext, PlaybookRegistry } from './framework.ts';
-import { type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
+import { ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -29,16 +27,6 @@ const DEFAULT_IDOR_CANDIDATES = [
   'abc',
   'admin',
   '00000000-0000-0000-0000-000000000001',
-];
-
-const DEFAULT_ROLE_PATHS = [
-  '/admin',
-  '/internal',
-  '/debug',
-  '/api/users',
-  '/api/swagger',
-  '/.git/HEAD',
-  '/api/admin',
 ];
 
 const DEFAULT_SENSITIVE_PATHS = [
@@ -129,6 +117,56 @@ function buildOutcome(
     steps,
     durationMs: 0,
   };
+}
+
+// -----------------------------------------------------------------------------
+// Header audit helpers
+// -----------------------------------------------------------------------------
+
+const CRITICAL_HEADERS = [
+  {
+    name: 'anti-clickjacking',
+    satisfiers: ['x-frame-options', 'content-security-policy'],
+    cspToken: 'frame-ancestors' as const,
+  },
+  { name: 'hsts', satisfiers: ['strict-transport-security'], httpsOnly: true as const },
+];
+
+const NICE_TO_HAVE_HEADERS = [
+  'x-content-type-options',
+  'referrer-policy',
+  'content-security-policy',
+];
+
+function auditHeaders(
+  headers: Record<string, string>,
+  isHttps: boolean,
+): { missingCritical: string[]; missingNiceToHave: string[] } {
+  const lc: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) lc[k.toLowerCase()] = v;
+
+  const missingCritical: string[] = [];
+  for (const c of CRITICAL_HEADERS) {
+    if ('httpsOnly' in c && c.httpsOnly && !isHttps) continue;
+    let satisfied = false;
+    for (const sat of c.satisfiers) {
+      const v = lc[sat];
+      if (!v) continue;
+      if ('cspToken' in c && c.cspToken && sat === 'content-security-policy') {
+        if (v.toLowerCase().includes(c.cspToken)) {
+          satisfied = true;
+          break;
+        }
+      } else {
+        satisfied = true;
+        break;
+      }
+    }
+    if (!satisfied) missingCritical.push(c.name);
+  }
+
+  const missingNiceToHave = NICE_TO_HAVE_HEADERS.filter((h) => !lc[h]);
+  return { missingCritical, missingNiceToHave };
 }
 
 // -----------------------------------------------------------------------------
@@ -233,468 +271,107 @@ const idorProbe: Playbook<IdorProbeInput> = {
 };
 
 // -----------------------------------------------------------------------------
-// 2. role_escalation_probe
+// 2. header_audit
 // -----------------------------------------------------------------------------
 
-interface RoleEscalationInput {
-  paths?: string[];
+const headerAuditShape = {
+  paths: z.array(z.string()).min(1),
+} satisfies z.ZodRawShape;
+
+export interface HeaderAuditInput {
+  paths: string[];
 }
 
-const roleEscalationProbe: Playbook<RoleEscalationInput> = {
-  name: 'role_escalation_probe',
+const headerAudit: Playbook<HeaderAuditInput> = {
+  name: 'header_audit',
   description:
-    'Visit a list of paths typically restricted to admins/internal roles and ' +
-    'flag any that return 200 with non-error content as suspicious.',
-  categories: ['security'],
-  estimatedDurationMs: 8000,
-  inputShape: {
-    paths: z.array(z.string()).optional(),
-  },
-  async run(input, ctx) {
-    const paths = input.paths ?? DEFAULT_ROLE_PATHS;
-    const steps: PlaybookStep[] = [];
-    const probed: Array<Record<string, unknown>> = [];
-    for (const p of paths) {
-      const target = resolveOnOrigin(p, ctx.page.url(), ctx.allowedHosts);
-      if (!target) {
-        steps.push({ label: `skip ${p}`, ok: true, detail: 'off-origin — refused' });
-        continue;
-      }
-      let status: number | null = null;
-      let heading: string | null = null;
-      let bodyText = '';
-      try {
-        const resp = await ctx.page.goto(target, { waitUntil: 'domcontentloaded' });
-        status = resp?.status() ?? null;
-        heading = await ctx.page
-          .locator('h1, h2')
-          .first()
-          .textContent({ timeout: 1000 })
-          .catch(() => null);
-        bodyText =
-          (await ctx.page
-            .locator('body')
-            .textContent({ timeout: 1000 })
-            .catch(() => '')) ?? '';
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        steps.push({ label: `probe ${p}`, ok: true, detail: `navigation failed: ${message}` });
-        probed.push({ path: p, error: message });
-        continue;
-      }
-      const isReal = status === 200 && looksLikeRealContent(heading, bodyText);
-      steps.push({
-        label: `probe ${p}`,
-        ok: !isReal,
-        detail: `status=${status ?? 'unknown'}`,
-      });
-      probed.push({ path: p, url: target, status, heading: heading ?? null });
-    }
-    return buildOutcome(roleEscalationProbe.name, steps, { probed });
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 3. session_invalidation_probe
-// -----------------------------------------------------------------------------
-
-const sessionInvalidationProbe: Playbook<Record<string, never>> = {
-  name: 'session_invalidation_probe',
-  description:
-    'Capture the current authed URL, log out (POST /logout), then re-navigate to it. ' +
-    'Suspicious if the previously-authed page still loads with a 200.',
-  categories: ['security'],
-  estimatedDurationMs: 5000,
-  inputShape: {},
-  async run(_input, ctx) {
-    const authedUrl = ctx.page.url();
-    const steps: PlaybookStep[] = [];
-    const evidence: Record<string, unknown> = { authedUrl };
-
-    const logoutUrl = resolveOnOrigin('/logout', authedUrl, ctx.allowedHosts);
-    if (!logoutUrl) {
-      steps.push({
-        label: 'logout',
-        ok: true,
-        detail: 'could not resolve /logout on origin — skipping',
-      });
-      return buildOutcome(sessionInvalidationProbe.name, steps, evidence);
-    }
-
-    let logoutStatus: number | null = null;
-    try {
-      const r = await ctx.page.request.post(logoutUrl, { failOnStatusCode: false });
-      logoutStatus = r.status();
-      steps.push({
-        label: 'POST /logout',
-        ok: true,
-        detail: `status=${logoutStatus}`,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      steps.push({ label: 'POST /logout', ok: true, detail: `failed: ${message}` });
-      evidence.logoutError = message;
-      return buildOutcome(sessionInvalidationProbe.name, steps, evidence);
-    }
-    evidence.logoutStatus = logoutStatus;
-
-    let revisitStatus: number | null = null;
-    let landedUrl = '';
-    try {
-      const resp = await ctx.page.goto(authedUrl, { waitUntil: 'domcontentloaded' });
-      revisitStatus = resp?.status() ?? null;
-      landedUrl = ctx.page.url();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      steps.push({
-        label: 'revisit authed url',
-        ok: true,
-        detail: `navigation failed: ${message}`,
-      });
-      evidence.revisitError = message;
-      return buildOutcome(sessionInvalidationProbe.name, steps, evidence);
-    }
-    evidence.revisitStatus = revisitStatus;
-    evidence.landedUrl = landedUrl;
-
-    const redirectedToLogin = /login|signin|sign-in/i.test(landedUrl);
-    const isUnauthorized = revisitStatus === 401 || revisitStatus === 403;
-    const sessionInvalidated = redirectedToLogin || isUnauthorized;
-
-    steps.push({
-      label: 'revisit authed url',
-      ok: sessionInvalidated,
-      detail: `status=${revisitStatus ?? 'unknown'} landed=${landedUrl}`,
-    });
-
-    return buildOutcome(sessionInvalidationProbe.name, steps, evidence);
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 4. storage_inspect
-// -----------------------------------------------------------------------------
-
-const JWT_RE = /^ey[A-Za-z0-9_-]+\.ey[A-Za-z0-9_-]+\./;
-const API_KEY_RE = /^(sk|pk)_[A-Za-z0-9]{20,}/;
-const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
-
-interface StorageEntry {
-  store: 'localStorage' | 'sessionStorage';
-  key: string;
-  value: string;
-}
-
-const storageInspect: Playbook<Record<string, never>> = {
-  name: 'storage_inspect',
-  description:
-    'Read localStorage + sessionStorage and flag any value matching JWT, API-key, ' +
-    'or email patterns as suspicious (PII / credential leakage in browser storage).',
-  categories: ['security'],
-  estimatedDurationMs: 1000,
-  inputShape: {},
-  async run(_input, ctx) {
-    type RawEntry = { store: 'localStorage' | 'sessionStorage'; key: string; value: string };
-    const raw = (await ctx.page.evaluate(() => {
-      // biome-ignore lint/suspicious/noExplicitAny: DOM globals
-      const w = globalThis as any;
-      const entries: RawEntry[] = [];
-      try {
-        for (let i = 0; i < w.localStorage.length; i++) {
-          const k = w.localStorage.key(i);
-          if (k != null) {
-            entries.push({
-              store: 'localStorage',
-              key: k,
-              value: String(w.localStorage.getItem(k) ?? ''),
-            });
-          }
-        }
-      } catch {}
-      try {
-        for (let i = 0; i < w.sessionStorage.length; i++) {
-          const k = w.sessionStorage.key(i);
-          if (k != null) {
-            entries.push({
-              store: 'sessionStorage',
-              key: k,
-              value: String(w.sessionStorage.getItem(k) ?? ''),
-            });
-          }
-        }
-      } catch {}
-      return entries;
-    })) as StorageEntry[];
-
-    const steps: PlaybookStep[] = [];
-    const findings: Array<{
-      store: string;
-      key: string;
-      kind: 'jwt' | 'api_key' | 'email';
-    }> = [];
-
-    for (const entry of raw) {
-      const kinds: Array<'jwt' | 'api_key' | 'email'> = [];
-      if (JWT_RE.test(entry.value)) kinds.push('jwt');
-      if (API_KEY_RE.test(entry.value)) kinds.push('api_key');
-      if (EMAIL_RE.test(entry.value)) kinds.push('email');
-      if (kinds.length === 0) {
-        steps.push({
-          label: `${entry.store}.${entry.key}`,
-          ok: true,
-          detail: 'no sensitive pattern',
-        });
-        continue;
-      }
-      for (const k of kinds) {
-        findings.push({ store: entry.store, key: entry.key, kind: k });
-        steps.push({
-          label: `${entry.store}.${entry.key}`,
-          ok: false,
-          detail: `matches ${k} pattern`,
-        });
-      }
-    }
-
-    return buildOutcome(storageInspect.name, steps, {
-      entryCount: raw.length,
-      findings,
-    });
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 5. csrf_probe
-// -----------------------------------------------------------------------------
-
-interface CsrfProbeInput {
-  actionUrl: string;
-}
-
-const csrfProbe: Playbook<CsrfProbeInput> = {
-  name: 'csrf_probe',
-  description:
-    'POST to a state-changing endpoint with an attacker Referer and empty body. ' +
-    'A correctly-protected endpoint rejects (4xx). 2xx is suspicious.',
-  categories: ['security'],
-  estimatedDurationMs: 2000,
-  inputShape: {
-    actionUrl: z.string(),
-  },
-  async run(input, ctx) {
-    const target = resolveOnOrigin(input.actionUrl, ctx.page.url(), ctx.allowedHosts);
-    if (!target) {
-      return buildOutcome(
-        csrfProbe.name,
-        [
-          {
-            label: `csrf ${input.actionUrl}`,
-            ok: true,
-            detail: 'off-origin — refused',
-          },
-        ],
-        { actionUrl: input.actionUrl },
-      );
-    }
-
-    let status: number | null = null;
-    try {
-      const resp = await ctx.page.request.post(target, {
-        headers: { Referer: 'https://evil.example.com' },
-        data: {},
-        failOnStatusCode: false,
-      });
-      status = resp.status();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return buildOutcome(
-        csrfProbe.name,
-        [{ label: `POST ${input.actionUrl}`, ok: true, detail: `request failed: ${message}` }],
-        { actionUrl: input.actionUrl, error: message },
-      );
-    }
-
-    const accepted = status >= 200 && status < 300;
-    const step: PlaybookStep = {
-      label: `POST ${input.actionUrl}`,
-      ok: !accepted,
-      detail: `status=${status} (referer=evil.example.com)`,
-    };
-    return buildOutcome(csrfProbe.name, [step], { actionUrl: input.actionUrl, status });
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 6. open_redirect_probe
-// -----------------------------------------------------------------------------
-
-interface OpenRedirectInput {
-  routeWithRedirect: string;
-}
-
-const openRedirectProbe: Playbook<OpenRedirectInput> = {
-  name: 'open_redirect_probe',
-  description:
-    'Navigate to a route that takes a ?redirect= parameter, set it to evil.example.com, ' +
-    'and check whether the final URL lands off-origin.',
+    'Fetch a list of paths and inspect their response headers for hardening posture: X-Frame-Options OR CSP `frame-ancestors`, Strict-Transport-Security, X-Content-Type-Options=nosniff, Referrer-Policy, basic CSP presence. Status: `suspicious` if any path is missing critical headers; `ok` otherwise. Probes paths under `target.allowed_hosts` only; off-allowlist paths are skipped (recorded as evidence).',
   categories: ['security'],
   estimatedDurationMs: 4000,
-  inputShape: {
-    routeWithRedirect: z.string(),
-  },
-  async run(input, ctx) {
-    const evil = 'https://evil.example.com';
-    const base = resolveOnOrigin(input.routeWithRedirect, ctx.page.url(), ctx.allowedHosts);
-    if (!base) {
-      return buildOutcome(
-        openRedirectProbe.name,
-        [
-          {
-            label: `open_redirect ${input.routeWithRedirect}`,
-            ok: true,
-            detail: 'off-origin — refused',
-          },
-        ],
-        { routeWithRedirect: input.routeWithRedirect },
+  inputShape: headerAuditShape,
+  async run(input, ctx): Promise<PlaybookOutcome> {
+    const steps: PlaybookStep[] = [];
+    const evidence: Record<string, unknown> = { paths: input.paths, results: [] as unknown[] };
+    const results = evidence.results as Array<{
+      path: string;
+      url: string | null;
+      status: number | null;
+      missingCritical: string[];
+      missingNiceToHave: string[];
+      skipped?: 'off-allowlist' | 'fetch-failed';
+    }>;
+
+    const currentUrl = ctx.page.url();
+
+    for (const path of input.paths) {
+      const url = resolveOnOrigin(path, currentUrl, ctx.allowedHosts);
+      if (url === null) {
+        results.push({
+          path,
+          url: null,
+          status: null,
+          missingCritical: [],
+          missingNiceToHave: [],
+          skipped: 'off-allowlist',
+        });
+        steps.push({ label: `${path} → skipped (off-allowlist)`, ok: true });
+        continue;
+      }
+      try {
+        const resp = await ctx.page.request.get(url, { timeout: 5_000, failOnStatusCode: false });
+        const headers = resp.headers();
+        const isHttps = url.startsWith('https://');
+        const { missingCritical, missingNiceToHave } = auditHeaders(headers, isHttps);
+        results.push({ path, url, status: resp.status(), missingCritical, missingNiceToHave });
+        steps.push({
+          label: `${path} → ${resp.status()}; missing critical: [${missingCritical.join(', ') || 'none'}]`,
+          ok: missingCritical.length === 0,
+        });
+      } catch (err) {
+        results.push({
+          path,
+          url,
+          status: null,
+          missingCritical: [],
+          missingNiceToHave: [],
+          skipped: 'fetch-failed',
+        });
+        steps.push({
+          label: `${path} → fetch failed`,
+          ok: false,
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const anyMissing = results.some((r) => r.missingCritical.length > 0);
+    if (anyMissing) {
+      return suspicious(
+        headerAudit.name,
+        `Missing critical security headers on ${results.filter((r) => r.missingCritical.length > 0).length}/${results.length} path(s).`,
+        evidence,
+        steps,
       );
     }
-
-    // Build the URL with the evil redirect query.
-    let probeUrl: string;
-    try {
-      const u = new URL(base);
-      u.searchParams.set('redirect', evil);
-      probeUrl = u.toString();
-    } catch {
-      return buildOutcome(
-        openRedirectProbe.name,
-        [
-          {
-            label: `open_redirect ${input.routeWithRedirect}`,
-            ok: true,
-            detail: 'could not construct probe URL',
-          },
-        ],
-        { routeWithRedirect: input.routeWithRedirect },
-      );
-    }
-
-    let landedUrl = '';
-    try {
-      await ctx.page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
-      landedUrl = ctx.page.url();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Navigation failures may simply mean the redirect went off-origin and
-      // failed (we've often blocked external hosts in tests). Be conservative:
-      // if the failure URL contains evil.example.com, treat as suspicious.
-      const inferredEvil = message.includes('evil.example.com');
-      return buildOutcome(
-        openRedirectProbe.name,
-        [
-          {
-            label: `open_redirect ${input.routeWithRedirect}`,
-            ok: !inferredEvil,
-            detail: `navigation error: ${message}`,
-          },
-        ],
-        { routeWithRedirect: input.routeWithRedirect, error: message },
-      );
-    }
-
-    let landedOffOrigin = false;
-    try {
-      const landed = new URL(landedUrl);
-      landedOffOrigin = landed.hostname === 'evil.example.com';
-    } catch {
-      landedOffOrigin = false;
-    }
-
-    const step: PlaybookStep = {
-      label: `open_redirect ${input.routeWithRedirect}`,
-      ok: !landedOffOrigin,
-      detail: `landed=${landedUrl}`,
-    };
-    return buildOutcome(openRedirectProbe.name, [step], {
-      routeWithRedirect: input.routeWithRedirect,
-      probeUrl,
-      landedUrl,
-    });
+    return ok(
+      headerAudit.name,
+      `All ${results.filter((r) => !r.skipped).length} path(s) carry the audited critical headers.`,
+      evidence,
+      steps,
+    );
   },
 };
 
 // -----------------------------------------------------------------------------
-// 7. clickjacking_probe
-// -----------------------------------------------------------------------------
-
-interface ClickjackingInput {
-  url: string;
-}
-
-const clickjackingProbe: Playbook<ClickjackingInput> = {
-  name: 'clickjacking_probe',
-  description:
-    'Fetch the URL and inspect response headers for X-Frame-Options or CSP frame-ancestors. ' +
-    'Suspicious if both are missing (no clickjacking protection).',
-  categories: ['security'],
-  estimatedDurationMs: 2000,
-  inputShape: {
-    url: z.string(),
-  },
-  async run(input, ctx) {
-    const target = resolveOnOrigin(input.url, ctx.page.url(), ctx.allowedHosts);
-    if (!target) {
-      return buildOutcome(
-        clickjackingProbe.name,
-        [{ label: `clickjacking ${input.url}`, ok: true, detail: 'off-origin — refused' }],
-        { url: input.url },
-      );
-    }
-
-    let headers: Record<string, string> = {};
-    let status: number | null = null;
-    try {
-      const resp = await ctx.page.request.fetch(target, { failOnStatusCode: false });
-      headers = resp.headers();
-      status = resp.status();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return buildOutcome(
-        clickjackingProbe.name,
-        [{ label: `clickjacking ${input.url}`, ok: true, detail: `fetch failed: ${message}` }],
-        { url: input.url, error: message },
-      );
-    }
-
-    const xfo = headers['x-frame-options'];
-    const csp = headers['content-security-policy'] ?? '';
-    const hasFrameAncestors = /frame-ancestors\b/i.test(csp);
-    const protected_ = Boolean(xfo) || hasFrameAncestors;
-
-    const step: PlaybookStep = {
-      label: `clickjacking ${input.url}`,
-      ok: protected_,
-      detail: `status=${status} xfo=${xfo ?? 'none'} frame-ancestors=${hasFrameAncestors}`,
-    };
-    return buildOutcome(clickjackingProbe.name, [step], {
-      url: input.url,
-      status,
-      xFrameOptions: xfo ?? null,
-      cspFrameAncestors: hasFrameAncestors,
-    });
-  },
-};
-
-// -----------------------------------------------------------------------------
-// 8. sensitive_url_audit
+// 3. sensitive_path_audit
 // -----------------------------------------------------------------------------
 
 interface SensitiveAuditInput {
   paths?: string[];
 }
 
-const sensitiveUrlAudit: Playbook<SensitiveAuditInput> = {
-  name: 'sensitive_url_audit',
+const sensitivePathAudit: Playbook<SensitiveAuditInput> = {
+  name: 'sensitive_path_audit',
   description:
     'Probe a broader list of often-forgotten sensitive paths (.git, .env, /backup, /api/swagger, ' +
     '/robots.txt, /sitemap.xml, etc.) and flag any that return 200 with non-error content.',
@@ -748,7 +425,7 @@ const sensitiveUrlAudit: Playbook<SensitiveAuditInput> = {
       });
       probed.push({ path: p, url: target, status, heading: heading ?? null });
     }
-    return buildOutcome(sensitiveUrlAudit.name, steps, { probed });
+    return buildOutcome(sensitivePathAudit.name, steps, { probed });
   },
 };
 
@@ -756,39 +433,22 @@ const sensitiveUrlAudit: Playbook<SensitiveAuditInput> = {
 // Registration
 // -----------------------------------------------------------------------------
 
-export {
-  clickjackingProbe,
-  csrfProbe,
-  idorProbe,
-  openRedirectProbe,
-  resolveOnOrigin,
-  roleEscalationProbe,
-  sensitiveUrlAudit,
-  sessionInvalidationProbe,
-  storageInspect,
-};
+export { headerAudit, idorProbe, resolveOnOrigin, sensitivePathAudit };
 
 /** Internal helpers exported only for tests. */
 export const __internal = {
   resolveOnOrigin,
+  auditHeaders,
   replaceIdSegment,
   looksLikeRealContent,
   UUID_RE,
   NUMERIC_ID_RE,
-  JWT_RE,
-  API_KEY_RE,
-  EMAIL_RE,
 };
 
 export function registerSecurityPlaybooks(r: PlaybookRegistry): void {
   r.register(idorProbe);
-  r.register(roleEscalationProbe);
-  r.register(sessionInvalidationProbe);
-  r.register(storageInspect);
-  r.register(csrfProbe);
-  r.register(openRedirectProbe);
-  r.register(clickjackingProbe);
-  r.register(sensitiveUrlAudit);
+  r.register(headerAudit);
+  r.register(sensitivePathAudit);
 }
 
 // Suppress unused-warning for context type by re-exporting nothing — but we

@@ -2,7 +2,7 @@ import { type Browser, chromium, type Page } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createLogger } from '../logging/logger.ts';
 import { crawlSite } from './crawl.ts';
-import { defaultLinkExtractor } from './extract-links.ts';
+import { extractLinks } from './extract-links.ts';
 
 let browser: Browser;
 let page: Page;
@@ -68,7 +68,7 @@ describe('crawlSite', () => {
       maxRoutes: 60,
       maxWallClockMs: 30_000,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
 
@@ -93,7 +93,7 @@ describe('crawlSite', () => {
       maxRoutes: 2,
       maxWallClockMs: 30_000,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
 
@@ -109,7 +109,7 @@ describe('crawlSite', () => {
       maxRoutes: 60,
       maxWallClockMs: 30_000,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
 
@@ -138,7 +138,7 @@ describe('crawlSite', () => {
       maxRoutes: 60,
       maxWallClockMs: 400,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
     const elapsed = Date.now() - start;
@@ -174,7 +174,7 @@ describe('crawlSite', () => {
       maxRoutes: 60,
       maxWallClockMs: 30_000,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
 
@@ -204,7 +204,7 @@ describe('crawlSite', () => {
       maxRoutes: 60,
       maxWallClockMs: 30_000,
       allowedHosts: ['app.test'],
-      linkExtractor: defaultLinkExtractor,
+      linkExtractor: extractLinks,
       logger: silentLogger(),
     });
 

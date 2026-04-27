@@ -27,6 +27,116 @@ import type {
 } from '../page-model/types.ts';
 import { isHostAllowed } from '../safety/guards.ts';
 
+/** Default verb stems used to identify safe-to-probe toolbar/page-level
+ * trigger elements. Labels must start with one of these words (or end with
+ * "...") to be clicked. Override via `affordanceKeywords` on
+ * `probeAffordances` options. */
+export const DEFAULT_AFFORDANCE_VERBS: readonly string[] = [
+  'add',
+  'new',
+  'create',
+  'open',
+  'view',
+  'edit',
+  'import',
+  'export',
+  'settings',
+  'more',
+  'filter',
+  'sort',
+  'configure',
+  'manage',
+  'help',
+  'about',
+  'preferences',
+  'customize',
+  'columns',
+  'options',
+  'actions',
+  'browse',
+  'search',
+  'expand',
+  'details',
+  'info',
+  'continue',
+  'next',
+  'get started',
+  'begin',
+];
+
+/** Default destructive keyword stems — labels matching any of these are
+ * NEVER clicked. Override via `destructiveKeywords` on `probeAffordances`
+ * options. */
+export const DEFAULT_DESTRUCTIVE_KEYWORDS: readonly string[] = [
+  'save',
+  'submit',
+  'delete',
+  'remove',
+  'discard',
+  'confirm',
+  'apply',
+  'publish',
+  'send',
+  'pay',
+  'buy',
+  'purchase',
+  'reset',
+  'restart',
+  'shutdown',
+  'sign out',
+  'log out',
+  'logout',
+  'deactivate',
+  'archive',
+  'trash',
+  'approve',
+  'reject',
+  'merge',
+  'deploy',
+  'upgrade',
+  'downgrade',
+  'cancel subscription',
+  'unsubscribe',
+  'disable',
+  'enable',
+  'activate',
+  'promote',
+  'demote',
+  'suspend',
+  'ban',
+  'lock',
+  'unlock',
+  'refund',
+  'charge',
+  'issue',
+  'resend',
+  'sync',
+  'run',
+  'execute',
+  'trigger',
+  'notify',
+  'invite',
+  'verify',
+  'authorize',
+  'grant',
+  'revoke',
+  'email',
+  'fire',
+  'kick',
+  'expire',
+];
+
+/** Default CSS selector hints used when attempting to dismiss an opened
+ * overlay (modal, popover, menu). Override via `dismissSelectorHints` on
+ * `probeAffordances` options. */
+export const DEFAULT_DISMISS_SELECTORS: readonly string[] = [
+  'button[aria-label*="close" i]',
+  'button[aria-label*="dismiss" i]',
+  'button[title*="close" i]',
+  '[role="dialog"] button:has-text("Close")',
+  '[role="dialog"] button:has-text("Cancel")',
+];
+
 export interface AffordanceProbeOptions {
   /** Per-click timeout (ms). Default 600ms. */
   perClickTimeoutMs: number;
@@ -45,6 +155,12 @@ export interface AffordanceProbeOptions {
    * This guards against a prior navigation having landed on an off-allowlist URL
    * that we should not revisit. */
   allowedHosts?: string[];
+  /** Override the safe verb list. Default: DEFAULT_AFFORDANCE_VERBS. */
+  affordanceKeywords?: string[];
+  /** Override the destructive keyword list. Default: DEFAULT_DESTRUCTIVE_KEYWORDS. */
+  destructiveKeywords?: string[];
+  /** Override the dismiss selector hints. Default: DEFAULT_DISMISS_SELECTORS. */
+  dismissSelectorHints?: string[];
 }
 
 const DEFAULT_OPTIONS: AffordanceProbeOptions = {
@@ -55,18 +171,17 @@ const DEFAULT_OPTIONS: AffordanceProbeOptions = {
   maxRowActionProbes: 5,
 };
 
-/** Labels that indicate the affordance is safe to open and close. The probe
- * will only click toolbar/header/page-level buttons whose label matches one
- * of these prefixes. Row kebabs bypass this allowlist (they're naturally
- * read-only) but still apply the destructive blocklist below. */
-const SAFE_PREFIX_RE =
-  /^(add|new|create|open|view|edit|import|export|settings|more|filter|sort|configure|manage|help|about|preferences|customize|columns|options|actions|browse|search|expand|details|info|continue|next|get\s*started|begin)\b|\.\.\.$/i;
+/** Build the safe-prefix regex from a verb array. */
+function buildSafePrefixRe(verbs: readonly string[]): RegExp {
+  const escaped = verbs.map((v) => v.replace(/\s+/g, '\\s*'));
+  return new RegExp(`^(${escaped.join('|')})\\b|\\.\\.\\.$`, 'i');
+}
 
-/** Labels that we MUST NOT click — irreversibly mutates state, signs the
- * user out, or fires off a destructive action. Applied to every candidate
- * regardless of context. */
-const DESTRUCTIVE_RE =
-  /\b(save|submit|delete|remove|discard|confirm|apply|publish|send|pay|buy|purchase|reset|restart|shutdown|sign\s*out|log\s*out|logout|deactivate|archive|trash|approve|reject|merge|deploy|upgrade|downgrade|cancel\s*subscription|unsubscribe|disable|enable|activate|promote|demote|suspend|ban|lock|unlock|refund|charge|issue|resend|sync|run|execute|trigger|notify|invite|verify|authorize|grant|revoke|email|fire|kick|expire)\b/i;
+/** Build the destructive-keyword regex from a keyword array. */
+function buildDestructiveRe(keywords: readonly string[]): RegExp {
+  const escaped = keywords.map((k) => k.replace(/\s+/g, '\\s*'));
+  return new RegExp(`\\b(${escaped.join('|')})\\b`, 'i');
+}
 
 /** Labels that indicate this click WILL navigate (so we'd burn a probe slot
  * just to see "navigation"). The crawler already handles links — skip. */
@@ -91,13 +206,15 @@ function looksLikeKebab(ref: ActionRef): boolean {
 function pickToolbarCandidates(
   refs: ActionRef[],
   cap: number,
+  safePrefixRe: RegExp,
+  destructiveRe: RegExp,
 ): Array<{ ref: ActionRef; context: 'toolbar' }> {
   const out: Array<{ ref: ActionRef; context: 'toolbar' }> = [];
   for (const ref of refs) {
     if (ref.disabled) continue;
     if (ref.intent === 'navigate' || NAV_LIKE_RE.test(ref.label)) continue;
-    if (DESTRUCTIVE_RE.test(ref.label)) continue;
-    if (!SAFE_PREFIX_RE.test(ref.label) && !looksLikeKebab(ref)) continue;
+    if (destructiveRe.test(ref.label)) continue;
+    if (!safePrefixRe.test(ref.label) && !looksLikeKebab(ref)) continue;
     out.push({ ref, context: 'toolbar' });
     if (out.length >= cap) break;
   }
@@ -180,8 +297,7 @@ async function classifyChange(
           }
         }
         if (!name) {
-          name =
-            dlg.querySelector('h1,h2,h3,[role="heading"]')?.textContent?.trim() || 'Modal';
+          name = dlg.querySelector('h1,h2,h3,[role="heading"]')?.textContent?.trim() || 'Modal';
         }
         const stepIndicators = dlg.querySelectorAll(
           '[role="progressbar"], [role="tablist"] [role="tab"], .step, [data-step], [aria-current="step"]',
@@ -199,8 +315,7 @@ async function classifyChange(
             stepCount: labels.length || stepIndicators.length,
           };
         }
-        const hasForm =
-          dlg.querySelector('form, input, textarea, select') !== null;
+        const hasForm = dlg.querySelector('form, input, textarea, select') !== null;
         return { kind: 'modal', modalName: name, hasForm };
       }
 
@@ -258,7 +373,7 @@ async function classifyChange(
  * then click an empty point on body (click-outside dismiss for popovers/
  * menus that don't respond to Escape). Cap each attempt aggressively — a
  * stuck dismiss would derail subsequent probes. */
-async function dismissOpened(page: Page): Promise<void> {
+async function dismissOpened(page: Page, closeSelectors: readonly string[]): Promise<void> {
   try {
     await page.keyboard.press('Escape', { delay: 30 });
   } catch {
@@ -268,13 +383,6 @@ async function dismissOpened(page: Page): Promise<void> {
   await page.waitForTimeout(80).catch(() => undefined);
 
   // Partial-match labels — apps use "Close window", "Close dialog", etc.
-  const closeSelectors = [
-    'button[aria-label*="close" i]',
-    'button[aria-label*="dismiss" i]',
-    'button[title*="close" i]',
-    '[role="dialog"] button:has-text("Close")',
-    '[role="dialog"] button:has-text("Cancel")',
-  ];
   for (const sel of closeSelectors) {
     try {
       const loc = page.locator(sel).first();
@@ -332,9 +440,7 @@ async function countOpenDialogs(page: Page): Promise<number> {
     return await page.evaluate(() => {
       // biome-ignore lint/suspicious/noExplicitAny: DOM types not in tsconfig.lib
       const g = globalThis as any;
-      const all = g.document.querySelectorAll(
-        '[role="dialog"], [aria-modal="true"], dialog[open]',
-      );
+      const all = g.document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]');
       let visible = 0;
       for (const el of all) {
         const rect = el.getBoundingClientRect?.();
@@ -367,6 +473,15 @@ export async function probeAffordances(
   options?: Partial<AffordanceProbeOptions>,
 ): Promise<DiscoveredAffordance[]> {
   const opts: AffordanceProbeOptions = { ...DEFAULT_OPTIONS, ...options };
+
+  // Resolve configurable keyword/selector arrays once, building compiled
+  // regexes from the active verb lists so filter logic stays fast.
+  const verbs = opts.affordanceKeywords ?? DEFAULT_AFFORDANCE_VERBS;
+  const destructiveKws = opts.destructiveKeywords ?? DEFAULT_DESTRUCTIVE_KEYWORDS;
+  const dismissSelectors = opts.dismissSelectorHints ?? DEFAULT_DISMISS_SELECTORS;
+  const safePrefixRe = buildSafePrefixRe(verbs);
+  const destructiveRe = buildDestructiveRe(destructiveKws);
+
   const startedAt = Date.now();
   const baselineUrl = page.url();
   const out: DiscoveredAffordance[] = [];
@@ -383,7 +498,12 @@ export async function probeAffordances(
     pageRefs.push(ref);
   }
 
-  const toolbarCandidates = pickToolbarCandidates(pageRefs, opts.maxToolbarProbes);
+  const toolbarCandidates = pickToolbarCandidates(
+    pageRefs,
+    opts.maxToolbarProbes,
+    safePrefixRe,
+    destructiveRe,
+  );
   const rowCandidates = pickRowActionCandidates(model, opts.maxRowActionProbes);
   const candidates = [...toolbarCandidates, ...rowCandidates];
 
@@ -433,7 +553,7 @@ export async function probeAffordances(
     if (outcome.kind === 'navigation') {
       await restoreUrlIfNeeded(page, baselineUrl, probeAllowedHosts);
     } else if (outcome.kind !== 'inert' && outcome.kind !== 'error') {
-      await dismissOpened(page);
+      await dismissOpened(page, dismissSelectors);
       // If dismiss didn't fully take and URL drifted, restore.
       if (page.url() !== baselineUrl) {
         await restoreUrlIfNeeded(page, baselineUrl, probeAllowedHosts);
