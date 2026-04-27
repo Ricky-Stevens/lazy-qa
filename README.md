@@ -178,6 +178,21 @@ Per-agent knobs:
 - `override_personality` — inline string to bypass the profile file
 - `budget` — per-agent caps (turns, USD, minutes)
 
+## Stealth mode
+
+By default, regress-harness uses Playwright's bundled Chromium. For portals behind bot-detection services (Cloudflare, Akamai, PerimeterX), you can enable CloakBrowser's stealth Chromium binary:
+
+```yaml
+target:
+  stealth: true
+```
+
+When enabled:
+- First use downloads CloakBrowser's stealth binary (~200 MB). Subsequent runs reuse it.
+- The binary is licensed separately by CloakHQ. Regress-harness does NOT redistribute it; users install it directly via `bun add cloakbrowser` (or `npm install cloakbrowser`).
+- The stealth binary replaces Playwright Chromium for the pre-login phase only; it carries the same session to the agent loop as the normal path.
+- **Default:** `false` (uses bundled Playwright Chromium; no extra download). Opt in only if you hit bot-detection walls.
+
 ## Auth modes
 
 - **`type: form`** (default) — Playwright fills the form. Works for Auth0, generic SSO login pages, anything with username + password + submit. Set `success_url_pattern` or `wait_for_selector` if the post-submit heuristic doesn't fit.

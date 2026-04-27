@@ -61,6 +61,7 @@ export interface AcquireInput {
   runDir: string;
   agentId: string;
   logger: Logger;
+  stealth: boolean;
 }
 
 export interface AcquireResult {
@@ -116,6 +117,7 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
           runDir: input.runDir,
           agentId: input.agentId,
           logger: input.logger,
+          stealth: input.stealth,
         });
         return {
           browser: result.browser,

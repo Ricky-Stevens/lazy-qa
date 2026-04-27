@@ -1,7 +1,7 @@
 import { chmod, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { chromium } from 'playwright';
+import { chromium as playwrightChromium } from 'playwright';
 import type { AuthConfig } from '../config/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import { createNetworkAllowlistRoute, isHostAllowed } from '../safety/guards.ts';
@@ -79,6 +79,7 @@ export interface LoginInput {
   runDir: string;
   agentId: string;
   logger: Logger;
+  stealth: boolean;
 }
 
 export interface LoginResult {
@@ -94,6 +95,41 @@ export interface LoginResult {
 }
 
 /**
+ * Launch a browser using either Playwright (default) or CloakBrowser (stealth mode).
+ * When stealth is false, uses Playwright's chromium (fast, bundled).
+ * When stealth is true, uses CloakBrowser's stealth binary via dynamic import
+ * (no dependency burden on install unless opted in).
+ */
+export async function launchBrowser(
+  stealth: boolean,
+  options: Parameters<typeof playwrightChromium.launch>[0],
+): Promise<Browser> {
+  if (!stealth) {
+    return playwrightChromium.launch(options);
+  }
+  // Dynamic import — only loaded when stealth is on, keeps default install lean.
+  // Type as unknown to avoid requiring cloakbrowser at compile time (optional peer dep).
+  let cloakbrowser: unknown;
+  try {
+    // Delay module name from TypeScript's static analysis
+    const moduleName = 'cloakbrowser';
+    cloakbrowser = await import(moduleName);
+  } catch {
+    throw new Error(
+      'target.stealth is true but cloakbrowser is not installed. Run `bun add cloakbrowser` (or npm/yarn equivalent).',
+    );
+  }
+  // CloakBrowser's launch() returns a real Playwright Browser — same shape as chromium.launch().
+  const cb = cloakbrowser as { launch: (opts: unknown) => Promise<Browser> };
+  return cb.launch({
+    headless: options?.headless ?? true,
+    // Pass through proxy / launch options if compatible. Fold into the
+    // launchOptions field per CloakBrowser's API.
+    launchOptions: options,
+  });
+}
+
+/**
  * Authenticate a Playwright browser context and return live handles.
  *
  * The same browser stays alive through the agent's exploration loop — the
@@ -103,7 +139,7 @@ export interface LoginResult {
  * `cacheLocation: memory`) lose their session across the file-based handoff.
  */
 export async function performLogin(input: LoginInput): Promise<LoginResult> {
-  const { targetUrl, auth, allowedHosts, credentials, runDir, agentId, logger } = input;
+  const { targetUrl, auth, allowedHosts, credentials, runDir, agentId, logger, stealth } = input;
 
   const authDir = path.join(runDir, 'auth', agentId);
   await mkdir(authDir, { recursive: true });
@@ -114,15 +150,18 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
   // Match Playwright MCP's default — Google Chrome stable. Falls back to bundled
   // Chromium for users without Chrome installed; storageState handoff is
-  // unreliable across browser binaries for some SSO flows.
+  // unreliable across browser binaries for some SSO flows. When stealth is
+  // enabled, launchBrowser routes to CloakBrowser's stealth binary instead.
   async function launchChrome(): Promise<Browser> {
-    return chromium.launch({ headless, channel: 'chrome' }).catch(async (err) => {
+    return launchBrowser(stealth, { headless, channel: 'chrome' }).catch(async (err) => {
       logger.warn('login.chrome.fallback', {
         agentId,
         reason: err instanceof Error ? err.message : String(err),
-        hint: 'Run `bunx playwright install chrome` for best Auth0/SSO compatibility',
+        hint: stealth
+          ? 'Run `bun add cloakbrowser` and check that CloakBrowser is properly installed'
+          : 'Run `bunx playwright install chrome` for best Auth0/SSO compatibility',
       });
-      return chromium.launch({ headless });
+      return launchBrowser(stealth, { headless });
     });
   }
 

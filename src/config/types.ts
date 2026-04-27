@@ -148,6 +148,10 @@ export const TargetConfigSchema = z
     // Allowed hosts agents can navigate to (prevents drift; wired to Playwright MCP --allowed-origins)
     allowed_hosts: z.array(z.string().min(1)).min(1),
     auth: AuthConfigSchema,
+    /** Use CloakBrowser stealth Chromium binary instead of bundled Playwright Chromium.
+     *  Recommended for portals behind Cloudflare/Akamai/PerimeterX bot-detection.
+     *  First use auto-downloads ~200 MB binary. Default: false. */
+    stealth: z.boolean().default(false),
   })
   .superRefine((t, ctx) => {
     // target.url's host must be in allowed_hosts.
@@ -199,7 +203,7 @@ export const AnthropicConfigSchema = z.object({
   // bill against the API as before.
   api_key_env: z.string().min(1).optional(),
   // Default model for agents
-  default_model: ModelSchema.default('claude-sonnet-4-6'),
+  default_model: ModelSchema.default('claude-haiku-4-5-20251001'),
 });
 export type AnthropicConfig = z.infer<typeof AnthropicConfigSchema>;
 

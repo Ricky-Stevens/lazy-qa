@@ -45,6 +45,8 @@ export interface SpawnAgentInput {
   /** External abort signal — forwarded so Ctrl-C / SIGTERM cancels in-flight
    * SDK calls and tool handlers. */
   abortSignal?: AbortSignal;
+  /** Whether to use CloakBrowser stealth mode for login. */
+  stealth: boolean;
 }
 
 export interface SpawnAgentResult {
@@ -65,7 +67,7 @@ export const ALLOWED_TOOL_NAMES: readonly string[] = [
  * run the agent loop. Persists the resulting journey before returning.
  */
 export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResult> {
-  const { runId, runDir, targetUrl, allowedHosts, auth, agent, apiKey, logger, abortSignal } =
+  const { runId, runDir, targetUrl, allowedHosts, auth, agent, apiKey, logger, abortSignal, stealth } =
     input;
   const { budget } = agent;
 
@@ -99,6 +101,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       runDir,
       agentId: agent.id,
       logger: childLogger,
+      stealth,
     });
     livePage = acquired.page;
     releaseSession = acquired.release;

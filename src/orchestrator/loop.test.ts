@@ -14,6 +14,23 @@ import { createLogger } from '../logging/logger.ts';
 import { compactSlidingWindow } from './loop.ts';
 import { SummaryMemory } from './summary-memory.ts';
 
+/** Build a minimal Anthropic.Tool array the same way the loop does. */
+function buildCachedTools(rawDefs: Array<{ name: string }>): Anthropic.Tool[] {
+  const tools: Anthropic.Tool[] = rawDefs.map((d) => ({
+    name: d.name,
+    description: `${d.name} tool`,
+    input_schema: { type: 'object' as const, properties: {} },
+  }));
+  if (tools.length === 0) return [];
+  return [
+    ...tools.slice(0, -1),
+    {
+      ...tools[tools.length - 1]!,
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    },
+  ];
+}
+
 const logger = createLogger({ runId: 'test' });
 
 function userPrompt(label: string): Anthropic.MessageParam {
@@ -48,6 +65,35 @@ function buildTurns(n: number): Anthropic.MessageParam[] {
   }
   return out;
 }
+
+describe('cachedTools breakpoint', () => {
+  it('marks only the last tool definition with cache_control', () => {
+    const tools = buildCachedTools([{ name: 'tool_a' }, { name: 'tool_b' }, { name: 'tool_c' }]);
+
+    expect(tools).toHaveLength(3);
+    // First N-1 entries must NOT have cache_control.
+    expect((tools[0] as Anthropic.Tool & { cache_control?: unknown }).cache_control).toBeUndefined();
+    expect((tools[1] as Anthropic.Tool & { cache_control?: unknown }).cache_control).toBeUndefined();
+    // Last entry must carry the 1h ephemeral marker.
+    expect((tools[2] as Anthropic.Tool & { cache_control?: unknown }).cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('returns an empty array when there are no tools', () => {
+    expect(buildCachedTools([])).toEqual([]);
+  });
+
+  it('works with a single tool', () => {
+    const tools = buildCachedTools([{ name: 'only_tool' }]);
+    expect(tools).toHaveLength(1);
+    expect((tools[0] as Anthropic.Tool & { cache_control?: unknown }).cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+});
 
 describe('compactSlidingWindow', () => {
   it('does nothing when below the threshold', () => {

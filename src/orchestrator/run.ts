@@ -154,6 +154,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       runDir,
       agentId: 'crawler',
       logger: crawlerLogger,
+      stealth: cfg.target.stealth,
     });
     crawledMap = await crawlSite(crawlerSession.page, {
       maxDepth: CRAWL_MAX_DEPTH,
@@ -225,6 +226,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       siteMap,
       logger,
       abortSignal: runAbortController.signal,
+      stealth: cfg.target.stealth,
     }),
   );
 

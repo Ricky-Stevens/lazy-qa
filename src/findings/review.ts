@@ -3,7 +3,7 @@ import path from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
-import { computeCostUsd } from '../orchestrator/cost.ts';
+import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 
@@ -230,7 +230,15 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   const response = await client.messages.create({
     model,
     max_tokens: 8192,
-    system: SYSTEM_PROMPT,
+    system: [
+      {
+        type: 'text',
+        text: SYSTEM_PROMPT,
+        // Cache the system prompt for 1h — the SYSTEM_PROMPT is static across
+        // all review calls in a session, so this is safe and cuts per-call cost.
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
     messages: [{ role: 'user', content: payload }],
   });
 
@@ -248,6 +256,14 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   } catch {
     // Unknown model price — ignore; reviewer still works.
   }
+
+  const savedUsd = computeCacheSavingsUsd(model, tokenUsage.cacheRead);
+  logger.info('review.cache.savings', {
+    cacheReadTokens: tokenUsage.cacheRead,
+    cacheWriteTokens: tokenUsage.cacheWrite,
+    savedUsd,
+    ratioOfInput: tokenUsage.input > 0 ? tokenUsage.cacheRead / tokenUsage.input : 0,
+  });
 
   // Pull the assistant's first text block. The prompt instructs JSON-only.
   const textBlock = response.content.find((b) => b.type === 'text');

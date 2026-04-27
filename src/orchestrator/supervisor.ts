@@ -250,7 +250,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
     },
   ];
 
-  const anthropicTools: Anthropic.Tool[] = rawTools.map((rt) => {
+  const anthropicToolsRaw: Anthropic.Tool[] = rawTools.map((rt) => {
     const objSchema = z.object(rt.shape);
     const jsonSchema = z.toJSONSchema(objSchema) as Record<string, unknown>;
     return {
@@ -259,6 +259,19 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
       input_schema: jsonSchema as Anthropic.Tool['input_schema'],
     };
   });
+
+  // Cache the tools array: mark the last entry with a 1h breakpoint.
+  // Anthropic caches tools[0..lastIndex] inclusive when the last has cache_control.
+  const anthropicTools: Anthropic.Tool[] =
+    anthropicToolsRaw.length > 0
+      ? [
+          ...anthropicToolsRaw.slice(0, -1),
+          {
+            ...anthropicToolsRaw[anthropicToolsRaw.length - 1]!,
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ]
+      : [];
 
   const handlerByName = new Map(rawTools.map((rt) => [rt.name, rt.handler]));
 

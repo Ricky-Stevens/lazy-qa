@@ -50,3 +50,12 @@ export function computeCostUsd(
     1_000_000
   );
 }
+
+/** Compute the dollar savings from cache reads vs paying full input price. */
+export function computeCacheSavingsUsd(model: string, cacheReadTokens: number): number {
+  const pricing = MODEL_PRICING[model];
+  if (!pricing) return 0;
+  const fullCost = (cacheReadTokens * pricing.input) / 1_000_000;
+  const actualCost = (cacheReadTokens * pricing.cacheRead) / 1_000_000;
+  return Math.max(0, fullCost - actualCost);
+}

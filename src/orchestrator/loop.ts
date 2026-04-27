@@ -130,6 +130,57 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       compactSlidingWindow(messages, summaryMemory, logger);
     }
 
+    // Cache the tools array: mark the last entry with a 1h breakpoint.
+    // Anthropic caches tools[0..lastIndex] inclusive when the last has cache_control.
+    const cachedTools: Anthropic.Tool[] =
+      anthropicTools.length > 0
+        ? [
+            ...anthropicTools.slice(0, -1),
+            {
+              ...anthropicTools[anthropicTools.length - 1]!,
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+          ]
+        : [];
+
+    // Build a per-request messages array with a 5-min cache breakpoint on the
+    // last content block of the last message. The persistent `messages` array
+    // is reused across turns — mutating in-place would carry the marker forward
+    // and invalidate the cache on every turn.
+    const cacheBreakpoint: Anthropic.CacheControlEphemeral = { type: 'ephemeral' };
+    const requestMessages: Anthropic.MessageParam[] =
+      messages.length > 0
+        ? [
+            ...messages.slice(0, -1),
+            (() => {
+              const last = messages[messages.length - 1]!;
+              if (typeof last.content === 'string') {
+                return {
+                  role: last.role,
+                  content: [
+                    {
+                      type: 'text' as const,
+                      text: last.content,
+                      cache_control: cacheBreakpoint,
+                    },
+                  ],
+                } satisfies Anthropic.MessageParam;
+              }
+              const blocks = last.content;
+              if (blocks.length === 0) return last;
+              const lastBlock = blocks[blocks.length - 1]!;
+              const clonedTail = { ...lastBlock, cache_control: cacheBreakpoint };
+              return {
+                role: last.role,
+                content: [
+                  ...(blocks.slice(0, -1) as Anthropic.ContentBlockParam[]),
+                  clonedTail as Anthropic.ContentBlockParam,
+                ],
+              } satisfies Anthropic.MessageParam;
+            })(),
+          ]
+        : [];
+
     let response: Anthropic.Message;
     try {
       response = await client.messages.create({
@@ -143,8 +194,8 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
             cache_control: { type: 'ephemeral', ttl: '1h' },
           },
         ],
-        messages,
-        tools: anthropicTools,
+        messages: requestMessages,
+        tools: cachedTools,
         ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
           ? { thinking: { type: 'enabled', budget_tokens: agent.maxThinkingTokens } }
           : {}),
