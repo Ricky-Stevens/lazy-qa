@@ -46,17 +46,20 @@ Every snapshot call and every playbook invocation pulls the current page's `Page
 
 Each agent gets its own tab on a single shared Chrome session. The orchestrator logs in once; subsequent agents acquire fresh tabs on the same authenticated context. Credentials are filled by the orchestrator before the LLM loop starts and never enter the model's prompt.
 
-Each agent runs a direct Anthropic SDK loop (`src/orchestrator/loop.ts`): one continuous conversation with a 1-hour prompt-cache on the system prompt. History is managed with a sliding window — once the conversation exceeds the compaction threshold (14 messages), the head is replaced with a single synthetic summary derived from the per-agent `SummaryMemory` (which records one entry per playbook invocation), and the most recent 12 messages are kept verbatim. This keeps per-turn input cost bounded without losing "what have I tried" context.
+Each agent runs a direct Anthropic SDK loop (`src/orchestrator/loop.ts`): one continuous conversation with prompt caching on the system prompt (1h), tools array (1h), and message tail (5min breakpoint). This reduces per-turn cacheRead cost to ~90% of full input price. History is managed with a sliding window — once the conversation exceeds the compaction threshold (14 messages), the head is replaced with a single synthetic summary derived from the per-agent `SummaryMemory` (which records one entry per playbook invocation), and the most recent 12 messages are kept verbatim. This keeps per-turn input cost bounded without losing "what have I tried" context.
 
 The per-turn user message includes a sitemap snapshot listing unvisited routes, untested forms/tables/modals, and affordance hints (what's behind buttons and kebabs that the link-graph crawler cannot see). Tool calls within a turn execute in parallel.
 
+**Default model routing:** agents run on Haiku 4.5 by default (fast, cheap). Immediately after a message-window compaction, the agent's next turn uses Sonnet 4.6 to re-synthesize the elided context — this improves long-trajectory coherence without significantly raising per-run cost.
+
 ### 4. Browser MCP tools
 
-The browser server (`src/tools/browser-server.ts`) exposes 13 primitive/macro tools:
+The browser server (`src/tools/browser-server.ts`) exposes 14 primitive/macro tools:
 
 | Tool | Purpose |
 |---|---|
 | `snapshot` | Structured PageModel snapshot (forms, tables, modals, wizards, toolbars, nav) |
+| `ax_snapshot` | Text-outline of the accessibility tree (cheap, for "what's on the page" questions) |
 | `navigate` | Go to a URL; refuses off-allowlist hosts; expands the sitemap |
 | `back` | Browser back |
 | `click` | Click an element by Playwright selector; logout controls refused |
@@ -70,7 +73,9 @@ The browser server (`src/tools/browser-server.ts`) exposes 13 primitive/macro to
 | `read_recent` | One-call sweep: PageModel + console errors + last 5 network anomalies |
 | `storage_inspect` | Surface storage keys by kind (cookie / localStorage / sessionStorage); values are redacted by default |
 
-Playbook tools (`mcp__playbooks__*`) are mounted dynamically from the playbook registry. The persona drives exploration; playbooks are deterministic shortcuts for the turns that are tedious to do step-by-step.
+**PageModel vs AX-tree:** Use `snapshot` (full PageModel) when you need form schemas, table row data, or locator strings. Use `ax_snapshot` for faster orientation — what buttons/links/fields are present and their roles — at 60–80% lower token cost.
+
+Playbook tools (`mcp__playbooks__*`) are mounted dynamically from the Skills directory. The persona drives exploration; playbooks are deterministic shortcuts for the turns that are tedious to do step-by-step.
 
 ### 5. Harness MCP tools
 
@@ -113,9 +118,9 @@ runs/<runId>/
 
 ## Personas
 
-Profiles live in `src/profiles/` as markdown — pure persona psychology, no scripted steps.
+Five built-in personas live in `skills/personas/` (Anthropic Agent Skills format):
 
-| Profile | Style |
+| Persona | Style |
 |---|---|
 | `power-user` | Knows the app cold; runs real CRUD flows end-to-end, verifies persistence by reload-and-check |
 | `chaos-clicker` | Fast, careless, double-clicks, hits browser-back mid-flow, abandons forms |
@@ -123,7 +128,7 @@ Profiles live in `src/profiles/` as markdown — pure persona psychology, no scr
 | `completionist` | Methodical; finishes every flow, round-trips every save, exhausts every wizard branch |
 | `insider-attacker` | Authenticated grey-box probe — IDOR, RBAC, silent-failure hunt, reflected XSS, storage hygiene |
 
-Add your own by dropping a `<slug>.md` into `src/profiles/` with a `name` + `defaultBudget` frontmatter and a `# Personality` section. Or override inline per-agent via `override_personality` in the YAML.
+Add your own via the "Extending regress-harness" section (above). Override inline per-agent via `override_personality` in the YAML.
 
 ## Configuration
 
@@ -139,6 +144,7 @@ target:
     password_selector: 'input[name="password"]'
     submit_selector: 'button[type="submit"]'
     success_url_pattern: '^https://staging\.example\.com'
+  stealth: false                    # opt-in CloakBrowser for bot-detection-protected portals
 
 anthropic:
   api_key_env: ANTHROPIC_API_KEY
@@ -151,15 +157,19 @@ supervisor:
 review:
   enabled: true
   model: claude-sonnet-4-6
+  batch_mode: auto                  # 'auto' (batch for large payloads) | 'inline' | 'force_batch'
 
 run:
   max_budget_usd: 5
   output_dir: ./runs
+  memory:
+    enabled: true
 
 agents:
   - id: power-user
     profile: power-user
     model: claude-haiku-4-5-20251001
+    planner_model: claude-sonnet-4-6
     max_thinking_tokens: 1024     # 0 = no thinking; >=1024 enabled (API floor)
     credentials:
       username_env: PORTAL_USER
@@ -172,11 +182,34 @@ agents:
 
 Per-agent knobs:
 
-- `model` — overrides `anthropic.default_model`
+- `model` — overrides `anthropic.default_model` (default: Haiku 4.5, fast and cheap)
+- `planner_model` — optional. When set, the agent's first turn AFTER a message-window compaction uses this model to re-synthesize context. Typical: Sonnet 4.6 while exploratory turns stay on Haiku. Improves long-trajectory coherence; omit for single-model mode.
 - `max_thinking_tokens` — `0` (off, fastest) or `≥1024`. Useful at `1024` on Haiku for multi-step coherence; `2000+` on Sonnet for the security/completionist personas
-- `planner_model` — optional smarter model for one-shot plan calls between chunks; the cheap executor model then follows the plan. Omit for single-model mode (faster per chunk, less directed)
 - `override_personality` — inline string to bypass the profile file
 - `budget` — per-agent caps (turns, USD, minutes)
+
+## Cost & Caching
+
+Prompt caching reduces per-turn input cost dramatically:
+
+- **System prompt:** 1-hour cache (shared across all agents in a run)
+- **Tools array:** 1-hour cache (all agent loop calls hit the cache)
+- **Message tail:** 5-minute cache (the last content block of the most recent message)
+
+For a typical multi-turn agent run, these three breakpoints mean ~90% of the input token bill is charged at the cacheRead rate ($0.08/Mt on Haiku, vs $0.80/Mt full price). The per-run cost delta is substantial: savings compound across turns and across the parallel agent swarm.
+
+Optional batching for the post-run critic reduces output token cost by 50% for large triage payloads. Set `review.batch_mode: auto` (default) or `force_batch` to use the Batch API; SLA is 24h but typical completion is 1–4h. Use `--inline-critic` CLI flag to override for immediate feedback.
+
+## Cross-run learning
+
+Agents now have a per-target persistent Memory tool (`memory` in the toolset). It survives across separate runs against the same portal. Agents use it to record:
+
+- Stable orientation facts ("portal has 3 roles: admin, user, viewer; admin login is /admin")
+- Bug patterns noticed across runs
+- Routes that are dead ends
+- Approaches that have failed before
+
+The Memory tool stores data under `~/.regress-harness/memory/<targetUrlHash>/`. Users can delete this directory to clear accumulated notes. Note: privacy implication — anything the agent writes is persisted locally; document the path so users can clear it if needed.
 
 ## Stealth mode
 
@@ -192,6 +225,68 @@ When enabled:
 - The binary is licensed separately by CloakHQ. Regress-harness does NOT redistribute it; users install it directly via `bun add cloakbrowser` (or `npm install cloakbrowser`).
 - The stealth binary replaces Playwright Chromium for the pre-login phase only; it carries the same session to the agent loop as the normal path.
 - **Default:** `false` (uses bundled Playwright Chromium; no extra download). Opt in only if you hit bot-detection walls.
+
+## Extending regress-harness
+
+Personas and playbooks follow the open-standard Anthropic Agent Skills format. Drop a new skill in the `skills/` directory to extend the harness:
+
+### Custom personas
+
+Create `skills/personas/<your-slug>/SKILL.md`:
+
+```yaml
+---
+name: your-slug
+description: Brief description of this persona's style
+type: persona
+defaultBudget:
+  max_turns: 100
+  max_usd: 1.0
+  max_minutes: 15
+---
+
+# Personality
+
+Describe the persona's behaviour, psychology, and exploration style.
+```
+
+### Custom playbooks
+
+Create `skills/playbooks/<your-name>/SKILL.md` and `skills/playbooks/<your-name>/handler.ts`:
+
+**SKILL.md:**
+```yaml
+---
+name: your-playbook-name
+description: What this playbook does
+type: playbook
+categories: [form]  # or [discovery, security, util]
+estimatedDurationMs: 5000
+---
+
+# Usage
+
+One-paragraph description for the agent.
+
+# Inputs
+
+- `field1`: Description
+- `field2`: Description
+```
+
+**handler.ts:**
+```ts
+export const inputShape = { /* zod shape */ } as const;
+
+export async function handler(
+  input: /* inferred from inputShape */,
+  ctx: PlaybookContext,
+): Promise<PlaybookOutcome> {
+  // Your playbook logic
+}
+```
+
+See `skills/playbooks/` for 9 built-in examples. Reference the [Anthropic Agent Skills spec](https://docs.anthropic.com) for full details.
 
 ## Auth modes
 
@@ -238,25 +333,29 @@ When enabled:
 
 ## Project structure
 
+- `skills/` — Agent Skills format: personas and playbooks
+  - `skills/personas/` — 5 built-in personas (SKILL.md files)
+  - `skills/playbooks/` — 9 built-in playbooks (SKILL.md + handler.ts pairs)
 - `src/config/` — YAML schema + loader (Zod)
 - `src/auth/` — Pre-agent login, shared multi-tab session pool, recovery
 - `src/crawler/` — BFS pre-run crawler, on-demand route expansion, SiteMap
 - `src/page-model/` — Single round-trip DOM parser (PageModel), serializer for agent prompts
-- `src/playbooks/` — 9 surviving playbooks: 3 discovery (`ask_sitemap`, `route_404_probe`, `discover_route_affordances`), 3 utility (`fill_and_verify`, `walk_pagination`, `walk_wizard`), 3 security (`idor_probe`, `header_audit`, `sensitive_path_audit`). The persona drives flow; playbooks are deterministic shortcuts for the bits that are tedious turn-by-turn.
+- `src/playbooks/` — Core playbook types and execution engine; see `skills/playbooks/` for implementations
 - `src/plugins/` — Auth provider plugins (`form`, `none`), link extractors, logout guard
-- `src/profiles/` — Persona markdown files (5 built-in)
-- `src/tools/` — In-process MCP servers (`browser-server.ts`, `findings-server.ts`)
-- `src/orchestrator/` — `run.ts`, `spawn-agent.ts`, `loop.ts`, `supervisor.ts`, `registry.ts`, cost compute
-- `src/findings/` — `review.ts` (critic LLM), `report.ts` (markdown writer), `persist.ts`, `coverage.ts`
+- `src/skills/` — Skills format loader (reads `skills/` directory, discovers personas + playbooks)
+- `src/tools/` — In-process MCP servers (`browser-server.ts` with 14 browser primitives, `findings-server.ts`)
+- `src/orchestrator/` — `run.ts`, `spawn-agent.ts`, `loop.ts`, `supervisor.ts`, registry, cost compute, Memory tool integration
+- `src/findings/` — `review.ts` (critic LLM, batch-capable), `report.ts` (markdown writer), `persist.ts`, `coverage.ts`
 - `src/safety/` — Allowlist checks, non-prod gate, credential-name validation
 - `src/logging/` — Structured JSON logger with `redactForLlm` (secret masking + 8 KB truncation)
-- `bin/` — `regress.ts` (scan), `regress-review.ts` (re-review)
+- `bin/` — `regress.ts` (scan), `regress-review.ts` (re-review with `--inline-critic` override)
 
 ## Commands
 
 ```bash
 bun run scan <config.yaml>      # full run: crawler + explorers + supervisor + post-run review
 bun run review <runDir>         # re-review a past run with a fresh critic pass
+bun run review <runDir> --inline-critic  # immediate review (full price, no batch queuing)
 bun run typecheck               # TypeScript check
 bun run lint                    # Biome check
 bun run lint:fix                # Biome format + safe-fix
@@ -269,21 +368,15 @@ regress-harness is pre-launch. The strategic review at
 `docs/superpowers/specs/2026-04-26-regress-harness-strategic-review.md`
 captures the v3 direction:
 
-- **Phase 2 (done):** simplified the playbook framework from 31 scripted
-  flows to 9 focused playbooks. Persona-first system prompt — primitives
-  are the default action vocabulary; playbooks are deterministic shortcuts
-  when they fit exactly. Supervisor trimmed to 3 intervention modes;
-  `storage_inspect` primitive replaces the deleted playbook.
-- **Phase 3:** prompt caching, model routing (Haiku for action / Sonnet
-  for planning + critic), Anthropic Memory tool for cross-run learning,
-  Agent Skills as the format for personas + playbooks.
-- **Phase 4:** critic LLM with browser access (re-runs suspect findings
-  to confirm), event-sourced replay.
+- **Phase 1 (done):** cleanup + security hardening (auth pool, playbook consolidation, allowlist enforcement).
+- **Phase 2 (done):** simplified the playbook framework from 31 scripted flows to 9 focused playbooks. Persona-first system prompt — primitives are the default action vocabulary; playbooks are deterministic shortcuts when they fit exactly. Supervisor trimmed to 3 intervention modes; `storage_inspect` primitive replaces the deleted playbook.
+- **Phase 3 (done):** prompt caching (system + tools + message tail, ~90% cacheRead savings), model routing (Haiku 4.5 for actions / Sonnet 4.6 for post-compaction synthesis), Anthropic Memory tool for cross-run learning (per-target persistent notebook), Agent Skills as the format for personas + playbooks, `ax_snapshot` primitive (cheap AX-tree outline), Batch API critic (50% off output), CloakBrowser stealth opt-in.
+- **Phase 4 (next):** critic LLM with browser access (Agent-as-a-Judge — re-runs suspect findings to confirm), event-sourced run trace.
 - **Phase 5:** end-to-end validation against OWASP Juice Shop.
 
 ## Tuning notes
 
-- **Speed / cost** — use Haiku 4.5 with `max_thinking_tokens: 0` for cheapest exploration. Add the supervisor on top for unblocking; it costs ~$0.15/run regardless of how many explorers you run.
+- **Speed / cost** — default is Haiku 4.5 with `max_thinking_tokens: 0` for cheapest exploration + Sonnet 4.6 as post-compaction `planner_model` for improved long-trajectory coherence. Remove `planner_model` for pure Haiku mode (faster per turn, less directed). Add the supervisor on top for unblocking; it costs ~$0.15/run regardless of how many explorers you run.
 - **Coverage** — more parallel agents = more breadth, not more depth. Personas diverge naturally (the same persona twice will explore differently each run).
-- **Coherence** — if Haiku is "scatterbrained" and clicking randomly, raise its `max_thinking_tokens` to `1024`. If Sonnet is over-thinking, lower it.
+- **Coherence** — if Haiku is "scatterbrained" and clicking randomly, raise its `max_thinking_tokens` to `1024` or enable `planner_model` for every turn (not just post-compaction). If Sonnet is over-thinking, lower `max_thinking_tokens` or disable the planner.
 - **Findings throttle** — 8 findings per agent per 60s. Past that the harness drops them silently (the reviewer dedupes anyway, so cascade-thrashing was costing tokens for nothing).
