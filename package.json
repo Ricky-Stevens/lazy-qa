@@ -32,6 +32,7 @@
   "scripts": {
     "scan": "tsx --env-file-if-exists=.env bin/regress.ts",
     "review": "tsx --env-file-if-exists=.env bin/regress-review.ts",
+    "replay": "tsx --env-file-if-exists=.env bin/regress-replay.ts",
     "eval": "tsx --env-file-if-exists=.env bin/regress-eval.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

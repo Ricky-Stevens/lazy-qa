@@ -22,11 +22,14 @@ import type { MemoryTool20250818 } from '@anthropic-ai/sdk/resources/messages/me
 import { z } from 'zod';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
+import { redactForLlm } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
 import { computeCostUsd } from './cost.ts';
+import type { EventWriter } from './events.ts';
+import { capToolCallInput, capToolResultContent } from './events.ts';
 import { consumeNudge, updateOnTurn } from './registry.ts';
 import type { MemoryEntry, SummaryMemory } from './summary-memory.ts';
 
@@ -69,13 +72,15 @@ export interface LoopInput {
   /** Absolute path to the per-target memory directory. Passed for context /
    * future extensions; the API manages actual I/O server-side. */
   memoryPath: string;
+  /** Event writer for this run. Optional — omitted in tests that don't need it. */
+  events?: EventWriter;
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
  * errors are recorded into `journey.terminationReason`. */
 export async function runAgentLoop(input: LoopInput): Promise<void> {
   const client = new Anthropic({ apiKey: input.apiKey });
-  const { agent, journey, logger, rawTools, siteMap, summaryMemory } = input;
+  const { agent, journey, logger, rawTools, siteMap, summaryMemory, events } = input;
 
   // 1. Convert RawToolDef → Anthropic SDK tool definitions. Zod 4 ships
   // z.toJSONSchema, so we can derive a clean JSON Schema for free.
@@ -215,6 +220,14 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const modelForThisTurn =
       nextTurnIsPlanning && agent.plannerModel ? agent.plannerModel : agent.model;
 
+    // Emit agent.turn.start before the API call.
+    await events?.write({
+      type: 'agent.turn.start',
+      agentId: agent.id,
+      turn: journey.turns + 1,
+      modelUsed: modelForThisTurn,
+    });
+
     let response: Anthropic.Message;
     try {
       response = await client.messages.create({
@@ -277,24 +290,37 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     });
 
     const usage = response.usage;
-    journey.tokenUsage.input += usage.input_tokens ?? 0;
-    journey.tokenUsage.output += usage.output_tokens ?? 0;
-    journey.tokenUsage.cacheRead += usage.cache_read_input_tokens ?? 0;
-    journey.tokenUsage.cacheWrite += usage.cache_creation_input_tokens ?? 0;
+    const turnTokenUsage = {
+      input: usage.input_tokens ?? 0,
+      output: usage.output_tokens ?? 0,
+      cacheRead: usage.cache_read_input_tokens ?? 0,
+      cacheWrite: usage.cache_creation_input_tokens ?? 0,
+    };
+    journey.tokenUsage.input += turnTokenUsage.input;
+    journey.tokenUsage.output += turnTokenUsage.output;
+    journey.tokenUsage.cacheRead += turnTokenUsage.cacheRead;
+    journey.tokenUsage.cacheWrite += turnTokenUsage.cacheWrite;
     // Per-turn cost: accumulate using the model that was actually called.
     // Previously this recomputed from all-time token totals × a single model
     // price, which is wrong once model routing means different turns bill at
     // different rates. Running sum is correct.
+    let costUsdDelta = 0;
     try {
-      journey.costUsd += computeCostUsd(modelForThisTurn, {
-        input: usage.input_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
-        cacheRead: usage.cache_read_input_tokens ?? 0,
-        cacheWrite: usage.cache_creation_input_tokens ?? 0,
-      });
+      costUsdDelta = computeCostUsd(modelForThisTurn, turnTokenUsage);
+      journey.costUsd += costUsdDelta;
     } catch {
       // Unknown model — keep token totals only (cost will be 0 for this turn).
     }
+
+    // Emit agent.turn.end with per-turn stats.
+    await events?.write({
+      type: 'agent.turn.end',
+      agentId: agent.id,
+      turn: journey.turns,
+      tokenUsage: turnTokenUsage,
+      costUsdDelta,
+      stopReason: response.stop_reason ?? 'unknown',
+    });
 
     // Append the assistant turn to history.
     messages.push({ role: 'assistant', content: response.content });
@@ -321,13 +347,32 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     // sum-of-tool-times.
     const toolResultsAndOutcomes = await Promise.all(
       toolUses.map(async (use) => {
+        // Emit tool.call before the handler runs.
+        await events?.write({
+          type: 'tool.call',
+          agentId: agent.id,
+          turn: journey.turns,
+          name: use.name,
+          // Cap input at 4 KB to avoid bloating the event log.
+          input: capToolCallInput(use.input),
+        });
+
         const handler = handlerByName.get(use.name);
         if (!handler) {
+          const errContent = `Unknown tool: ${use.name}`;
+          await events?.write({
+            type: 'tool.result',
+            agentId: agent.id,
+            turn: journey.turns,
+            name: use.name,
+            ok: false,
+            content: errContent,
+          });
           return {
             block: {
               type: 'tool_result',
               tool_use_id: use.id,
-              content: `Unknown tool: ${use.name}`,
+              content: errContent,
               is_error: true,
             } satisfies Anthropic.ToolResultBlockParam,
             outcome: null as PlaybookOutcome | null,
@@ -336,6 +381,15 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
         try {
           const result = await handler(use.input as Record<string, unknown>);
           const text = result.content[0]?.text ?? '';
+          // Emit tool.result with redacted+capped content.
+          await events?.write({
+            type: 'tool.result',
+            agentId: agent.id,
+            turn: journey.turns,
+            name: use.name,
+            ok: true,
+            content: capToolResultContent(redactForLlm(text)),
+          });
           return {
             block: {
               type: 'tool_result',
@@ -349,11 +403,20 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
               : null,
           };
         } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await events?.write({
+            type: 'tool.result',
+            agentId: agent.id,
+            turn: journey.turns,
+            name: use.name,
+            ok: false,
+            content: capToolResultContent(redactForLlm(errMsg)),
+          });
           return {
             block: {
               type: 'tool_result',
               tool_use_id: use.id,
-              content: err instanceof Error ? err.message : String(err),
+              content: errMsg,
               is_error: true,
             } satisfies Anthropic.ToolResultBlockParam,
             outcome: null as PlaybookOutcome | null,
@@ -385,6 +448,18 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
         oneLineSummary: oneLineSummary(outcome),
       };
       summaryMemory.add(entry);
+      // Emit playbook.outcome after SummaryMemory is updated.
+      // The status values in PlaybookOutcome ('ok'|'failed'|'suspicious') map
+      // directly to the event taxonomy; 'skipped' is provided for completeness
+      // when the playbook was not invoked (currently unused by the loop).
+      await events?.write({
+        type: 'playbook.outcome',
+        agentId: agent.id,
+        playbookName: outcome.playbookName,
+        status: outcome.status as 'ok' | 'suspicious' | 'failed' | 'skipped',
+        durationMs: outcome.durationMs,
+        evidence: outcome.evidence ?? null,
+      });
     }
 
     // Surface end_turn diagnostically — useful for tuning.

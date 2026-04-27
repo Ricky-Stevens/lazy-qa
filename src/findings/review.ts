@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
 import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
+import type { EventWriter } from '../orchestrator/events.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 
@@ -83,6 +84,11 @@ export interface ReviewInput {
   /** Controls dispatch mode. Defaults to 'auto'. */
   batchMode?: 'auto' | 'inline' | 'force_batch';
   logger: Logger;
+  /**
+   * Event writer for this run. Optional — the review CLI may run standalone
+   * without an active writer. All emit calls silently no-op when undefined.
+   */
+  events?: EventWriter;
 }
 
 const SYSTEM_PROMPT = `You are a senior QA triager reviewing automated regression-scan findings.
@@ -262,7 +268,7 @@ async function runCriticBatch(
 }
 
 export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
-  const { runDir, apiKey, logger } = input;
+  const { runDir, apiKey, logger, events } = input;
   const model = input.model ?? 'claude-sonnet-4-6';
   const batchMode = input.batchMode ?? 'auto';
 
@@ -299,6 +305,14 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
     payloadChars: payload.length,
   });
 
+  // Emit critic.start before the API call.
+  await events?.write({
+    type: 'critic.start',
+    findingCount: findings.length,
+    model,
+  });
+
+  const reviewStartedAt = Date.now();
   const client = new Anthropic({ apiKey });
 
   const inputCharsApprox = payload.length;
@@ -355,8 +369,17 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   const missing: Finding[] = [];
   for (const f of findings) {
     const r = reviewsById.get(f.id);
-    if (r) reviews.push({ finding: f, review: r });
-    else missing.push(f);
+    if (r) {
+      reviews.push({ finding: f, review: r });
+      // Emit critic.verdict per finding.
+      await events?.write({
+        type: 'critic.verdict',
+        findingId: f.id,
+        verdict: r.classification,
+      });
+    } else {
+      missing.push(f);
+    }
   }
 
   // Validate duplicateOf references — drop ones that point at unknown ids
@@ -388,6 +411,13 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
     counts,
     clusters: clusters.length,
     costUsd: costUsd.toFixed(4),
+  });
+
+  // Emit critic.end with final cost and duration.
+  await events?.write({
+    type: 'critic.end',
+    totalCostUsd: costUsd,
+    durationMs: Date.now() - reviewStartedAt,
   });
 
   return {

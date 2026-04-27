@@ -6,6 +6,7 @@
  * go" reference; agents are responsible for everything behind interactions.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { Page } from 'playwright';
 import { parsePage } from '../page-model/parser.ts';
 import { extractLinks } from './extract-links.ts';
@@ -111,6 +112,7 @@ export async function crawlSite(page: Page, opts: CrawlOptions): Promise<SiteMap
   const siteMap = new SiteMapImpl({ rootUrl });
   const seen = new Set<string>();
   const queue: QueueItem[] = [{ url: rootUrl, depth: 0 }];
+  const { events } = opts;
 
   opts.logger.debug('crawl.start', { rootUrl, maxDepth: opts.maxDepth, maxRoutes: opts.maxRoutes });
 
@@ -134,6 +136,16 @@ export async function crawlSite(page: Page, opts: CrawlOptions): Promise<SiteMap
     if (!isSameOrigin(next.url, rootUrl)) continue;
     if (!isAllowedHost(next.url, opts.allowedHosts)) continue;
 
+    // Emit crawl.probe.submit before navigating.
+    const probeId = randomUUID();
+    const probeStart = Date.now();
+    await events?.write({
+      type: 'crawl.probe.submit',
+      probeId,
+      route,
+      kind: 'http',
+    });
+
     let status: number | undefined;
     let navError: string | undefined;
     try {
@@ -149,6 +161,15 @@ export async function crawlSite(page: Page, opts: CrawlOptions): Promise<SiteMap
       navError = err instanceof Error ? err.message : String(err);
       opts.logger.debug('crawl.navError', { url: next.url, error: navError });
     }
+
+    // Emit crawl.probe.result after navigation completes.
+    await events?.write({
+      type: 'crawl.probe.result',
+      probeId,
+      status: status ?? null,
+      ok: !navError && (status === undefined || status < 400),
+      durationMs: Date.now() - probeStart,
+    });
 
     if (navError) {
       const stub = buildRouteEntry({
@@ -235,9 +256,18 @@ export async function crawlSite(page: Page, opts: CrawlOptions): Promise<SiteMap
   }
 
   const final = siteMap.serialize();
+  const crawlDurationMs = Date.now() - startedAt;
   opts.logger.info('crawl.done', {
     routes: Object.keys(final.routes).length,
-    elapsedMs: Date.now() - startedAt,
+    elapsedMs: crawlDurationMs,
   });
+
+  // Emit crawl.complete once the full crawl finishes.
+  await events?.write({
+    type: 'crawl.complete',
+    routeCount: Object.keys(final.routes).length,
+    durationMs: crawlDurationMs,
+  });
+
   return final;
 }

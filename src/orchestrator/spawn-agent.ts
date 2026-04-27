@@ -26,6 +26,7 @@ import { BROWSER_TOOL_NAMES, createBrowserMcpServer } from '../tools/browser-ser
 import { createHarnessMcpServer } from '../tools/findings-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
+import type { EventWriter } from './events.ts';
 import { runAgentLoop } from './loop.ts';
 import { registerAgent, setStatus, updateOnAction } from './registry.ts';
 import { SummaryMemory } from './summary-memory.ts';
@@ -54,6 +55,8 @@ export interface SpawnAgentInput {
   memoryPath: string;
   /** Skills bundle loaded at run start — used to build playbook tools. */
   skillsBundle: SkillsBundle;
+  /** Event writer for this run. Optional — omitted in tests that don't need it. */
+  events?: EventWriter;
 }
 
 export interface SpawnAgentResult {
@@ -88,6 +91,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     memoryEnabled,
     memoryPath,
     skillsBundle,
+    events,
   } = input;
   const { budget } = agent;
 
@@ -148,6 +152,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       return livePage;
     },
     runDir,
+    events,
   });
   const browserKit = createBrowserMcpServer({
     getPage: () => {
@@ -162,6 +167,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     playbooks: playbookSkills,
     onAction: (patch) => updateOnAction(agent.id, patch),
     allowedHosts,
+    events,
   });
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the
@@ -182,6 +188,20 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   // I tried" context.
   const summaryMemory = new SummaryMemory();
 
+  // Emit agent.start before the loop begins.
+  await events?.write({
+    type: 'agent.start',
+    agentId: agent.id,
+    profileName: agent.profileName,
+    model: agent.model,
+    ...(agent.plannerModel ? { plannerModel: agent.plannerModel } : {}),
+    budget: {
+      max_turns: budget.max_turns,
+      max_minutes: budget.max_minutes,
+      max_usd: budget.max_usd,
+    },
+  });
+
   try {
     childLogger.info('agent.loop.mode', { mode: 'direct-api' });
     await runAgentLoop({
@@ -197,6 +217,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       summaryMemory,
       memoryEnabled,
       memoryPath,
+      events,
     });
   } catch (err) {
     if (abortController.signal.aborted) {
@@ -221,6 +242,15 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     journey.endedAt ??= new Date().toISOString();
     journey.terminationReason ??= 'max-turns';
     setStatus(agent.id, journey.terminationReason === 'error' ? 'errored' : 'finished');
+    // Emit agent.end with final journey stats.
+    await events?.write({
+      type: 'agent.end',
+      agentId: agent.id,
+      terminationReason: journey.terminationReason,
+      turns: journey.turns,
+      costUsd: journey.costUsd,
+      findingCount: journey.findings.length,
+    });
     await persistJourney(runDir, journey);
   }
 

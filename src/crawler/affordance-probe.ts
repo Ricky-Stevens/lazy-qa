@@ -17,8 +17,10 @@
  * use it to decide where to deepen their exploration.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { Page } from 'playwright';
 import type { Logger } from '../logging/logger.ts';
+import type { EventWriter } from '../orchestrator/events.ts';
 import type {
   ActionRef,
   AffordanceOutcome,
@@ -161,6 +163,10 @@ export interface AffordanceProbeOptions {
   destructiveKeywords?: string[];
   /** Override the dismiss selector hints. Default: DEFAULT_DISMISS_SELECTORS. */
   dismissSelectorHints?: string[];
+  /** Event writer for this run. Optional — emits crawl.probe.submit/result events. */
+  events?: EventWriter;
+  /** Run ID for event attribution. Required when events is set. */
+  runId?: string;
 }
 
 const DEFAULT_OPTIONS: AffordanceProbeOptions = {
@@ -521,6 +527,16 @@ export async function probeAffordances(
       break;
     }
 
+    // Emit crawl.probe.submit before each affordance click.
+    const probeId = randomUUID();
+    const probeStart = Date.now();
+    await opts.events?.write({
+      type: 'crawl.probe.submit',
+      probeId,
+      route: baselineUrl,
+      kind: 'affordance',
+    });
+
     let outcome: AffordanceOutcome;
     const dialogCountBefore = await countOpenDialogs(page);
 
@@ -534,6 +550,14 @@ export async function probeAffordances(
           context,
           outcome: { kind: 'error', detail: 'not visible' },
         });
+        // Emit result for the skipped probe.
+        await opts.events?.write({
+          type: 'crawl.probe.result',
+          probeId,
+          status: null,
+          ok: false,
+          durationMs: Date.now() - probeStart,
+        });
         continue;
       }
       await loc.click({ timeout: opts.perClickTimeoutMs, trial: false });
@@ -545,6 +569,15 @@ export async function probeAffordances(
         detail: err instanceof Error ? err.message : String(err),
       };
     }
+
+    // Emit crawl.probe.result after the click + classify cycle.
+    await opts.events?.write({
+      type: 'crawl.probe.result',
+      probeId,
+      status: null,
+      ok: outcome.kind !== 'error',
+      durationMs: Date.now() - probeStart,
+    });
 
     out.push({ trigger: ref, context, outcome });
 

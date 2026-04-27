@@ -6,6 +6,7 @@
 
 import type { Page } from 'playwright';
 import type { Logger } from '../logging/logger.ts';
+import type { EventWriter } from '../orchestrator/events.ts';
 import type { PageModel } from '../page-model/types.ts';
 
 export interface RouteEntry {
@@ -55,6 +56,8 @@ export interface CrawlOptions {
   /** Optional custom link extractor. Defaults to built-in same-origin walker. */
   linkExtractor?: (page: Page) => Promise<string[]>;
   logger: Logger;
+  /** Event writer for this run. Optional — emits crawl.* events. */
+  events?: EventWriter;
 }
 
 /**

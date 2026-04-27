@@ -18,6 +18,7 @@ import { expandRoute } from '../crawler/expand.ts';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import { deepRedact, redactForLlm } from '../logging/logger.ts';
+import type { EventWriter } from '../orchestrator/events.ts';
 import {
   count4xxIn,
   getEffectivePauseUntil,
@@ -88,6 +89,8 @@ export interface BrowserServerInput {
    * Subresources (css, font, image, etc.) are always allowed so CDN-backed
    * staging portals continue to work. */
   allowedHosts?: string[];
+  /** Event writer for this run. Optional — emits navigate events. */
+  events?: EventWriter;
 }
 
 /** Accessibility node interface for rendering the AX tree. */
@@ -239,6 +242,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     playbooks,
     onAction,
     allowedHosts = [],
+    events,
   } = input;
 
   // Console + network buffers. Drained into PageModel.signals on each parse,
@@ -553,9 +557,20 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           } catch {
             /* invalid url — use raw */
           }
+          // Emit refused navigate event.
+          const fromUrl = (() => { try { return getPage().url(); } catch { return ''; } })();
+          await events?.write({
+            type: 'navigate',
+            agentId: agentId ?? 'unknown',
+            fromUrl,
+            toUrl: url,
+            refused: true,
+            reason: `${hostname} not in allowed_hosts`,
+          });
           return textResult(`navigate refused: ${hostname} not in allowed_hosts`);
         }
         const page = ensureListeners();
+        const fromUrl = page.url();
         await awaitPauseIfNeeded();
         invalidateModelCache();
         try {
@@ -570,6 +585,14 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         } catch (err) {
           return textResult(statusFail(page, `navigate(${url})`, err));
         }
+        // Emit successful navigate event.
+        await events?.write({
+          type: 'navigate',
+          agentId: agentId ?? 'unknown',
+          fromUrl,
+          toUrl: page.url(),
+          refused: false,
+        });
         // Grow the shared sitemap with whatever the agent just discovered, so
         // the next agent's snapshot sees this route. Best-effort — sitemap
         // failures must not break navigation.
@@ -1089,6 +1112,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
   void agentId;
   void persona;
   void runDir;
+  void events;
 
   return { mcpServer, rawTools };
 }

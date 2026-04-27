@@ -4,6 +4,7 @@ import { recoverAllSessions } from '../auth/session-pool.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import { computeCostUsd } from './cost.ts';
+import type { EventWriter } from './events.ts';
 import {
   count4xxIn,
   getGlobalPauseSnapshot,
@@ -41,6 +42,8 @@ export interface SupervisorInput {
   maxTurns: number;
   abortSignal: AbortSignal;
   logger: Logger;
+  /** Event writer for this run. Optional — emits supervisor.intervention events. */
+  events?: EventWriter;
 }
 
 export interface SupervisorResult {
@@ -88,6 +91,7 @@ BE SPECIFIC IN NUDGES. Reference what the agent was actually doing. A vague nudg
 
 export async function runSupervisor(input: SupervisorInput): Promise<SupervisorResult> {
   const client = new Anthropic({ apiKey: input.apiKey });
+  const { events } = input;
   const startedAt = Date.now();
   let turns = 0;
   let costUsd = 0;
@@ -160,6 +164,11 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
           failed: result.failed,
           detail: result.detail,
         });
+        await events?.write({
+          type: 'supervisor.intervention',
+          kind: 'auth-walled',
+          detail: `relogin: ok=${result.ok} recovered=${result.recovered} failed=${result.failed} — ${result.detail}`,
+        });
         return { content: [{ type: 'text' as const, text }] };
       },
     },
@@ -185,6 +194,13 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
           ? `Nudge queued for ${agentId}. They will read it at the start of their next chunk (≤30s).`
           : `Failed: no agent registered with id '${agentId}'. Call list_agents to see valid IDs.`;
         input.logger.info('supervisor.nudge', { agentId, ok, preview: message.slice(0, 200) });
+        if (ok) {
+          await events?.write({
+            type: 'supervisor.intervention',
+            kind: 'no-progress',
+            detail: `nudge → ${agentId}: ${message.slice(0, 200)}`,
+          });
+        }
         return { content: [{ type: 'text' as const, text }] };
       },
     },
@@ -210,6 +226,11 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
         setGlobalPause(until, reason);
         pauseCount += 1;
         input.logger.info('supervisor.pause_agents', { durationSec: clamped, reason });
+        await events?.write({
+          type: 'supervisor.intervention',
+          kind: 'backend-storm',
+          detail: `pause_agents ${clamped}s: ${reason}`,
+        });
         return {
           content: [
             {

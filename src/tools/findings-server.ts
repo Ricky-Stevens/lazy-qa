@@ -3,6 +3,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
+import type { EventWriter } from '../orchestrator/events.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
@@ -25,6 +26,8 @@ export interface HarnessServerInput {
   getPage?: () => Page;
   /** Run directory used to materialise screenshot files. Required for `attach_screenshot`. */
   runDir?: string;
+  /** Event writer for this run. Optional — emits finding.report events. */
+  events?: EventWriter;
 }
 
 export function createHarnessMcpServer(
@@ -36,7 +39,7 @@ export function createHarnessMcpServer(
     'journey' in inputOrJourney
       ? inputOrJourney
       : { journey: inputOrJourney, logger: loggerArg as Logger };
-  const { journey, logger, getPage, runDir } = input;
+  const { journey, logger, getPage, runDir, events } = input;
   const rawTools: RawToolDef[] = [];
   function defTool<S extends Record<string, z.ZodTypeAny>>(
     name: string,
@@ -175,6 +178,12 @@ export function createHarnessMcpServer(
             }
           }
           journey.findings.push(finding);
+          // Emit finding.report event after the finding is recorded.
+          await events?.write({
+            type: 'finding.report',
+            agentId: journey.agentId,
+            finding,
+          });
           logger.info('finding.reported', {
             agentId: journey.agentId,
             findingId: finding.id,
