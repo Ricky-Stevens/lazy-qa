@@ -13,6 +13,7 @@ import path from 'node:path';
 import { acquireSession } from '../auth/session-pool.ts';
 import { loadConfig, resolveApiKey } from '../config/load.ts';
 import { crawlSite } from '../crawler/crawl.ts';
+import { extractLinks } from '../crawler/extract-links.ts';
 import { SiteMapImpl } from '../crawler/sitemap.ts';
 import type { SiteMap } from '../crawler/types.ts';
 import { writeCoverageReport } from '../findings/coverage.ts';
@@ -27,10 +28,10 @@ import { writeReviewArtefacts } from '../findings/report.ts';
 import { reviewRun } from '../findings/review.ts';
 import type { Logger } from '../logging/logger.ts';
 import { createLogger } from '../logging/logger.ts';
-import { extractLinks } from '../crawler/extract-links.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
 import { spawnAgent } from './spawn-agent.ts';
 import { runSupervisor } from './supervisor.ts';
@@ -209,7 +210,15 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     siteMap.upsertRoute(route, model);
   }
 
-  // 9. Launch agents in parallel. The supervisor runs concurrently and
+  // 9. Resolve and initialise the per-target memory directory. Created once
+  // before any agents spawn so concurrent agents share the same path.
+  const memoryEnabled = cfg.memory.enabled;
+  const memoryPath = resolveMemoryPath(cfg.target.url, cfg.memory.path);
+  if (memoryEnabled) {
+    await mkdir(memoryPath, { recursive: true });
+  }
+
+  // 10. Launch agents in parallel. The supervisor runs concurrently and
   // finishes when every agent terminates.
   const runStartedAt = new Date().toISOString();
 
@@ -227,6 +236,8 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       logger,
       abortSignal: runAbortController.signal,
       stealth: cfg.target.stealth,
+      memoryEnabled,
+      memoryPath,
     }),
   );
 
@@ -342,6 +353,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         runDir,
         apiKey,
         model: cfg.review.model,
+        batchMode: cfg.review.batch_mode,
         logger: logger.child({ tool: 'review' }),
       });
       await writeReviewArtefacts(runDir, review);

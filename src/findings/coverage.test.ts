@@ -6,7 +6,11 @@ import type { RouteEntry, SiteMap } from '../crawler/types.ts';
 import type { PageModel } from '../page-model/types.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
-import { buildCoverageReport, type PlaybookOutcomeRecord, writeCoverageReport } from './coverage.ts';
+import {
+  buildCoverageReport,
+  type PlaybookOutcomeRecord,
+  writeCoverageReport,
+} from './coverage.ts';
 
 function makeRoute(partial: Partial<RouteEntry> & { route: string }): RouteEntry {
   return {

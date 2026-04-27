@@ -8,7 +8,7 @@ const args = process.argv.slice(2);
 const runDirArg = args[0];
 
 if (!runDirArg || runDirArg === '--help' || runDirArg === '-h') {
-  process.stderr.write(`Usage: regress-review <runDir> [--model <model>]
+  process.stderr.write(`Usage: regress-review <runDir> [--model <model>] [--inline-critic]
 
 Re-reviews a past scan: reads findings.json + journeys/*.meta.json from runDir,
 calls a critic LLM to triage each finding, writes review.md and review.json
@@ -17,12 +17,15 @@ into the same dir.
 Requires ANTHROPIC_API_KEY in the environment (this path uses the direct
 Anthropic SDK, not the Claude Code subprocess).
 
-  --model   Override reviewer model (default: claude-sonnet-4-6).
+  --model          Override reviewer model (default: claude-sonnet-4-6).
+  --inline-critic  Force synchronous messages.create instead of Batch API
+                   (default: auto-selects batch for payloads > 16 000 chars).
 \n`);
   process.exit(runDirArg ? 0 : 1);
 }
 
 let model: string | undefined;
+let batchMode: 'auto' | 'inline' | 'force_batch' = 'auto';
 for (let i = 1; i < args.length; i++) {
   const a = args[i];
   if (a === '--model') {
@@ -33,6 +36,8 @@ for (let i = 1; i < args.length; i++) {
     }
     model = next;
     i += 1;
+  } else if (a === '--inline-critic') {
+    batchMode = 'inline';
   } else {
     process.stderr.write(`Unknown argument: ${a}\n`);
     process.exit(1);
@@ -55,6 +60,7 @@ try {
     runDir,
     apiKey,
     model,
+    batchMode,
     logger,
   });
   await writeReviewArtefacts(runDir, review);

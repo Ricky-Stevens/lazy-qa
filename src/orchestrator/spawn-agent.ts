@@ -47,6 +47,10 @@ export interface SpawnAgentInput {
   abortSignal?: AbortSignal;
   /** Whether to use CloakBrowser stealth mode for login. */
   stealth: boolean;
+  /** Whether the Memory tool is enabled for agents in this run. */
+  memoryEnabled: boolean;
+  /** Absolute path to the per-target memory directory (pre-created by run.ts). */
+  memoryPath: string;
 }
 
 export interface SpawnAgentResult {
@@ -67,8 +71,20 @@ export const ALLOWED_TOOL_NAMES: readonly string[] = [
  * run the agent loop. Persists the resulting journey before returning.
  */
 export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResult> {
-  const { runId, runDir, targetUrl, allowedHosts, auth, agent, apiKey, logger, abortSignal, stealth } =
-    input;
+  const {
+    runId,
+    runDir,
+    targetUrl,
+    allowedHosts,
+    auth,
+    agent,
+    apiKey,
+    logger,
+    abortSignal,
+    stealth,
+    memoryEnabled,
+    memoryPath,
+  } = input;
   const { budget } = agent;
 
   const childLogger = logger.child({ agentId: agent.id });
@@ -155,7 +171,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   // optimized for direct-API mode because we no longer need the engagement-gate caveat
   // or the chunked-loop framing. Playbooks are a tool category; the agent
   // picks them like any other tool.
-  const systemPrompt = buildSystemPrompt({ targetUrl, agent });
+  const systemPrompt = buildSystemPrompt({ targetUrl, agent, memoryEnabled });
 
   // 6. Per-agent summary memory — the loop pushes one entry per playbook
   // invocation so older turns can be elided without losing the "what have
@@ -175,6 +191,8 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       logger: childLogger,
       siteMap: input.siteMap,
       summaryMemory,
+      memoryEnabled,
+      memoryPath,
     });
   } catch (err) {
     if (abortController.signal.aborted) {
@@ -209,8 +227,26 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
  *  persona using the browser primitives. Playbooks survive only as deterministic
  *  shortcuts for tasks that are tedious turn-by-turn (form-fill-and-verify,
  *  pagination, wizard traversal, security probes that need response headers). */
-function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): string {
-  const { targetUrl, agent } = args;
+function buildSystemPrompt(args: {
+  targetUrl: string;
+  agent: ResolvedAgent;
+  memoryEnabled: boolean;
+}): string {
+  const { targetUrl, agent, memoryEnabled } = args;
+
+  // Memory guidance block — injected between HARNESS and HARD RULES sections
+  // only when the Memory tool is enabled. Tells the agent WHAT to remember;
+  // the tool itself describes its operations to the model.
+  const memoryBlock: string[] = memoryEnabled
+    ? [
+        '',
+        'MEMORY (`memory` tool) — you have a persistent notebook. It survives across runs.',
+        'Use it for: stable orientation facts ("portal has admin / user / viewer roles, admin login is /admin"), bug patterns you keep noticing ("save buttons rarely show success toasts on this app"), routes you find broken so future runs skip them, and any "this approach failed before" learnings.',
+        'Keep entries short and concrete. Index keys by category (e.g. files like notes/orientation, notes/known-bugs, notes/dead-ends).',
+        'BEFORE choosing your first action this run, view the memory root to orient yourself. AFTER any meaningful finding or stuck moment, write a brief note.',
+      ]
+    : [];
+
   return [
     `You are NOT a QA agent. You are a real human user of ${targetUrl} — your character is described at the bottom of this prompt and you BEHAVE like that person.`,
     '',
@@ -239,6 +275,7 @@ function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): s
     'HARNESS:',
     '- `mcp__harness__report_finding` — file ANY finding the moment you see it. Be concrete. Then KEEP USING THE APP. A finding is NEVER a reason to stop. ONE finding per occurrence — never aggregate.',
     '- `mcp__harness__end_session` — STRICT HARD-FLOOR USE ONLY: `auth_wall`, `site_unreachable`, `browser_dead`. NEVER call because you "finished exploring".',
+    ...memoryBlock,
     '',
     'HARD RULES:',
     '1. Stay in character. Do not summarise.',

@@ -18,6 +18,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import type { MemoryTool20250818 } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import { z } from 'zod';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
@@ -63,6 +64,11 @@ export interface LoopInput {
   /** Per-agent rolling memory of past playbook attempts. The loop appends to
    * this after every playbook tool result. */
   summaryMemory: SummaryMemory;
+  /** Whether to include the server-side Memory tool in the request. */
+  memoryEnabled: boolean;
+  /** Absolute path to the per-target memory directory. Passed for context /
+   * future extensions; the API manages actual I/O server-side. */
+  memoryPath: string;
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
@@ -88,6 +94,12 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
   // 2. Continuous conversation. We only ever push to this array; the
   // sliding-window compaction rewrites the head in-place when needed.
   const messages: Anthropic.MessageParam[] = [];
+
+  // Per-turn model routing: the turn IMMEDIATELY after a sliding-window
+  // compaction uses plannerModel (typically Sonnet) so the agent can
+  // re-orient to the elided context with a smarter model. All other turns
+  // use agent.model (typically Haiku).
+  let nextTurnIsPlanning = false;
 
   while (
     journey.turns < agent.budget.max_turns &&
@@ -128,6 +140,9 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     // prompt is untouched so the prompt cache survives.
     if (messages.length > COMPACT_THRESHOLD) {
       compactSlidingWindow(messages, summaryMemory, logger);
+      // Signal that the NEXT assistant call is a "planning" turn — the agent
+      // needs to re-orient after elision. Use plannerModel for that one call.
+      nextTurnIsPlanning = true;
     }
 
     // Cache the tools array: mark the last entry with a 1h breakpoint.
@@ -142,6 +157,19 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
             },
           ]
         : [];
+
+    // The Memory tool is a server-managed tool — the API handles all I/O.
+    // It is placed AFTER cachedTools so the 1h cache breakpoint on the last
+    // regular tool is preserved. The memory tool itself is uncached (it is
+    // cheap metadata — Anthropic recommends server tools last in the array).
+    // MemoryTool20250818 is part of ToolUnion so no cast is needed.
+    const MEMORY_TOOL_DEF: MemoryTool20250818 = {
+      type: 'memory_20250818',
+      name: 'memory',
+    };
+    const allTools: Anthropic.ToolUnion[] = input.memoryEnabled
+      ? [...cachedTools, MEMORY_TOOL_DEF]
+      : cachedTools;
 
     // Build a per-request messages array with a 5-min cache breakpoint on the
     // last content block of the last message. The persistent `messages` array
@@ -181,10 +209,16 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           ]
         : [];
 
+    // Pick the model for this turn. Post-compaction turns use plannerModel
+    // (if configured) to produce a higher-quality re-orientation synthesis.
+    // All other turns use agent.model (Haiku by default after WP3.D).
+    const modelForThisTurn =
+      nextTurnIsPlanning && agent.plannerModel ? agent.plannerModel : agent.model;
+
     let response: Anthropic.Message;
     try {
       response = await client.messages.create({
-        model: agent.model,
+        model: modelForThisTurn,
         max_tokens: MAX_OUTPUT_TOKENS,
         system: [
           {
@@ -195,7 +229,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           },
         ],
         messages: requestMessages,
-        tools: cachedTools,
+        tools: allTools,
         ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
           ? { thinking: { type: 'enabled', budget_tokens: agent.maxThinkingTokens } }
           : {}),
@@ -227,8 +261,14 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           shape,
         });
       }
+      // Reset the planning flag even on API error so subsequent turns aren't
+      // accidentally promoted to plannerModel.
+      nextTurnIsPlanning = false;
       return;
     }
+
+    // Reset after the call resolves — the planning turn is now complete.
+    nextTurnIsPlanning = false;
 
     journey.turns += 1;
     updateOnTurn(agent.id, {
@@ -241,10 +281,19 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     journey.tokenUsage.output += usage.output_tokens ?? 0;
     journey.tokenUsage.cacheRead += usage.cache_read_input_tokens ?? 0;
     journey.tokenUsage.cacheWrite += usage.cache_creation_input_tokens ?? 0;
+    // Per-turn cost: accumulate using the model that was actually called.
+    // Previously this recomputed from all-time token totals × a single model
+    // price, which is wrong once model routing means different turns bill at
+    // different rates. Running sum is correct.
     try {
-      journey.costUsd = computeCostUsd(agent.model, journey.tokenUsage);
+      journey.costUsd += computeCostUsd(modelForThisTurn, {
+        input: usage.input_tokens ?? 0,
+        output: usage.output_tokens ?? 0,
+        cacheRead: usage.cache_read_input_tokens ?? 0,
+        cacheWrite: usage.cache_creation_input_tokens ?? 0,
+      });
     } catch {
-      // Unknown model — keep token totals only.
+      // Unknown model — keep token totals only (cost will be 0 for this turn).
     }
 
     // Append the assistant turn to history.
@@ -357,6 +406,15 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       journey.terminationReason = 'max-turns';
     }
   }
+}
+
+/**
+ * Pure model-selector function — exported for unit testing.
+ * Returns `plannerModel` when the next turn is a planning turn AND the agent
+ * has a plannerModel configured; otherwise returns `agent.model`.
+ */
+export function pickModel(nextTurnIsPlanning: boolean, agent: ResolvedAgent): string {
+  return nextTurnIsPlanning && agent.plannerModel ? agent.plannerModel : agent.model;
 }
 
 /** Build the per-turn user message — sitemap snapshot + summary memory + continue line. */

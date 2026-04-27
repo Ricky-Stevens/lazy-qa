@@ -250,9 +250,28 @@ export const ReviewConfigSchema = z
   .object({
     enabled: z.boolean().default(true),
     model: ModelSchema.default('claude-sonnet-4-6'),
+    /**
+     * Controls how the critic LLM call is dispatched:
+     * - 'auto'        : batch when payload > 16 000 chars (~4 k tokens), else inline (default)
+     * - 'inline'      : always synchronous messages.create
+     * - 'force_batch' : always use the Batch API regardless of payload size
+     */
+    batch_mode: z.enum(['auto', 'inline', 'force_batch']).default('auto'),
   })
-  .default({ enabled: true, model: 'claude-sonnet-4-6' });
+  .default({ enabled: true, model: 'claude-sonnet-4-6', batch_mode: 'auto' });
 export type ReviewConfig = z.infer<typeof ReviewConfigSchema>;
+
+// Memory tool configuration — persistent per-target notebook for agents.
+export const MemoryConfigSchema = z
+  .object({
+    /** When true, agents have a persistent Memory tool that survives across runs.
+     *  Storage: <homedir>/.regress-harness/memory/<targetUrlHash>/. Default: true. */
+    enabled: z.boolean().default(true),
+    /** Override the storage directory. Default: per-target path under ~/.regress-harness/memory/. */
+    path: z.string().optional(),
+  })
+  .default({ enabled: true });
+export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 
 // Top-level configuration schema
 export const ConfigSchema = z
@@ -262,6 +281,7 @@ export const ConfigSchema = z
     run: RunConfigSchema,
     supervisor: SupervisorConfigSchema,
     review: ReviewConfigSchema,
+    memory: MemoryConfigSchema,
     agents: z
       .array(AgentConfigSchema)
       .min(1)

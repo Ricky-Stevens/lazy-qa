@@ -80,6 +80,8 @@ export interface ReviewInput {
   runDir: string;
   apiKey: string;
   model?: string;
+  /** Controls dispatch mode. Defaults to 'auto'. */
+  batchMode?: 'auto' | 'inline' | 'force_batch';
   logger: Logger;
 }
 
@@ -189,9 +191,80 @@ function extractJsonObject(text: string): unknown {
   return JSON.parse(body);
 }
 
+/** Inline (synchronous) path — single messages.create call. */
+async function runCriticInline(
+  client: Anthropic,
+  model: string,
+  payload: string,
+): Promise<Anthropic.Message> {
+  return client.messages.create({
+    model,
+    max_tokens: 8192,
+    system: [
+      {
+        type: 'text',
+        text: SYSTEM_PROMPT,
+        // Cache the system prompt for 1h — the SYSTEM_PROMPT is static across
+        // all review calls in a session, so this is safe and cuts per-call cost.
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+    messages: [{ role: 'user', content: payload }],
+  });
+}
+
+/** Batch API path — submits a 1-request batch, polls until done, returns the message. */
+async function runCriticBatch(
+  client: Anthropic,
+  model: string,
+  payload: string,
+  logger: Logger,
+): Promise<Anthropic.Message> {
+  const batch = await client.messages.batches.create({
+    requests: [
+      {
+        custom_id: 'critic',
+        params: {
+          model,
+          max_tokens: 8192,
+          system: [
+            { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+          ],
+          messages: [{ role: 'user', content: payload }],
+        },
+      },
+    ],
+  });
+  logger.info('review.batch.submitted', { batchId: batch.id });
+
+  const startedAt = Date.now();
+  const TIMEOUT_MS = 6 * 60 * 60 * 1000;
+  let pollIntervalMs = 30_000;
+  while (Date.now() - startedAt < TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    const status = await client.messages.batches.retrieve(batch.id);
+    logger.debug('review.batch.poll', { batchId: batch.id, status: status.processing_status });
+    if (status.processing_status === 'ended') {
+      const results = client.messages.batches.results(batch.id);
+      for await (const result of await results) {
+        if (result.custom_id === 'critic') {
+          if (result.result.type === 'succeeded') {
+            return result.result.message;
+          }
+          throw new Error(`Critic batch failed: ${JSON.stringify(result.result)}`);
+        }
+      }
+      throw new Error('Critic batch ended but no result returned');
+    }
+    pollIntervalMs = Math.min(pollIntervalMs * 1.5, 5 * 60 * 1000);
+  }
+  throw new Error(`Critic batch timed out after ${TIMEOUT_MS / 60_000}min`);
+}
+
 export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   const { runDir, apiKey, logger } = input;
   const model = input.model ?? 'claude-sonnet-4-6';
+  const batchMode = input.batchMode ?? 'auto';
 
   const [findings, journeys] = await Promise.all([loadFindings(runDir), loadJourneys(runDir)]);
 
@@ -227,20 +300,13 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   });
 
   const client = new Anthropic({ apiKey });
-  const response = await client.messages.create({
-    model,
-    max_tokens: 8192,
-    system: [
-      {
-        type: 'text',
-        text: SYSTEM_PROMPT,
-        // Cache the system prompt for 1h — the SYSTEM_PROMPT is static across
-        // all review calls in a session, so this is safe and cuts per-call cost.
-        cache_control: { type: 'ephemeral', ttl: '1h' },
-      },
-    ],
-    messages: [{ role: 'user', content: payload }],
-  });
+
+  const inputCharsApprox = payload.length;
+  const useBatch =
+    batchMode === 'force_batch' || (batchMode === 'auto' && inputCharsApprox > 16_000);
+  const response = useBatch
+    ? await runCriticBatch(client, model, payload, logger)
+    : await runCriticInline(client, model, payload);
 
   // Aggregate token usage and cost for telemetry.
   const usage = response.usage;
