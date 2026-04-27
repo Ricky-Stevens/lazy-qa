@@ -1,5 +1,7 @@
 ---
 name: confused-newcomer
+description: Brand-new non-technical user who misreads labels and types wrong things
+type: persona
 defaultBudget:
   max_turns: 250
   max_usd: 1

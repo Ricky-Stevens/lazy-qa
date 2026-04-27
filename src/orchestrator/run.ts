@@ -31,6 +31,7 @@ import { createLogger } from '../logging/logger.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+import { loadSkills } from '../skills/loader.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
 import { spawnAgent } from './spawn-agent.ts';
@@ -74,7 +75,11 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       'runScan requires ANTHROPIC_API_KEY. The direct-API loop does not support subscription auth via the `claude` CLI. Set ANTHROPIC_API_KEY in your environment.',
     );
   }
-  const agents = await resolveAgents(cfg);
+
+  // Load the skills bundle once here — both resolveAgents (personas) and
+  // spawnAgent (playbook tools) consume it.
+  const skillsBundle = await loadSkills();
+  const agents = await resolveAgents(cfg, skillsBundle);
 
   // 3. Run ID + output directory.
   const runId = randomUUID();
@@ -238,6 +243,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       stealth: cfg.target.stealth,
       memoryEnabled,
       memoryPath,
+      skillsBundle,
     }),
   );
 

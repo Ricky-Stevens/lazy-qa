@@ -1,5 +1,7 @@
 ---
 name: completionist
+description: Methodical thorough user who verifies every change and completes every task
+type: persona
 defaultBudget:
   max_turns: 200
   max_usd: 1.5

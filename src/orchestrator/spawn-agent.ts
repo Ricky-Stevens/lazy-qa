@@ -20,7 +20,8 @@ import type { AuthConfig } from '../config/types.ts';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import { persistJourney } from '../findings/persist.ts';
 import type { Logger } from '../logging/logger.ts';
-import { buildDefaultRegistry } from '../playbooks/index.ts';
+import type { PlaybookContext } from '../playbooks/framework.ts';
+import type { Skill, SkillsBundle } from '../skills/loader.ts';
 import { BROWSER_TOOL_NAMES, createBrowserMcpServer } from '../tools/browser-server.ts';
 import { createHarnessMcpServer } from '../tools/findings-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
@@ -51,6 +52,8 @@ export interface SpawnAgentInput {
   memoryEnabled: boolean;
   /** Absolute path to the per-target memory directory (pre-created by run.ts). */
   memoryPath: string;
+  /** Skills bundle loaded at run start — used to build playbook tools. */
+  skillsBundle: SkillsBundle;
 }
 
 export interface SpawnAgentResult {
@@ -84,6 +87,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     stealth,
     memoryEnabled,
     memoryPath,
+    skillsBundle,
   } = input;
   const { budget } = agent;
 
@@ -133,9 +137,9 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   }
 
   // 3. In-process MCP servers — harness (findings) + browser (PageModel +
-  // playbooks). The browser server hosts the playbook registry as MCP
-  // tools and records outcomes back into the shared SiteMap.
-  const playbookRegistry = buildDefaultRegistry();
+  // playbooks). The browser server receives playbook skills from the bundle
+  // rather than a PlaybookRegistry; it mounts them as MCP tools directly.
+  const playbookSkills = Array.from(skillsBundle.playbooks.values());
   const harnessKit = createHarnessMcpServer({
     journey,
     logger: childLogger,
@@ -155,7 +159,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     persona: agent.personality,
     runDir,
     siteMap: input.siteMap,
-    playbookRegistry,
+    playbooks: playbookSkills,
     onAction: (patch) => updateOnAction(agent.id, patch),
     allowedHosts,
   });
@@ -171,7 +175,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   // optimized for direct-API mode because we no longer need the engagement-gate caveat
   // or the chunked-loop framing. Playbooks are a tool category; the agent
   // picks them like any other tool.
-  const systemPrompt = buildSystemPrompt({ targetUrl, agent, memoryEnabled });
+  const systemPrompt = buildSystemPrompt({ targetUrl, agent, memoryEnabled, skillsBundle });
 
   // 6. Per-agent summary memory — the loop pushes one entry per playbook
   // invocation so older turns can be elided without losing the "what have
@@ -231,8 +235,9 @@ function buildSystemPrompt(args: {
   targetUrl: string;
   agent: ResolvedAgent;
   memoryEnabled: boolean;
+  skillsBundle: SkillsBundle;
 }): string {
-  const { targetUrl, agent, memoryEnabled } = args;
+  const { targetUrl, agent, memoryEnabled, skillsBundle } = args;
 
   // Memory guidance block — injected between HARNESS and HARD RULES sections
   // only when the Memory tool is enabled. Tells the agent WHAT to remember;
@@ -246,6 +251,12 @@ function buildSystemPrompt(args: {
         'BEFORE choosing your first action this run, view the memory root to orient yourself. AFTER any meaningful finding or stuck moment, write a brief note.',
       ]
     : [];
+
+  // Derive the playbook list from the skills bundle rather than hardcoding it.
+  // This means new playbooks automatically appear in the system prompt when added.
+  const playbookLines = Array.from(skillsBundle.playbooks.values())
+    .map((s: Skill) => `- \`${s.name}\` — ${s.description}`)
+    .join('\n');
 
   return [
     `You are NOT a QA agent. You are a real human user of ${targetUrl} — your character is described at the bottom of this prompt and you BEHAVE like that person.`,
@@ -261,16 +272,12 @@ function buildSystemPrompt(args: {
     'Drive the app the way YOUR PERSONA would drive it. Use the browser primitives directly. The primitives ARE your hands. Click things, type into fields, navigate, read the page, observe what happens. The persona below tells you WHAT KIND of user you are; the app tells you what to do.',
     '',
     'BROWSER PRIMITIVES (`mcp__browser__*`) — your default action vocabulary:',
-    '`snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`.',
+    '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`.',
+    '',
+    "PRIMITIVES — `snapshot` is the full PageModel (forms, tables, modals, locators); `ax_snapshot` is a cheaper text outline of the accessibility tree (use when you just need to know what's on the page).",
     '',
     'PLAYBOOK HELPERS (`mcp__playbooks__*`) — deterministic shortcuts for tasks that are easy to script and tedious to drive turn-by-turn. Use one when it fits exactly; otherwise just drive the primitives.',
-    '- `ask_sitemap` — query the shared sitemap for unvisited routes / untested forms / unsorted tables / unexercised modals / unexercised wizards / 4xx routes.',
-    '- `route_404_probe` — bulk-probe a list of paths and flag 5xx.',
-    "- `discover_route_affordances` — probe the current route for kebab menus / toolbar buttons / triggers behind affordances the link-graph crawler can't see. Auto-runs once per route; pass `force:true` after you change page state.",
-    '- `fill_and_verify` — fill a form and assert specified post-submit conditions (URL change, success toast, error shown, value persisted).',
-    '- `walk_pagination` — page through a table; flags duplicate or missing rows.',
-    '- `walk_wizard` — step through a multi-step wizard with caller-supplied per-step inputs.',
-    "- `idor_probe`, `header_audit`, `sensitive_path_audit` — security-flavoured probes (the `insider-attacker` persona uses these heavily; other personas usually don't).",
+    playbookLines,
     '',
     'HARNESS:',
     '- `mcp__harness__report_finding` — file ANY finding the moment you see it. Be concrete. Then KEEP USING THE APP. A finding is NEVER a reason to stop. ONE finding per occurrence — never aggregate.',
@@ -288,3 +295,6 @@ function buildSystemPrompt(args: {
     agent.personality,
   ].join('\n');
 }
+
+// Keep PlaybookContext re-exported so existing imports compile without changes.
+export type { PlaybookContext };

@@ -27,15 +27,11 @@ import {
 import { parsePage } from '../page-model/parser.ts';
 import { serializeForAgent } from '../page-model/serialize.ts';
 import type { ConsoleEntry, NetworkAnomaly, PageModel } from '../page-model/types.ts';
-import {
-  type Playbook,
-  type PlaybookContext,
-  type PlaybookRegistry,
-  runPlaybook,
-} from '../playbooks/framework.ts';
+import type { PlaybookContext } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
 import { isHostAllowed } from '../safety/guards.ts';
 import { isLogoutLink } from '../safety/logout-guard.ts';
+import type { Skill } from '../skills/loader.ts';
 
 /** Per-agent backoff thresholds (carried over from v1). */
 const BACKOFF_4XX_THRESHOLD = 5;
@@ -83,8 +79,8 @@ export interface BrowserServerInput {
   runDir: string;
   /** Shared site map accessor. Playbook outcomes are recorded here. */
   siteMap: SiteMapAccessor;
-  /** Registered playbooks to mount as MCP tools. */
-  playbookRegistry: PlaybookRegistry;
+  /** Playbook skills to mount as MCP tools. Sourced from the skills bundle. */
+  playbooks: Skill[];
   /** Hook invoked on every action with current url + tool name + auth-wall flag. */
   onAction?: (patch: { url: string; toolName: string; authWalled: boolean }) => void;
   /** Hosts the agent is allowed to navigate/fetch to. document/xhr/fetch
@@ -92,6 +88,42 @@ export interface BrowserServerInput {
    * Subresources (css, font, image, etc.) are always allowed so CDN-backed
    * staging portals continue to work. */
   allowedHosts?: string[];
+}
+
+/** Accessibility node interface for rendering the AX tree. */
+interface AxNode {
+  role?: string;
+  name?: string;
+  value?: string;
+  disabled?: boolean;
+  checked?: boolean | 'mixed';
+  selected?: boolean;
+  expanded?: boolean;
+  children?: AxNode[];
+}
+
+/** Render an accessibility tree node and its children as an indented text outline. */
+function renderAxTree(node: AxNode, maxDepth: number, depth = 0): string {
+  if (depth > maxDepth) return '';
+  const indent = '  '.repeat(depth);
+  const role = node.role || 'unknown';
+  const name = node.name ? ` "${node.name.slice(0, 60)}"` : '';
+  const value = node.value ? ` = ${node.value.slice(0, 40)}` : '';
+  const flags = [
+    node.disabled && 'disabled',
+    node.checked === true && 'checked',
+    node.selected === true && 'selected',
+    node.expanded === true && 'expanded',
+  ]
+    .filter(Boolean)
+    .join(',');
+  const flagsStr = flags ? ` [${flags}]` : '';
+  const self = `${indent}${role}${name}${value}${flagsStr}`;
+  const children = (node.children ?? [])
+    .map((c) => renderAxTree(c, maxDepth, depth + 1))
+    .filter(Boolean)
+    .join('\n');
+  return children ? `${self}\n${children}` : self;
 }
 
 /** Strip query/fragment so /clients?page=2 and /clients/123 count as the same area. */
@@ -204,7 +236,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     persona,
     runDir,
     siteMap,
-    playbookRegistry,
+    playbooks,
     onAction,
     allowedHosts = [],
   } = input;
@@ -491,6 +523,21 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           model = await getOrParseModel();
         }
         return textResult(redactForLlm(serializeForAgent(model)));
+      },
+    ),
+
+    defTool(
+      'ax_snapshot',
+      "Return the page's accessibility tree as a text outline. Faster and cheaper than full snapshot — use when you just need to know what's present, not when you need locator strings or form schemas.",
+      { max_depth: z.number().int().min(1).max(20).optional() },
+      async (args) => {
+        const page = ensureListeners();
+        const maxDepth = (args as { max_depth?: number }).max_depth ?? 8;
+        // biome-ignore lint/suspicious/noExplicitAny: Playwright Page.accessibility API
+        const snapshot = await (page as any).accessibility.snapshot({ interestingOnly: true });
+        if (!snapshot) return textResult('(no accessibility tree available)');
+        const text = renderAxTree(snapshot as AxNode, maxDepth);
+        return textResult(redactForLlm(text));
       },
     ),
 
@@ -929,59 +976,98 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
   ];
 
   // ─── Playbook tools ──────────────────────────────────────────────────────
-  // For each registered playbook, build a handler that constructs the
-  // PlaybookContext from the current state, runs the playbook, records the
-  // outcome into the SiteMap, and returns a text MCP result.
-  const playbookRawTools = playbookRegistry.toMcpTools(
-    (pb: Playbook) => async (args: Record<string, unknown>) => {
-      // Playbook execution pulls the current page lazily so a relogin between
-      // turns transparently re-targets the playbook.
-      const ctx: PlaybookContext = {
-        page: ensureListeners(),
-        pageModel: () => getOrParseModel(),
-        siteMap,
-        agentId: agentId ?? 'unknown',
-        persona: persona ?? '',
-        runDir,
-        logger,
-        allowedHosts,
+  // For each playbook skill, build a handler that constructs the PlaybookContext
+  // from the current state, runs the playbook via the skill's handler, records
+  // the outcome into the SiteMap, and returns a text MCP result.
+  //
+  // Skills replace the old PlaybookRegistry. Each skill carries its own
+  // handler function and inputShape (ZodRawShape), so we don't need the
+  // registry's toMcpTools() indirection.
+  const playbookRawTools: RawToolDef[] = playbooks
+    .filter((skill) => skill.handler != null && skill.inputShape != null)
+    .map((skill) => {
+      const skillHandler = skill.handler as NonNullable<typeof skill.handler>;
+      const skillInputShape = skill.inputShape as NonNullable<typeof skill.inputShape>;
+      const playbookName = skill.name;
+
+      const toolHandler = async (args: Record<string, unknown>) => {
+        // Playbook execution pulls the current page lazily so a relogin between
+        // turns transparently re-targets the playbook.
+        const ctx: PlaybookContext = {
+          page: ensureListeners(),
+          pageModel: () => getOrParseModel(),
+          siteMap,
+          agentId: agentId ?? 'unknown',
+          persona: persona ?? '',
+          runDir,
+          logger,
+          allowedHosts,
+        };
+
+        // Invalidate before the playbook runs because most playbooks mutate the
+        // page (fill, click, navigate). Easier than tracking inside each one.
+        invalidateModelCache();
+
+        // Wrap in runPlaybook-compatible try/catch for consistent error handling.
+        let outcome: PlaybookOutcome;
+        const start = Date.now();
+        try {
+          outcome = await skillHandler(args, ctx);
+          outcome.durationMs = Date.now() - start;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          outcome = {
+            playbookName,
+            status: 'failed',
+            summary: `Playbook crashed: ${message}`,
+            evidence: { error: message },
+            signals: { networkAnomalies: [], consoleErrors: [] },
+            steps: [{ label: 'playbook crashed', ok: false, detail: message }],
+            durationMs: Date.now() - start,
+          };
+        }
+
+        // Record outcome into the sitemap. Target-id prefer order: form > table
+        // > modal > wizard. Cast to unknown then string to satisfy TS without
+        // forcing every playbook input shape to declare these fields.
+        const targetId =
+          ((args.formId as string | undefined) ||
+            (args.tableId as string | undefined) ||
+            (args.modalId as string | undefined) ||
+            (args.wizardId as string | undefined)) ??
+          null;
+        try {
+          siteMap.recordPlaybookOutcome(
+            routeOf(ctx.page.url()),
+            playbookName,
+            targetId,
+            outcome.status,
+          );
+        } catch (err) {
+          logger.warn('browser.playbook.record-outcome.failed', {
+            playbook: playbookName,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // After the playbook runs, kick off a speculative re-parse so the next
+        // snapshot call is instant.
+        try {
+          speculate(ensureListeners());
+        } catch {
+          /* swallow */
+        }
+
+        return textResult(serializeOutcome(outcome));
       };
 
-      // Invalidate before the playbook runs because most playbooks mutate the
-      // page (fill, click, navigate). Easier than tracking inside each one.
-      invalidateModelCache();
-
-      const outcome = await runPlaybook(pb, args, ctx);
-
-      // Record outcome into the sitemap. Target-id prefer order: form > table
-      // > modal > wizard. Cast to unknown then string to satisfy TS without
-      // forcing every playbook input shape to declare these fields.
-      const targetId =
-        ((args.formId as string | undefined) ||
-          (args.tableId as string | undefined) ||
-          (args.modalId as string | undefined) ||
-          (args.wizardId as string | undefined)) ??
-        null;
-      try {
-        siteMap.recordPlaybookOutcome(routeOf(ctx.page.url()), pb.name, targetId, outcome.status);
-      } catch (err) {
-        logger.warn('browser.playbook.record-outcome.failed', {
-          playbook: pb.name,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
-      // After the playbook runs, kick off a speculative re-parse so the next
-      // snapshot call is instant.
-      try {
-        speculate(ensureListeners());
-      } catch {
-        /* swallow */
-      }
-
-      return textResult(serializeOutcome(outcome));
-    },
-  );
+      return {
+        name: `mcp__playbooks__${playbookName}`,
+        description: skill.description,
+        shape: skillInputShape,
+        handler: toolHandler,
+      } satisfies RawToolDef;
+    });
 
   // Register playbook raw tools alongside primitives. The SDK MCP server needs
   // matching tool() entries; build one per playbook that delegates to the same
@@ -1010,6 +1096,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
 /** Stable list of primitive + macro tool names. Playbook tool names are
  * dynamic and depend on the registry — not included here. */
 export const BROWSER_TOOL_NAMES = [
+  'mcp__browser__ax_snapshot',
   'mcp__browser__snapshot',
   'mcp__browser__navigate',
   'mcp__browser__back',

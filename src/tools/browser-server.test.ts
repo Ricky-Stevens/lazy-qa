@@ -2,10 +2,10 @@
  * Tests for the browser MCP server.
  *
  * Coverage:
- *   - End-to-end: chromium + a stub SiteMapAccessor + an empty PlaybookRegistry
+ *   - End-to-end: chromium + a stub SiteMapAccessor + an empty playbooks array
  *     → snapshot returns a serialized PageModel string.
  *   - Navigation: navigate twice in a row across different routes succeeds.
- *   - Playbook mounting: registering a stub playbook yields an
+ *   - Playbook mounting: passing a stub Skill yields an
  *     `mcp__playbooks__stub` raw tool, and invoking it records into siteMap.
  */
 
@@ -18,8 +18,9 @@ import { z } from 'zod';
 import type { SiteMap, SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { PageModel } from '../page-model/types.ts';
-import { type Playbook, type PlaybookContext, PlaybookRegistry } from '../playbooks/framework.ts';
+import type { PlaybookContext } from '../playbooks/framework.ts';
 import { ok as okOutcome } from '../playbooks/outcome.ts';
+import type { Skill } from '../skills/loader.ts';
 import { createBrowserMcpServer } from './browser-server.ts';
 
 /** Silent logger satisfying the Logger interface. */
@@ -117,7 +118,7 @@ describe('createBrowserMcpServer', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
       agentId: 'test-agent',
     });
 
@@ -129,6 +130,81 @@ describe('createBrowserMcpServer', () => {
     expect(text.startsWith('URL:')).toBe(true);
     expect(text).toContain('Forms (');
     expect(text).toContain('Email');
+
+    await ctx.close();
+  });
+
+  it('ax_snapshot returns an accessibility tree outline', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+
+    // Mock the accessibility API with a simple tree
+    const mockAxTree = {
+      role: 'document',
+      name: 'Test Page',
+      children: [
+        {
+          role: 'heading',
+          name: 'Heading One',
+          level: 1,
+        },
+        {
+          role: 'button',
+          name: 'Click Me',
+        },
+        {
+          role: 'form',
+          name: 'Test Form',
+          children: [
+            {
+              role: 'textbox',
+              name: 'Email',
+            },
+            {
+              role: 'button',
+              name: 'Submit',
+            },
+          ],
+        },
+      ],
+    };
+
+    // Set up the mock before creating the server
+    // biome-ignore lint/suspicious/noExplicitAny: Test mock
+    (page as any).accessibility = {
+      snapshot: vi.fn().mockResolvedValue(mockAxTree),
+    };
+
+    const { accessor: siteMap } = makeFakeSiteMap();
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbooks: [],
+      agentId: 'test-agent',
+    });
+
+    const axSnapshot = rawTools.find((t) => t.name === 'ax_snapshot');
+    if (!axSnapshot) throw new Error('ax_snapshot tool not registered');
+
+    // Call with default max_depth
+    const result = await axSnapshot.handler({});
+    const text = result.content[0]?.text ?? '';
+
+    // The output should contain roles and indentation
+    expect(text).toContain('document');
+    expect(text).toContain('heading');
+    expect(text).toContain('button');
+    expect(text).toContain('Heading One');
+    expect(text).toContain('Click Me');
+    // Check indentation (children should have more spaces than parent)
+    expect(text).toMatch(/\n {2}[a-z]/);
+
+    // Call with explicit max_depth to test depth limiting
+    const resultWithDepth = await axSnapshot.handler({ max_depth: 1 });
+    const textWithDepth = resultWithDepth.content[0]?.text ?? '';
+    expect(textWithDepth).toContain('heading');
 
     await ctx.close();
   });
@@ -148,7 +224,7 @@ describe('createBrowserMcpServer', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
     });
 
     const navigate = rawTools.find((t) => t.name === 'navigate');
@@ -167,22 +243,24 @@ describe('createBrowserMcpServer', () => {
     await ctx.close();
   });
 
-  it('mounts registered playbooks as MCP tools and records outcomes', async () => {
+  it('mounts playbook Skills as MCP tools and records outcomes', async () => {
     const ctx = await browser.newContext();
     const page: Page = await ctx.newPage();
     await page.setContent('<html><body><h1>Stub</h1></body></html>');
 
-    const registry = new PlaybookRegistry();
     let runCalls = 0;
     let receivedFormId: string | undefined;
 
-    const stub: Playbook<{ formId: string }> = {
+    // Build a stub Skill in the Skills format (handler + inputShape).
+    const stubSkill: Skill = {
       name: 'stub',
+      type: 'playbook',
       description: 'Stub playbook for tests.',
+      body: '',
       categories: ['form'],
       estimatedDurationMs: 10,
       inputShape: { formId: z.string() },
-      run: async (input, ctxArg: PlaybookContext) => {
+      handler: async (input: { formId: string }, ctxArg: PlaybookContext) => {
         runCalls += 1;
         receivedFormId = input.formId;
         // Touch ctxArg.pageModel to ensure the cached helper works.
@@ -192,7 +270,6 @@ describe('createBrowserMcpServer', () => {
         });
       },
     };
-    registry.register(stub);
 
     const { accessor: siteMap, outcomes } = makeFakeSiteMap();
     const { rawTools } = createBrowserMcpServer({
@@ -200,7 +277,7 @@ describe('createBrowserMcpServer', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: registry,
+      playbooks: [stubSkill],
     });
 
     const playbookTool = rawTools.find((t) => t.name === 'mcp__playbooks__stub');
@@ -254,7 +331,7 @@ describe('evaluate handler — redaction', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
     });
 
     const evaluate = rawTools.find((t) => t.name === 'evaluate');
@@ -308,7 +385,7 @@ describe('storage_inspect handler — redaction', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
     });
 
     const tool = rawTools.find((t) => t.name === 'storage_inspect');
@@ -358,7 +435,7 @@ describe('navigate handler — host allowlist', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
       allowedHosts: ['staging.example.com'],
     });
 
@@ -393,7 +470,7 @@ describe('navigate handler — host allowlist', () => {
       logger: makeSilentLogger(),
       runDir,
       siteMap,
-      playbookRegistry: new PlaybookRegistry(),
+      playbooks: [],
       allowedHosts: ['staging.example.com'],
     });
 

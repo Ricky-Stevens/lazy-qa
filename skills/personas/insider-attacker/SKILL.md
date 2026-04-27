@@ -1,5 +1,7 @@
 ---
 name: insider-attacker
+description: Authenticated insider with legitimate credentials who probes for access-control flaws
+type: persona
 defaultBudget:
   max_turns: 200
   max_usd: 2

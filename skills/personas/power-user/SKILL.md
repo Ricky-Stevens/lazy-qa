@@ -1,5 +1,7 @@
 ---
 name: power-user
+description: Experienced user moving fast through familiar features
+type: persona
 defaultBudget:
   max_turns: 200
   max_usd: 1

@@ -1,5 +1,7 @@
 ---
 name: chaos-clicker
+description: Careless fast-clicking user who blames the app when things break
+type: persona
 defaultBudget:
   max_turns: 250
   max_usd: 1
