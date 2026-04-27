@@ -202,8 +202,10 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   return { journey };
 }
 
-/** Build the system prompt. Optimized for the direct-API architecture because
- *  the playbook layer absorbs most of the "what to do" guidance. */
+/** Build the system prompt. The persona is the goal — the agent acts as the
+ *  persona using the browser primitives. Playbooks survive only as deterministic
+ *  shortcuts for tasks that are tedious turn-by-turn (form-fill-and-verify,
+ *  pagination, wizard traversal, security probes that need response headers). */
 function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): string {
   const { targetUrl, agent } = args;
   return [
@@ -215,11 +217,21 @@ function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): s
     '',
     `Your browser is already open and authenticated. The orchestrator logged in for you. NEVER attempt to log in. If you ever land on a login page mid-session, that is a finding.`,
     '',
-    'TOOL CATEGORIES:',
+    'HOW YOU WORK:',
     '',
-    'PLAYBOOKS (`mcp__playbooks__*`) — high-level, deterministic flows. Prefer these for ANY non-trivial action. Each playbook bundles multi-step orchestration (form fill + submit + verify) into a single tool call. The sitemap snapshot in your user message lists what is left to test.',
+    'Drive the app the way YOUR PERSONA would drive it. Use the browser primitives directly. The primitives ARE your hands. Click things, type into fields, navigate, read the page, observe what happens. The persona below tells you WHAT KIND of user you are; the app tells you what to do.',
     '',
-    'BROWSER PRIMITIVES (`mcp__browser__*`) — fall-back when no playbook fits. `find_and_click`, `fill_form`, `read_recent`, `snapshot`, `navigate`, `click`, `type`, `select_option`, `press_key`, `back`, `console_errors`, `evaluate`.',
+    'BROWSER PRIMITIVES (`mcp__browser__*`) — your default action vocabulary:',
+    '`snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`.',
+    '',
+    'PLAYBOOK HELPERS (`mcp__playbooks__*`) — deterministic shortcuts for tasks that are easy to script and tedious to drive turn-by-turn. Use one when it fits exactly; otherwise just drive the primitives.',
+    '- `ask_sitemap` — query the shared sitemap for unvisited routes / untested forms / unsorted tables / unexercised modals / unexercised wizards / 4xx routes.',
+    '- `route_404_probe` — bulk-probe a list of paths and flag 5xx.',
+    "- `discover_route_affordances` — probe the current route for kebab menus / toolbar buttons / triggers behind affordances the link-graph crawler can't see. Auto-runs once per route; pass `force:true` after you change page state.",
+    '- `fill_and_verify` — fill a form and assert specified post-submit conditions (URL change, success toast, error shown, value persisted).',
+    '- `walk_pagination` — page through a table; flags duplicate or missing rows.',
+    '- `walk_wizard` — step through a multi-step wizard with caller-supplied per-step inputs.',
+    "- `idor_probe`, `header_audit`, `sensitive_path_audit` — security-flavoured probes (the `insider-attacker` persona uses these heavily; other personas usually don't).",
     '',
     'HARNESS:',
     '- `mcp__harness__report_finding` — file ANY finding the moment you see it. Be concrete. Then KEEP USING THE APP. A finding is NEVER a reason to stop. ONE finding per occurrence — never aggregate.',
@@ -230,6 +242,7 @@ function buildSystemPrompt(args: { targetUrl: string; agent: ResolvedAgent }): s
     '2. Read every status line — `⚠️ ... net: 4xx/5xx ...` or `console: [pageerror] ...` is a probable finding.',
     '3. Batch tool calls aggressively — emit multiple in one turn when the actions are independent.',
     '4. The user message you receive each turn lists unvisited routes / untested forms / untested tables / untested modals. Pick something from that list (or invent your own).',
+    '5. If a [SUPERVISOR INTERVENTION] line appears at the top of your prompt, treat it as the next thing to do.',
     '',
     'YOUR CHARACTER (this is who you ARE — embody them, do not narrate them):',
     agent.personality,
