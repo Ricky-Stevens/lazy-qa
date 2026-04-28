@@ -153,7 +153,28 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   // 3. In-process MCP servers — harness (findings) + browser (PageModel +
   // playbooks). The browser server receives playbook skills from the bundle
   // rather than a PlaybookRegistry; it mounts them as MCP tools directly.
-  const playbookSkills = Array.from(skillsBundle.playbooks.values());
+  //
+  // Per-persona filtering: a playbook with a non-empty `personaAllowlist`
+  // is only exposed to agents whose profileName is in the list. Used to
+  // keep speculative URL-guessing playbooks (sensitive_path_audit,
+  // idor_probe, route_404_probe) out of functional personas' tool lists —
+  // those personas drift toward cheap-finding probes and stop completing
+  // real flows. Logged once at spawn so we can verify the filter is doing
+  // what we expect.
+  const allPlaybookSkills = Array.from(skillsBundle.playbooks.values());
+  const playbookSkills = allPlaybookSkills.filter((skill) => {
+    if (!skill.personaAllowlist || skill.personaAllowlist.length === 0) return true;
+    return skill.personaAllowlist.includes(agent.profileName);
+  });
+  const filteredOut = allPlaybookSkills
+    .filter((s) => !playbookSkills.includes(s))
+    .map((s) => s.name);
+  if (filteredOut.length > 0) {
+    childLogger.debug('playbooks.filtered', {
+      profile: agent.profileName,
+      excluded: filteredOut,
+    });
+  }
   const harnessKit = createHarnessMcpServer({
     journey,
     logger: childLogger,

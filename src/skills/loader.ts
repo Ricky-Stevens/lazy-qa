@@ -47,6 +47,13 @@ export interface Skill {
   handler?: (input: any, ctx: PlaybookContext) => Promise<PlaybookOutcome>;
   estimatedDurationMs?: number;
   categories?: PlaybookCategory[];
+  /** Playbook-only: when set, this playbook is exposed only to agents whose
+   *  profile is in the allowlist. Used to keep speculative URL-guessing
+   *  playbooks (sensitive_path_audit, idor_probe, route_404_probe) out of
+   *  functional personas' tool lists — those personas drift toward
+   *  cheap-finding probes and stop completing real flows. Unset = available
+   *  to every persona. */
+  personaAllowlist?: string[];
 }
 
 export interface SkillsBundle {
@@ -63,6 +70,7 @@ interface SkillFrontmatter {
   defaultBudget?: { max_turns: number; max_usd: number; max_minutes: number };
   categories?: PlaybookCategory[];
   estimatedDurationMs?: number;
+  personaAllowlist?: string[];
 }
 
 function parseFrontmatter(
@@ -124,6 +132,13 @@ function parseFrontmatter(
 
   if (typeof obj.estimatedDurationMs === 'number') {
     fm.estimatedDurationMs = obj.estimatedDurationMs;
+  }
+
+  if (Array.isArray(obj.personaAllowlist)) {
+    fm.personaAllowlist = obj.personaAllowlist
+      .filter((v): v is string => typeof v === 'string')
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0);
   }
 
   return { fm, body };
@@ -241,6 +256,7 @@ export async function loadSkills(rootDir?: string): Promise<SkillsBundle> {
       estimatedDurationMs: fm.estimatedDurationMs,
       inputShape: handlerMod.inputShape,
       handler: handlerMod.handler,
+      personaAllowlist: fm.personaAllowlist,
     };
     playbooks.set(fm.name, skill);
   }

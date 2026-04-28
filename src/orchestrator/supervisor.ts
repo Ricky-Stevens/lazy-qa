@@ -69,14 +69,25 @@ function buildSystemPrompt(authType: 'form' | 'none'): string {
     : `1. AUTH-WALLED — auth.type='none' for this run, so there is NO login to recover. The relogin_session tactic is unavailable. If an agent appears auth-walled (lots of 401/403, currentUrl on a login page) it means the agent has navigated somewhere that requires auth this run can't provide.
    → ACTION: nudge_agent(agentId, "This run has no credentials. Stop trying to access authenticated endpoints; explore the public surface (homepage, search, public APIs returning 200) and stay focused on what's reachable.")`;
 
+  // Storm detection is TRIANGULATED — single-agent 5xx is just that agent
+  // probing or hitting a flaky endpoint, never a reason to pause others. The
+  // signal we trust is CORRELATED 5xx across multiple agents: if 2+ agents
+  // simultaneously see XHR/fetch 5xx (document 5xx is excluded upstream),
+  // the backend is genuinely sick and pausing everyone protects budget.
   const stormRule = reloginAvailable
-    ? `2. BACKEND STORM — TWO OR MORE agents have recent5xxCount >= 3 in the same window, OR ANY agent has recent5xxCount >= 5. 5xx means the backend is genuinely broken (dependency down, unhandled exception, OOM, dependency timeout). 4xx is NOT a storm signal — auth boundaries and access-control probes legitimately produce 4xx during normal exploration.
-   → FIRST ACTION: try relogin_session() once — sometimes 5xx is downstream of a stale session.
-   → THEN: pause_agents({duration_seconds: 60, reason: "backend 5xx storm — waiting for recovery"}).
-   → AFTER PAUSE: on the next cycle, if recent5xxCount is now low, nudge each agent to retry. If it stays high after 2 pauses, the backend is genuinely down — let agents end naturally (do NOT keep pausing forever).`
-    : `2. BACKEND STORM — TWO OR MORE agents have recent5xxCount >= 3 in the same window, OR ANY agent has recent5xxCount >= 5. 5xx means the backend is genuinely broken. 4xx is NOT a storm signal — security probing legitimately produces 4xx.
-   → ACTION: pause_agents({duration_seconds: 60, reason: "backend 5xx storm — waiting for recovery"}).
-   → AFTER PAUSE: on the next cycle, if recent5xxCount is now low, nudge each agent to retry. If it stays high after 2 pauses, the backend is genuinely down — let agents end naturally.`;
+    ? `2. BACKEND STORM (triangulated) — TWO OR MORE agents simultaneously have recent5xxCount >= 3. ALL of these conditions must hold:
+   - At least 2 distinct agents
+   - Each above the threshold in the same window
+   This is the ONLY storm signal. A single agent at recent5xxCount=20 is NOT a storm — that agent is just probing endpoints or hit a flaky API; let them self-throttle. Pausing the whole run would punish healthy agents for one agent's behaviour.
+   → FIRST ACTION: try relogin_session() once — sometimes correlated 5xx is downstream of stale sessions across agents.
+   → THEN: pause_agents({duration_seconds: 60, reason: "backend 5xx storm across N agents — waiting for recovery"}).
+   → AFTER PAUSE: on the next cycle, if multi-agent 5xx is now resolved, nudge each agent to retry. If it stays high across 2 pauses, the backend is genuinely down — let agents end naturally (do NOT keep pausing forever).`
+    : `2. BACKEND STORM (triangulated) — TWO OR MORE agents simultaneously have recent5xxCount >= 3. ALL conditions must hold:
+   - At least 2 distinct agents
+   - Each above the threshold in the same window
+   This is the ONLY storm signal. A single agent's 5xx is just that agent probing/hitting a flaky endpoint — NEVER pause the whole run for one agent's mess. Pausing healthy agents because one is probing wastes everyone's budget.
+   → ACTION: pause_agents({duration_seconds: 60, reason: "backend 5xx storm across N agents — waiting for recovery"}).
+   → AFTER PAUSE: on the next cycle, if multi-agent 5xx is resolved, nudge each agent to retry. If still elevated after 2 pauses, the backend is genuinely down — let agents end naturally.`;
 
   return `You are the SUPERVISOR. Other AI agents are exploring a target portal in parallel; your job is to keep them productive and unblock them aggressively.
 

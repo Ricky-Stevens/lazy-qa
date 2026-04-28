@@ -43,10 +43,36 @@ const askSitemapShape = {
   ]),
 } satisfies z.ZodRawShape;
 
+/** Per-(agentId, query) memo of the most recent ask_sitemap result hash.
+ *  When an agent re-asks the same query and the answer hasn't changed, we
+ *  return a short "no change" message instead of the full payload. Without
+ *  this, agents loop on ask_sitemap (last run: power-user 20 calls in 49
+ *  turns including 6 consecutive at one point — they're stalling, not
+ *  exploring). The terse response forces them to act on the prior answer.
+ *
+ *  Module-level Map; keys are GC'd when agents finish but it's fine to
+ *  leak them in-process since runs are short-lived. */
+interface AskSitemapMemo {
+  hash: string;
+  count: number;
+}
+const askSitemapMemos = new Map<string, AskSitemapMemo>();
+
+function hashItems(items: unknown[]): string {
+  // Stable JSON; hash via simple FNV-1a so we don't need crypto here.
+  const json = JSON.stringify(items);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < json.length; i++) {
+    h ^= json.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
 export const askSitemap: Playbook<AskSitemapInput> = {
   name: 'ask_sitemap',
   description:
-    'Query the shared SiteMap for unvisited routes, untested forms, unsorted tables, unexercised modals, unexercised wizards, or 4xx routes. Returns up to 10 items in evidence.',
+    'Query the shared SiteMap for unvisited routes, untested forms, unsorted tables, unexercised modals, unexercised wizards, or 4xx routes. Returns up to 10 items in evidence. Repeated identical queries return a brief "no change" message — act on the prior answer instead of re-asking.',
   categories: ['discovery'],
   estimatedDurationMs: 200,
   inputShape: askSitemapShape,
@@ -104,6 +130,29 @@ export const askSitemap: Playbook<AskSitemapInput> = {
 
     evidence.items = items;
     evidence.itemCount = items.length;
+
+    // Dedup: if this (agent, query) just got the same answer, return a short
+    // no-change message instead of the full item list. The agent should act
+    // on the previous answer, not keep re-asking.
+    const memoKey = `${ctx.agentId}::${input.query}`;
+    const newHash = hashItems(items);
+    const prev = askSitemapMemos.get(memoKey);
+    if (prev && prev.hash === newHash) {
+      prev.count += 1;
+      askSitemapMemos.set(memoKey, prev);
+      return ok(
+        askSitemap.name,
+        `ask_sitemap("${input.query}") → no change since your last call (${prev.count} repeat(s)). PICK SOMETHING from the previous answer and act on it (click, navigate, fill a form). Do NOT call ask_sitemap again on this query unless you've actually used the app and changed the sitemap.`,
+        { ...evidence, deduped: true, repeatCount: prev.count },
+        [
+          {
+            label: `query: ${input.query} (deduped, repeat #${prev.count})`,
+            ok: true,
+          },
+        ],
+      );
+    }
+    askSitemapMemos.set(memoKey, { hash: newHash, count: 1 });
 
     return ok(
       askSitemap.name,

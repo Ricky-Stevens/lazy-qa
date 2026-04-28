@@ -4,6 +4,7 @@ description: Probe a route containing an id segment (numeric or UUID) by navigat
 type: playbook
 categories: [security]
 estimatedDurationMs: 8000
+personaAllowlist: [insider-attacker]
 ---
 
 # Usage

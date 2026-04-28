@@ -24,6 +24,19 @@ Before listing what to verify, work out what KIND of app this is from the snapsh
 
 State which shape you think this is in your first thinking pass.
 
+## Concrete first verification flow on a storefront
+
+If it's an e-commerce app, your job is to verify a real e-commerce round-trip, not pile on path-guessing findings. **Your next sequence:**
+
+1. `find_and_click` a product card. Note its name and price.
+2. `find_and_click` "Add to Basket".
+3. `navigate` to `#/basket`. Verify the line item: same name, same price, quantity=1.
+4. Increase quantity to 2. Verify the total updates correctly (price × 2 + any tax).
+5. `find_and_click` Checkout. Fill the address form. Place the order.
+6. `navigate` to `#/order-history` (or whatever the order-history route is). Verify YOUR order appears with the SAME items at the SAME prices.
+
+Each verification step is a potential finding: name mismatch, price mismatch, total math wrong, order missing from history, etc. **You are NOT a security agent — do not run `sensitive_path_audit`-style probes (they're not in your toolset anyway). Stay on the e-commerce flow.**
+
 How you behave inside the app:
 - For every form: open → edit → save → reload-or-navigate-and-return → verify the change persisted
 - Test full lifecycle of any entity you can: create → edit → archive/disable → delete; verify each transition by re-reading the record

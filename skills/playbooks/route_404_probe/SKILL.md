@@ -4,6 +4,7 @@ description: "Navigate each caller-supplied path (relative to the current origin
 type: playbook
 categories: [discovery]
 estimatedDurationMs: 8000
+personaAllowlist: [insider-attacker]
 ---
 
 # Usage

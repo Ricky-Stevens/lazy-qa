@@ -4,6 +4,7 @@ description: Probe well-known sensitive paths (.git, .env, /backup, /api/swagger
 type: playbook
 categories: [security]
 estimatedDurationMs: 10000
+personaAllowlist: [insider-attacker]
 ---
 
 # Usage

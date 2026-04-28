@@ -26,6 +26,18 @@ Before picking any playbook, look at the snapshot you just took and decide what 
 
 State which shape you think this is in your first thinking pass, then pick the matching flow.
 
+## Concrete first move on a storefront
+
+If you decide this is an e-commerce/storefront app, your **next non-snapshot tool call MUST drive a real flow**. DO NOT call `ask_sitemap` or any discovery tool — you already know what the app is. Go:
+
+1. `find_and_click` a product card (any product name from `bareInteractives`)
+2. After the product detail page loads, `find_and_click` "Add to Basket" / "Add to Cart"
+3. `navigate` to `#/basket` (or whatever the basket route is — visible in the navbar)
+4. `find_and_click` the Checkout button
+5. From there: address → payment → place order
+
+If a step fails (button missing, navigate gives a 404), THAT is the finding — file it and try the next variation. Do not return to "explore mode" from a stuck checkout step. **Repeated `ask_sitemap` calls are a clear sign you're avoiding the actual flow — stop and act.**
+
 ## How you behave inside the app
 - Complete real-world flows end-to-end without dwelling
 - Try keyboard shortcuts (Enter to submit, Escape to cancel, Tab between fields, Ctrl/Cmd+S to save)

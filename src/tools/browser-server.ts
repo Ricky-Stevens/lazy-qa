@@ -460,24 +460,36 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       });
       if (networkBuffer.length > NETWORK_BUFFER_LIMIT) networkBuffer.shift();
       // Mirror into the registry for cross-agent visibility + per-agent
-      // backoff (this server).
+      // backoff. The storm-detection counter (recordHttpStatus → count5xxIn)
+      // is intentionally selective:
+      //
+      //   - `document` 5xx = the agent navigated directly to a route that
+      //     500'd (e.g. /api/Orders, /rest/admin/X). That's URL-guessing —
+      //     same intent as a speculative playbook probe. Logged but NOT
+      //     counted. The previous run's storm cascade was triggered entirely
+      //     by document-type 5xx from agent navigates.
+      //   - `xhr` / `fetch` 5xx = a page's background request broke during
+      //     normal interaction. THAT is the page genuinely breaking under
+      //     the agent's hands. Counted.
+      //
+      // Note: speculative-playbook 5xx are also excluded (probeDepth>0 in
+      // registry.recordHttpStatus). The two filters compose.
       if (agentId) {
-        recordHttpStatus(agentId, status);
-        // 5xx storm = real backend brokenness. 4xx is honest signal during
-        // security probing (auth boundaries, IDOR), so we don't throttle on
-        // it — the supervisor's nudge tactic is the right escalation if a
-        // run gets stuck in 4xx-land.
-        if (status >= 500 && status < 600) {
-          const recent5xx = count5xxIn(agentId, BACKOFF_WINDOW_MS);
-          if (recent5xx >= BACKOFF_5XX_THRESHOLD) {
-            const until = Date.now() + BACKOFF_DURATION_MS;
-            setAgentPause(agentId, until);
-            logger.warn('browser.backoff.5xx', {
-              agentId,
-              recent5xx,
-              windowMs: BACKOFF_WINDOW_MS,
-              pauseMs: BACKOFF_DURATION_MS,
-            });
+        const stormRelevant = type === 'xhr' || type === 'fetch';
+        if (stormRelevant) {
+          recordHttpStatus(agentId, status);
+          if (status >= 500 && status < 600) {
+            const recent5xx = count5xxIn(agentId, BACKOFF_WINDOW_MS);
+            if (recent5xx >= BACKOFF_5XX_THRESHOLD) {
+              const until = Date.now() + BACKOFF_DURATION_MS;
+              setAgentPause(agentId, until);
+              logger.warn('browser.backoff.5xx', {
+                agentId,
+                recent5xx,
+                windowMs: BACKOFF_WINDOW_MS,
+                pauseMs: BACKOFF_DURATION_MS,
+              });
+            }
           }
         }
       }

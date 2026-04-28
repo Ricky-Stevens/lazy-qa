@@ -14,3 +14,9 @@ coverage/
 .serena/
 docs/
 CLAUDE.md
+
+# Local YAML configs — keep them off the public repo. The only config that
+# ships in git is the reference example. Everything else (work portals,
+# personal targets, throwaway scratchpads) stays local.
+config/*
+!config/example.yaml
