@@ -21,6 +21,7 @@ vi.mock('../page-model/parser.ts', () => ({
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],

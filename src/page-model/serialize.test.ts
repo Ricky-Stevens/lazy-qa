@@ -84,6 +84,7 @@ function makePageModel(overrides: Partial<PageModel> = {}): PageModel {
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],

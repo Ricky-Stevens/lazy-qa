@@ -186,6 +186,9 @@ const idorProbe: Playbook<IdorProbeInput> = {
     'Flags any 200 that returns non-error content as suspicious (likely IDOR).',
   categories: ['security'],
   estimatedDurationMs: 8000,
+  // Speculative URL-guessing — 5xx is the *expected* outcome on protected
+  // resources. Excluded from the storm-detection counter.
+  speculative: true,
   inputShape: {
     routeWithId: z.string(),
     candidates: z.array(z.string()).optional(),
@@ -377,6 +380,9 @@ const sensitivePathAudit: Playbook<SensitiveAuditInput> = {
     '/robots.txt, /sitemap.xml, etc.) and flag any that return 200 with non-error content.',
   categories: ['security'],
   estimatedDurationMs: 10000,
+  // Speculative URL-guessing — 4xx/5xx is the *expected* outcome on
+  // well-secured paths. Excluded from the storm-detection counter.
+  speculative: true,
   inputShape: {
     paths: z.array(z.string()).optional(),
   },

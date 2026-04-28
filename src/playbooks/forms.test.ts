@@ -76,6 +76,7 @@ function makeContext(page: Page, form: FormSpec): PlaybookContext {
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],

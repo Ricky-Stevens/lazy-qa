@@ -187,6 +187,12 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
         error: err instanceof Error ? err.message : String(err),
       });
     });
+    // Best-effort dismiss of persistent banners (cookie consent, welcome
+    // splash, EU/GDPR cookie modals). Without this, agents on Juice Shop /
+    // any GDPR-banner-wearing app waste 4-9 turns dismissing modals before
+    // the snapshot shows non-blocked interactives. Each pattern is tried
+    // once with a short timeout — silent on miss.
+    await dismissPersistentBanners(page, logger.child({ agentId, phase: 'auto-dismiss' }));
     logger.info('login.skip', { agentId, reason: 'auth.type=none' });
     return { browser, context, page, storageStatePath };
   }
@@ -246,4 +252,53 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
     await browser.close().catch(() => undefined);
     throw err;
   }
+}
+
+/**
+ * Best-effort dismissal of common persistent banners (GDPR cookie consent,
+ * welcome splash, "we use cookies" bars). Tries each pattern with a 1-second
+ * timeout; silent on miss. Safe to call against any page — patterns are
+ * narrow enough not to fire on real app affordances.
+ *
+ * Without this, an agent landing on (e.g.) Juice Shop wastes 4-9 turns
+ * dismissing the cookie + welcome modal stack before the snapshot reveals
+ * the actual product surface — the bareInteractives walker tags everything
+ * blocked-by-modal until both modals close.
+ */
+const PERSISTENT_BANNER_PATTERNS: Array<{ name: string; locator: string }> = [
+  // GDPR / cookie banners — broadest match patterns, all dismiss intents.
+  { name: 'cookie-dismiss', locator: 'role=button[name=/dismiss cookie|dismiss/i]' },
+  { name: 'cookie-accept', locator: 'role=button[name=/accept cookies|accept all|accept/i]' },
+  { name: 'cookie-got-it', locator: 'role=button[name=/got it|i agree|ok/i]' },
+  // Welcome / splash overlays.
+  { name: 'welcome-close', locator: 'role=button[name=/close welcome|close banner|got it!/i]' },
+  // Material / Bootstrap dialog close buttons (last-ditch).
+  { name: 'mat-dialog-close', locator: 'button[mat-dialog-close]' },
+  { name: 'aria-close-dialog', locator: 'role=dialog >> role=button[name=/^close$/i]' },
+];
+
+export async function dismissPersistentBanners(page: Page, logger: Logger): Promise<void> {
+  let dismissed = 0;
+  for (const pat of PERSISTENT_BANNER_PATTERNS) {
+    try {
+      const loc = page.locator(pat.locator).first();
+      const count = await loc.count();
+      if (count === 0) continue;
+      // Visibility check — invisible matches mean the dialog isn't open.
+      const visible = await loc.isVisible({ timeout: 500 }).catch(() => false);
+      if (!visible) continue;
+      await loc.click({ timeout: 1500 });
+      dismissed += 1;
+      logger.debug('banner.dismissed', { pattern: pat.name });
+      // Small settle pause so subsequent patterns see the post-dismissal DOM.
+      await page.waitForTimeout(150);
+    } catch (err) {
+      // Banner pattern miss is normal — silent unless debug-logging.
+      logger.debug('banner.dismiss.skip', {
+        pattern: pat.name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (dismissed > 0) logger.info('banners.dismissed', { count: dismissed });
 }

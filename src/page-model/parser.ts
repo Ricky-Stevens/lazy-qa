@@ -27,6 +27,7 @@ import type { Page } from 'playwright';
 import YAML from 'yaml';
 import type {
   ActionRef,
+  BareFieldRef,
   ConsoleEntry,
   ElementType,
   FormFieldSpec,
@@ -1086,7 +1087,10 @@ function computeTextHash(text: string): string {
 function deriveRoute(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
-    return `${u.origin}${u.pathname}`;
+    // Preserve SPA hash-routes — `#/login`, `#/search`, etc. — so each
+    // hash-routed page has its own sitemap identity.
+    const isSpaHash = /^#!?\//.test(u.hash);
+    return `${u.origin}${u.pathname}${isSpaHash ? u.hash : ''}`;
   } catch {
     return rawUrl;
   }
@@ -1680,6 +1684,7 @@ export async function parsePage(
       toolbars: [],
       navLinks: [],
       bareInteractives: [],
+      bareFields: [],
       discovered: [],
       network: signals?.network ?? [],
       console: signals?.console ?? [],
@@ -1808,32 +1813,65 @@ export async function parsePage(
     if (navLinks.length >= 40) break;
   }
 
-  // Bare interactives: AX action nodes not inside any form/table/modal/
-  // wizard/toolbar/nav.
-  const containerRoles = new Set([
+  // Containers that already render their interactives in their own section
+  // (forms.fields, tables.rowActions, etc.) — bare* walkers skip these.
+  const ownedContainerRoles = new Set([
     'form',
     'table',
     'grid',
-    'dialog',
-    'alertdialog',
     'tablist',
     'toolbar',
     'navigation',
     'rowgroup',
     'row',
   ]);
+  // Modal/dialog ancestors — interactives inside ARE collected (so the agent
+  // can see what's available behind the dismiss UI) but flagged
+  // `blockedByModal: true` so the agent knows to dismiss first. Without this,
+  // a stacked cookie + welcome banner on an SPA presents as "0 interactives".
+  const modalContainerRoles = new Set(['dialog', 'alertdialog']);
+
   const bareInteractives: ActionRef[] = [];
   const seenBareLabels = new Set<string>();
   for (const { node, ancestors } of walkAx(axRoots)) {
     if (!isActionRole(node.role)) continue;
-    if (ancestors.some((a) => containerRoles.has(a.role))) continue;
+    if (ancestors.some((a) => ownedContainerRoles.has(a.role))) continue;
     const a = actionFromAx(node, locators);
     if (!a.label) continue;
     const k = `${a.label}::${a.locator}`;
     if (seenBareLabels.has(k)) continue;
     seenBareLabels.add(k);
+    if (ancestors.some((anc) => modalContainerRoles.has(anc.role))) {
+      a.blockedByModal = true;
+    }
     bareInteractives.push(a);
     if (bareInteractives.length >= 60) break;
+  }
+
+  // Bare fields: standalone form fields outside any form/table. SPAs with
+  // search bars in <mat-form-field> (Angular Material) or navbar-level inputs
+  // commonly have these; they would otherwise be invisible to the agent.
+  const bareFields: BareFieldRef[] = [];
+  const seenBareFieldLabels = new Set<string>();
+  for (const { node, ancestors } of walkAx(axRoots)) {
+    if (!isFormFieldRole(node.role)) continue;
+    if (ancestors.some((a) => ownedContainerRoles.has(a.role))) continue;
+    const label = node.name || '';
+    if (!label) continue;
+    const locator = axLocator(node.role, label);
+    const k = `${label}::${locator}`;
+    if (seenBareFieldLabels.has(k)) continue;
+    seenBareFieldLabels.add(k);
+    const f: BareFieldRef = {
+      locator,
+      label,
+      role: node.role,
+    };
+    if (ancestors.some((anc) => modalContainerRoles.has(anc.role))) {
+      f.blockedByModal = true;
+    }
+    bareFields.push(f);
+    if (bareFields.length >= 30) break;
   }
 
   const model: PageModel = {
@@ -1847,6 +1885,7 @@ export async function parsePage(
     toolbars,
     navLinks,
     bareInteractives,
+    bareFields,
     discovered: [],
     network: signals?.network ?? [],
     console: signals?.console ?? [],

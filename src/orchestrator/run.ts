@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { acquireSession } from '../auth/session-pool.ts';
 import { loadConfig, resolveApiKey } from '../config/load.ts';
@@ -16,7 +16,7 @@ import { crawlSite } from '../crawler/crawl.ts';
 import { extractLinks } from '../crawler/extract-links.ts';
 import { SiteMapImpl } from '../crawler/sitemap.ts';
 import type { SiteMap } from '../crawler/types.ts';
-import { writeCoverageReport } from '../findings/coverage.ts';
+import { type PlaybookOutcomeRecord, writeCoverageReport } from '../findings/coverage.ts';
 import { dedupeFindings } from '../findings/evaluate.ts';
 import {
   persistFindings,
@@ -34,6 +34,7 @@ import { SelectorCache } from '../tools/selector-cache.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 import { EventWriter, formatEventLine } from './events.ts';
+import { FindingCache } from './finding-cache.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
 import { spawnAgent } from './spawn-agent.ts';
@@ -269,6 +270,12 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       selectorCache = await SelectorCache.load(cfg.target.url);
     }
 
+    // 9b. Cross-agent finding cache. In-process only (per-run). Every agent
+    // shares this instance so each turn's user message includes findings
+    // already filed by others. Stops the duplicate-rediscovery waste that
+    // dominated the previous Juice Shop run (10 of 18 findings were dupes).
+    const findingCache = new FindingCache();
+
     // 10. Launch agents in parallel. The supervisor runs concurrently and
     // finishes when every agent terminates.
     const runStartedAt = new Date().toISOString();
@@ -292,6 +299,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         skillsBundle,
         events,
         selectorCache,
+        findingCache,
       }),
     );
 
@@ -377,15 +385,15 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     await writeRunManifest(runDir, manifest);
     await writeSummaryMarkdown(runDir, journeys, allFindings);
 
-    // 13. Coverage report. The playbookOutcomes array is empty for now —
-    // wiring per-agent outcome jsonl is owned by WP15. Once that lands, the run
-    // will read `runs/<runId>/playbooks/<agentId>.jsonl` and pass them in.
+    // 13. Coverage report. Reads playbook.outcome events from the run's
+    // events.jsonl trace — every runPlaybook call emits one.
     try {
+      const playbookOutcomes = await collectPlaybookOutcomesFromEvents(eventsPath);
       await writeCoverageReport(runDir, {
         runId,
         siteMap: siteMap.serialize(),
         journeys,
-        playbookOutcomes: [],
+        playbookOutcomes,
       });
     } catch (err) {
       logger.error('coverage.failed', {
@@ -542,4 +550,45 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       }
     }
   }
+}
+
+/** Read the run's events.jsonl and reconstruct PlaybookOutcomeRecords from
+ *  every `playbook.outcome` event. Source of truth for "which playbooks did
+ *  the agents actually execute?" — used by the coverage builder. */
+async function collectPlaybookOutcomesFromEvents(
+  eventsPath: string,
+): Promise<PlaybookOutcomeRecord[]> {
+  let raw: string;
+  try {
+    raw = await readFile(eventsPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const out: PlaybookOutcomeRecord[] = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let e: Record<string, unknown>;
+    try {
+      e = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (e.type !== 'playbook.outcome') continue;
+    const status = e.status as string;
+    // Coverage records only tally ok/failed/suspicious; 'skipped' isn't
+    // tracked because it's not a real attempt.
+    if (status !== 'ok' && status !== 'failed' && status !== 'suspicious') continue;
+    out.push({
+      agentId: String(e.agentId ?? ''),
+      playbookName: String(e.playbookName ?? ''),
+      // `playbook.outcome` events don't carry route/targetId yet; coverage's
+      // overall "Playbooks executed" tally and per-agent depth still work
+      // without them, but per-target percentages will read 0%. That's fine
+      // for now — the bare execution count is the regression we're fixing.
+      route: '',
+      targetId: null,
+      status,
+    });
+  }
+  return out;
 }

@@ -30,6 +30,7 @@ import type { Journey } from '../types/journey.ts';
 import { computeCostUsd } from './cost.ts';
 import type { EventWriter } from './events.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
+import type { FindingCache, KnownFindingRef } from './finding-cache.ts';
 import { consumeNudge, updateOnTurn } from './registry.ts';
 import type { MemoryEntry, SummaryMemory } from './summary-memory.ts';
 
@@ -74,6 +75,10 @@ export interface LoopInput {
   memoryPath: string;
   /** Event writer for this run. Optional — omitted in tests that don't need it. */
   events?: EventWriter;
+  /** Cross-agent finding cache. Read at the start of every turn to render
+   *  a "Findings already reported by other agents" block in the user message
+   *  so this agent skips rediscovery. */
+  findingCache?: FindingCache;
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
@@ -127,6 +132,9 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     // on subsequent turns the previous turn's user message was the
     // tool_results, so we add a fresh user message with sitemap + summary +
     // continue instruction before the next assistant call.
+    const knownFindings = input.findingCache
+      ? input.findingCache.forAgent(agent.id).slice(0, 30)
+      : [];
     const userContent = buildUserMessage({
       isFirstTurn: journey.turns === 0,
       targetUrl: input.targetUrl,
@@ -136,6 +144,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       turnsCompleted: journey.turns,
       findingsCount: journey.findings.length,
       remainingMin,
+      knownFindings,
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -502,12 +511,16 @@ function buildUserMessage(args: {
   turnsCompleted: number;
   findingsCount: number;
   remainingMin: number;
+  knownFindings: KnownFindingRef[];
 }): string {
   const sections: string[] = [];
 
   if (args.nudge) {
     sections.push(`[SUPERVISOR INTERVENTION — read this first]\n${args.nudge}`);
   }
+
+  const knownBlock = renderKnownFindings(args.knownFindings);
+  if (knownBlock) sections.push(knownBlock);
 
   const snapshot = renderSiteMapSnapshot(args.siteMap);
   if (snapshot) sections.push(snapshot);
@@ -529,6 +542,34 @@ function buildUserMessage(args: {
   }
 
   return sections.join('\n\n');
+}
+
+/** Render an "Already reported by other agents" block. Returns empty string
+ *  when nothing to render. Format is dense per-line so it doesn't dominate
+ *  the message budget. */
+function renderKnownFindings(refs: KnownFindingRef[]): string {
+  if (refs.length === 0) return '';
+  const lines = ['[findings already reported by other agents — DO NOT re-file these]'];
+  // Group by route so the agent can spot "this route is exhausted" at a glance.
+  const byRoute = new Map<string, KnownFindingRef[]>();
+  for (const r of refs) {
+    const key = r.route || '(no route)';
+    const arr = byRoute.get(key) ?? [];
+    arr.push(r);
+    byRoute.set(key, arr);
+  }
+  for (const [route, group] of byRoute) {
+    const summary = group
+      .slice(0, 3)
+      .map((g) => `${g.severity}:${g.title.slice(0, 60)}`)
+      .join(' | ');
+    const more = group.length > 3 ? ` (+${group.length - 3} more)` : '';
+    lines.push(`- ${route}: ${summary}${more}`);
+  }
+  lines.push(
+    'Skip routes already on this list unless you can demonstrate a NEW kind of bug there. Prefer unexplored ground.',
+  );
+  return lines.join('\n');
 }
 
 /** Render the top-N unvisited / untested items from the sitemap. Returns

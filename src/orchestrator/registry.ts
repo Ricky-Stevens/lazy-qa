@@ -17,6 +17,11 @@ export type AgentLifecycle = 'starting' | 'active' | 'auth_walled' | 'finished' 
 interface HttpStatusEntry {
   ts: number;
   status: number;
+  /** True when this status was recorded inside a speculative URL probe
+   *  (sensitive_path_audit, idor_probe, route_404_probe). Storm-detection
+   *  counters skip these — speculative probing intentionally generates
+   *  4xx/5xx and is not a backend-health signal. */
+  speculative: boolean;
 }
 
 export interface AgentRuntimeState {
@@ -48,6 +53,15 @@ export interface AgentRuntimeState {
   /** When set in the future, the browser server's action tools sleep until this
    * time before executing. Used by per-agent backoff and supervisor pause. */
   pauseUntil: number | null;
+  /** Counter — non-zero when the agent is inside one or more speculative
+   * URL probe playbooks (sensitive_path_audit, idor_probe, route_404_probe).
+   * While counter > 0, the response listener does NOT record HTTP statuses
+   * into the storm counter — speculative probing intentionally generates 4xx
+   * /5xx and is not a backend-health signal. The supervisor is also told the
+   * agent is currently probing so it doesn't misread the resulting noise.
+   *
+   * Counter (not boolean) so nested playbook calls compose safely. */
+  probeDepth: number;
 }
 
 const states = new Map<string, AgentRuntimeState>();
@@ -73,7 +87,43 @@ export function registerAgent(agentId: string, profileName: string): void {
     pendingNudge: null,
     recentHttpStatuses: [],
     pauseUntil: null,
+    probeDepth: 0,
   });
+}
+
+/** Increment the speculative-probe nesting counter. Returns the new depth.
+ *  Wraps every speculative URL playbook (sensitive_path_audit, idor_probe,
+ *  route_404_probe) so any 4xx/5xx generated inside is excluded from the
+ *  storm-detection counter. */
+export function enterProbeMode(agentId: string): number {
+  const s = states.get(agentId);
+  if (!s) return 0;
+  s.probeDepth += 1;
+  return s.probeDepth;
+}
+
+/** Decrement the counter; clamps at 0. */
+export function exitProbeMode(agentId: string): number {
+  const s = states.get(agentId);
+  if (!s) return 0;
+  s.probeDepth = Math.max(0, s.probeDepth - 1);
+  return s.probeDepth;
+}
+
+export function isProbing(agentId: string): boolean {
+  const s = states.get(agentId);
+  return !!s && s.probeDepth > 0;
+}
+
+/** Convenience wrapper: run an async function with probeMode active. The
+ *  guard increments on entry and always decrements (even on throw). */
+export async function withProbeMode<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+  enterProbeMode(agentId);
+  try {
+    return await fn();
+  } finally {
+    exitProbeMode(agentId);
+  }
 }
 
 export function updateOnAction(
@@ -148,40 +198,67 @@ export function snapshotAll(): AgentRuntimeState[] {
  * Record a backend HTTP status observed by the browser server's network
  * listener. We keep ~50 entries (~30s worth at typical action rates) so the
  * supervisor and per-agent backoff can spot 4xx/5xx storms.
+ *
+ * Entries inherit the agent's current probeDepth. A non-zero depth tags the
+ * entry as speculative, which excludes it from storm-detection counters
+ * (count5xxIn, count4xxIn) but keeps it in the buffer for diagnostics.
  */
 export function recordHttpStatus(agentId: string, status: number): void {
   const s = states.get(agentId);
   if (!s) return;
-  s.recentHttpStatuses.push({ ts: Date.now(), status });
+  s.recentHttpStatuses.push({
+    ts: Date.now(),
+    status,
+    speculative: s.probeDepth > 0,
+  });
   if (s.recentHttpStatuses.length > HTTP_STATUS_BUFFER_LIMIT) s.recentHttpStatuses.shift();
 }
 
 /** How many 4xx responses has this agent seen in the last `windowMs` ms?
- *  4xx is informational only — auth boundaries and IDOR probes legitimately
- *  produce 4xx during security testing, so we no longer use this as a
- *  storm trigger. Kept exported for diagnostics / future tuning. */
-export function count4xxIn(agentId: string, windowMs: number): number {
+ *  Excludes speculative-probe responses by default — those are the *expected*
+ *  outcome of probing, not a signal of brokenness. Pass
+ *  `{ includeSpeculative: true }` for raw counts (diagnostics).
+ *  4xx is informational only and not used as a storm trigger. */
+export function count4xxIn(
+  agentId: string,
+  windowMs: number,
+  opts?: { includeSpeculative?: boolean },
+): number {
   const s = states.get(agentId);
   if (!s) return 0;
   const cutoff = Date.now() - windowMs;
+  const includeSpec = opts?.includeSpeculative === true;
   let n = 0;
   for (const entry of s.recentHttpStatuses) {
-    if (entry.ts >= cutoff && entry.status >= 400 && entry.status < 500) n += 1;
+    if (entry.ts < cutoff) continue;
+    if (entry.status < 400 || entry.status >= 500) continue;
+    if (entry.speculative && !includeSpec) continue;
+    n += 1;
   }
   return n;
 }
 
 /** How many 5xx responses has this agent seen in the last `windowMs` ms?
- *  This is the canonical "is the backend sick?" signal — 5xx genuinely
- *  indicates server-side breakage, distinct from honest 4xx auth/access
- *  responses agents see during normal probing. */
-export function count5xxIn(agentId: string, windowMs: number): number {
+ *  Excludes speculative-probe responses — speculative URL probing
+ *  intentionally generates 5xx (e.g. /rest/user/:id IDOR probe on Juice
+ *  Shop returns 500 for every guess). The storm trigger is for "the page
+ *  literally broke under the agent's hands", not "the agent guessed a URL
+ *  that doesn't exist". */
+export function count5xxIn(
+  agentId: string,
+  windowMs: number,
+  opts?: { includeSpeculative?: boolean },
+): number {
   const s = states.get(agentId);
   if (!s) return 0;
   const cutoff = Date.now() - windowMs;
+  const includeSpec = opts?.includeSpeculative === true;
   let n = 0;
   for (const entry of s.recentHttpStatuses) {
-    if (entry.ts >= cutoff && entry.status >= 500 && entry.status < 600) n += 1;
+    if (entry.ts < cutoff) continue;
+    if (entry.status < 500 || entry.status >= 600) continue;
+    if (entry.speculative && !includeSpec) continue;
+    n += 1;
   }
   return n;
 }

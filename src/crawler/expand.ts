@@ -28,7 +28,9 @@ export interface ExpandRouteOptions {
 function deriveRoute(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
-    return `${u.origin}${u.pathname}`;
+    // SPA hash-routes (`#/path`) are part of the route identity.
+    const isSpaHash = /^#!?\//.test(u.hash);
+    return `${u.origin}${u.pathname}${isSpaHash ? u.hash : ''}`;
   } catch {
     return rawUrl;
   }

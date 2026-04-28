@@ -30,6 +30,7 @@ function blankModel(extra: Partial<PageModel> = {}): PageModel {
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     discovered: [],
     network: [],

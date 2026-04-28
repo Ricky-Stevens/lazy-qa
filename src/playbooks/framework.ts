@@ -9,6 +9,7 @@ import type { Page } from 'playwright';
 import type { z } from 'zod';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
+import { withProbeMode } from '../orchestrator/registry.ts';
 import type { PageModel } from '../page-model/types.ts';
 import type { PlaybookOutcome, PlaybookStep } from './outcome.ts';
 
@@ -61,6 +62,12 @@ export interface Playbook<I = Record<string, unknown>> {
   estimatedDurationMs: number;
   /** Zod shape for inputs. Converted to JSON Schema for the SDK. */
   inputShape: z.ZodRawShape;
+  /** When true, runPlaybook wraps execution in `withProbeMode` so any
+   *  4xx/5xx generated inside is excluded from the agent's storm-detection
+   *  counter. Set on speculative URL-guessing probes (sensitive_path_audit,
+   *  idor_probe, route_404_probe) where 4xx/5xx is the *expected* outcome,
+   *  not a backend-health signal. */
+  speculative?: boolean;
   run: (input: I, ctx: PlaybookContext) => Promise<PlaybookOutcome>;
 }
 
@@ -78,6 +85,11 @@ export interface RawToolDef {
 /**
  * Run a playbook with timing + error handling. Always returns an outcome —
  * never throws. Captures unhandled exceptions as `failed` outcomes.
+ *
+ * If the playbook is marked `speculative: true`, execution is wrapped in
+ * `withProbeMode` so the per-agent storm counter ignores 4xx/5xx generated
+ * inside the playbook. URL-guessing probes always trip 4xx/5xx — that's the
+ * point — and shouldn't poison the "is the backend sick?" detector.
  */
 export async function runPlaybook<I>(
   pb: Playbook<I>,
@@ -86,7 +98,9 @@ export async function runPlaybook<I>(
 ): Promise<PlaybookOutcome> {
   const start = Date.now();
   try {
-    const outcome = await pb.run(input, ctx);
+    const outcome = pb.speculative
+      ? await withProbeMode(ctx.agentId, () => pb.run(input, ctx))
+      : await pb.run(input, ctx);
     outcome.durationMs = Date.now() - start;
     return outcome;
   } catch (err) {

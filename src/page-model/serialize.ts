@@ -6,7 +6,15 @@
  * counts (e.g. "Forms: 3") to navigate.
  */
 
-import type { ActionRef, FormSpec, ModalSpec, PageModel, TableSpec, WizardSpec } from './types.ts';
+import type {
+  ActionRef,
+  BareFieldRef,
+  FormSpec,
+  ModalSpec,
+  PageModel,
+  TableSpec,
+  WizardSpec,
+} from './types.ts';
 
 const HARD_CAP = 4096;
 
@@ -15,8 +23,16 @@ function fmtAction(a: ActionRef): string {
   const flags: string[] = [];
   if (a.disabled) flags.push('disabled');
   if (a.intent !== 'unknown') flags.push(a.intent);
+  if (a.blockedByModal) flags.push('blocked-by-modal');
   const flagStr = flags.length > 0 ? ` [${flags.join(',')}]` : '';
   return `  - ${a.type}: "${a.label}" → ${a.locator}${flagStr}`;
+}
+
+function fmtBareField(f: BareFieldRef): string {
+  const flags: string[] = [];
+  if (f.blockedByModal) flags.push('blocked-by-modal');
+  const flagStr = flags.length > 0 ? ` [${flags.join(',')}]` : '';
+  return `  - ${f.role}: "${f.label}" → ${f.locator}${flagStr}`;
 }
 
 function fmtForm(f: FormSpec, idx: number): string {
@@ -48,9 +64,7 @@ function fmtTable(t: TableSpec, idx: number): string {
     `Table #${idx + 1}: ${t.name} [${t.id}] @ ${t.tableLocator} — ${t.rowCount} rows, ${t.columns.length} cols`,
   );
   if (t.columns.length > 0) {
-    const colSummary = t.columns
-      .map((c) => `${c.label}${c.sortable ? '↕' : ''}`)
-      .join(' | ');
+    const colSummary = t.columns.map((c) => `${c.label}${c.sortable ? '↕' : ''}`).join(' | ');
     lines.push(`  cols: ${colSummary}`);
   }
   if (t.rowActions.length > 0) {
@@ -129,6 +143,23 @@ export function serializeForAgent(model: PageModel): string {
   if (model.primaryHeading) headerLines.push(`H1: ${model.primaryHeading}`);
   headerLines.push(`Interactive: ${model.interactiveCount}, looksBroken=${model.looksBroken}`);
 
+  // Modal-blocking warning. Without this, agents on SPAs (Juice Shop's
+  // cookie+welcome stack) repeatedly see "Bare interactives (0)" because
+  // the elements are tagged blockedByModal — surfacing the modals' dismiss
+  // affordances first lets the agent unblock the page in one turn.
+  if (model.modals.length > 0) {
+    const dismissers: string[] = [];
+    for (const m of model.modals) {
+      if (m.closers.cancel)
+        dismissers.push(`"${m.closers.cancel.label}" → ${m.closers.cancel.locator}`);
+      else if (m.closers.x) dismissers.push(`closeX → ${m.closers.x.locator}`);
+    }
+    headerLines.push(
+      `⚠ ${model.modals.length} modal(s) currently open — interactives below them are tagged [blocked-by-modal]. Dismiss first:`,
+    );
+    for (const d of dismissers.slice(0, 4)) headerLines.push(`  → ${d}`);
+  }
+
   const formsSection: Section = {
     header: `Forms (${model.forms.length}):`,
     body: model.forms.map((f, i) => fmtForm(f, i)),
@@ -157,6 +188,10 @@ export function serializeForAgent(model: PageModel): string {
     header: `Bare interactives (${model.bareInteractives.length}, top 30):`,
     body: model.bareInteractives.slice(0, 30).map(fmtAction),
   };
+  const bareFieldsSection: Section = {
+    header: `Bare fields (${model.bareFields.length}, top 20):`,
+    body: model.bareFields.slice(0, 20).map(fmtBareField),
+  };
 
   const signalLines: string[] = [];
   if (model.network.length > 0 || model.console.length > 0) {
@@ -164,17 +199,17 @@ export function serializeForAgent(model: PageModel): string {
     if (model.network.length > 0) {
       const n = model.network.length;
       const recent = model.network.slice(-5);
-      const summary = recent
-        .map((r) => `${r.status} ${r.method} ${r.url}`)
-        .join('; ');
+      const summary = recent.map((r) => `${r.status} ${r.method} ${r.url}`).join('; ');
       signalLines.push(`  network: ${n} anomaly(ies) — ${summary}`);
     }
     if (model.console.length > 0) {
       const errs = model.console.filter((c) => c.level === 'error' || c.level === 'pageerror');
       const recent = (errs.length > 0 ? errs : model.console).slice(-3);
-      signalLines.push(`  console: ${model.console.length} entries — ${recent
-        .map((c) => `[${c.level}] ${c.text.slice(0, 80)}`)
-        .join('; ')}`);
+      signalLines.push(
+        `  console: ${model.console.length} entries — ${recent
+          .map((c) => `[${c.level}] ${c.text.slice(0, 80)}`)
+          .join('; ')}`,
+      );
     }
   }
   const signalsSection: Section = {
@@ -192,6 +227,7 @@ export function serializeForAgent(model: PageModel): string {
     toolbarsSection,
     navSection,
     bareSection,
+    bareFieldsSection,
     signalsSection,
   ];
   let output = joinSections(sections);
@@ -199,9 +235,7 @@ export function serializeForAgent(model: PageModel): string {
 
   // Over cap: trim body sections proportionally. Keep headers intact;
   // collectively the bodies must fit in the remaining budget.
-  const headerOnly = joinSections(
-    sections.map((s) => ({ header: s.header, body: [] })),
-  );
+  const headerOnly = joinSections(sections.map((s) => ({ header: s.header, body: [] })));
   const truncationFooter = '\n\n... (truncated to fit context budget)';
   const budget = HARD_CAP - headerOnly.length - truncationFooter.length - 200; // 200 char safety margin
 
@@ -213,11 +247,9 @@ export function serializeForAgent(model: PageModel): string {
     toolbarsSection,
     navSection,
     bareSection,
+    bareFieldsSection,
   ];
-  const totalBodyLen = trimmable.reduce(
-    (acc, s) => acc + s.body.join('\n').length,
-    0,
-  );
+  const totalBodyLen = trimmable.reduce((acc, s) => acc + s.body.join('\n').length, 0);
   if (totalBodyLen === 0) {
     return `${headerOnly}${truncationFooter}`;
   }

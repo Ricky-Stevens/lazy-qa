@@ -92,6 +92,7 @@ function makeContext(page: Page, wizard: WizardSpec): PlaybookContext {
     wizards: [wizard],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],

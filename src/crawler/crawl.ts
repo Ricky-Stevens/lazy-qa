@@ -35,12 +35,17 @@ async function waitForHydration(page: Page): Promise<void> {
   }
 }
 
-/** Derive `origin + pathname` (no query/fragment) from a URL. Returns the
- * raw string on parse failure so misformed URLs don't crash the crawler. */
+/** Derive `origin + pathname` from a URL, preserving SPA hash-routes
+ * (`#/path`) as part of the route key. Without preserving the hash,
+ * Angular / Vue / React-Router apps where every route shares the base
+ * pathname would collapse into a single sitemap entry. Query strings are
+ * still stripped — they don't typically denote distinct routes. Returns
+ * the raw string on parse failure. */
 function deriveRoute(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
-    return `${u.origin}${u.pathname}`;
+    const isSpaHash = /^#!?\//.test(u.hash);
+    return `${u.origin}${u.pathname}${isSpaHash ? u.hash : ''}`;
   } catch {
     return rawUrl;
   }
@@ -175,6 +180,7 @@ async function processRoute(
       toolbars: [],
       navLinks: [],
       bareInteractives: [],
+      bareFields: [],
       discovered: [],
       network: [],
       console: [],

@@ -4,6 +4,7 @@ import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
+import type { FindingCache } from '../orchestrator/finding-cache.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
@@ -28,6 +29,10 @@ export interface HarnessServerInput {
   runDir?: string;
   /** Event writer for this run. Optional — emits finding.report events. */
   events?: EventWriter;
+  /** Shared cross-agent finding cache. When supplied, every reported finding
+   *  is registered so OTHER agents see it in their per-turn user message and
+   *  skip rediscovering the same issue. */
+  findingCache?: FindingCache;
 }
 
 export function createHarnessMcpServer(
@@ -39,7 +44,7 @@ export function createHarnessMcpServer(
     'journey' in inputOrJourney
       ? inputOrJourney
       : { journey: inputOrJourney, logger: loggerArg as Logger };
-  const { journey, logger, getPage, runDir, events } = input;
+  const { journey, logger, getPage, runDir, events, findingCache } = input;
   const rawTools: RawToolDef[] = [];
   function defTool<S extends Record<string, z.ZodTypeAny>>(
     name: string,
@@ -178,6 +183,9 @@ export function createHarnessMcpServer(
             }
           }
           journey.findings.push(finding);
+          // Register in the cross-agent finding cache so other agents in the
+          // same run see this on their next turn and skip rediscovery.
+          findingCache?.add(journey.agentId, finding);
           // Emit finding.report event after the finding is recorded.
           await events?.write({
             type: 'finding.report',

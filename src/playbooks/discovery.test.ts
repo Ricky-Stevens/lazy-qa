@@ -87,6 +87,7 @@ function makeContext(
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network,
     console: [],

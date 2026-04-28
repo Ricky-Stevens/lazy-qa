@@ -28,6 +28,7 @@ import type { SelectorCache } from '../tools/selector-cache.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
 import type { EventWriter } from './events.ts';
+import type { FindingCache } from './finding-cache.ts';
 import { runAgentLoop } from './loop.ts';
 import { registerAgent, setStatus, updateOnAction } from './registry.ts';
 import { SummaryMemory } from './summary-memory.ts';
@@ -61,6 +62,10 @@ export interface SpawnAgentInput {
   /** Persistent selector cache for find_and_click. Optional — undefined when
    *  selector_cache.enabled is false in the run config. */
   selectorCache?: SelectorCache;
+  /** Cross-agent finding cache. All parallel agents in this run share one
+   *  instance so each turn the agent sees what others have already filed and
+   *  skips rediscovery. */
+  findingCache?: FindingCache;
 }
 
 export interface SpawnAgentResult {
@@ -158,6 +163,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     },
     runDir,
     events,
+    findingCache: input.findingCache,
   });
   const browserKit = createBrowserMcpServer({
     getPage: () => {
@@ -224,6 +230,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       memoryEnabled,
       memoryPath,
       events,
+      findingCache: input.findingCache,
     });
   } catch (err) {
     if (abortController.signal.aborted) {

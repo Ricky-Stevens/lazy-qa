@@ -13,6 +13,7 @@ function makePageModel(route: string, overrides: Partial<PageModel> = {}): PageM
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],

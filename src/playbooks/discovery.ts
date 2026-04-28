@@ -131,6 +131,9 @@ export const route404Probe: Playbook<Route404ProbeInput> = {
   categories: ['discovery'],
   estimatedDurationMs: 8_000,
   inputShape: route404ProbeShape,
+  // Speculative URL-guessing — 4xx is the *expected* outcome. Excluded from
+  // the storm-detection counter.
+  speculative: true,
   async run(input, ctx): Promise<PlaybookOutcome> {
     const steps: PlaybookStep[] = [];
     const evidence: Record<string, unknown> = {
@@ -206,7 +209,8 @@ const discoverRouteAffordancesShape = {
 function deriveRoute(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
-    return `${u.origin}${u.pathname}`;
+    const isSpaHash = /^#!?\//.test(u.hash);
+    return `${u.origin}${u.pathname}${isSpaHash ? u.hash : ''}`;
   } catch {
     return rawUrl;
   }

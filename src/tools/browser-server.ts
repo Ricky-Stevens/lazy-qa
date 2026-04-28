@@ -387,6 +387,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           toolbars: [],
           navLinks: [],
           bareInteractives: [],
+          bareFields: [],
           network: [],
           console: [],
           textHash: '',

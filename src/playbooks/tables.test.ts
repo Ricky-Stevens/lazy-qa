@@ -69,6 +69,7 @@ function makeContext(page: Page, table: TableSpec): PlaybookContext {
     wizards: [],
     toolbars: [],
     navLinks: [],
+    bareFields: [],
     bareInteractives: [],
     network: [],
     console: [],
