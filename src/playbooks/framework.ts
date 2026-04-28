@@ -7,9 +7,9 @@
 
 import type { Page } from 'playwright';
 import type { z } from 'zod';
+import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { PageModel } from '../page-model/types.ts';
-import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { PlaybookOutcome, PlaybookStep } from './outcome.ts';
 
 export type PlaybookCategory =

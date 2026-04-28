@@ -3,13 +3,13 @@
  * SiteMapAccessor; route_404_probe uses page.route() to mock HTTP responses.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type Browser, type BrowserContext, chromium, type Page } from 'playwright';
-import { askSitemap, discoverRouteAffordances, route404Probe } from './discovery.ts';
-import type { PlaybookContext } from './framework.ts';
-import type { NetworkAnomaly, PageModel } from '../page-model/types.ts';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { RouteEntry, SiteMapAccessor } from '../crawler/types.ts';
 import { createLogger } from '../logging/logger.ts';
+import type { NetworkAnomaly, PageModel } from '../page-model/types.ts';
+import { askSitemap, discoverRouteAffordances, route404Probe } from './discovery.ts';
+import type { PlaybookContext } from './framework.ts';
 
 let browser: Browser;
 let context: BrowserContext;
@@ -180,14 +180,13 @@ describe('route_404_probe', () => {
     try {
       await page.goto('https://probe-test.local/start', { waitUntil: 'domcontentloaded' });
       const ctx = makeContext(page, fakeSiteMap());
-      const out = await route404Probe.run(
-        { paths: ['/exists', '/missing'] },
-        ctx,
-      );
+      const out = await route404Probe.run({ paths: ['/exists', '/missing'] }, ctx);
       expect(out.status).toBe('ok');
-      const results = (out.evidence as {
-        results: Array<{ path: string; status: number | null; ok: boolean }>;
-      }).results;
+      const results = (
+        out.evidence as {
+          results: Array<{ path: string; status: number | null; ok: boolean }>;
+        }
+      ).results;
       expect(results).toHaveLength(2);
       expect(results[0]).toMatchObject({ path: '/exists', status: 200, ok: true });
       expect(results[1]).toMatchObject({ path: '/missing', status: 404, ok: false });

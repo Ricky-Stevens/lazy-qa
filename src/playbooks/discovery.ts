@@ -58,35 +58,30 @@ export const askSitemap: Playbook<AskSitemapInput> = {
     try {
       switch (input.query) {
         case 'unvisited routes': {
-          items = ctx.siteMap.listUnvisitedRoutes().slice(0, MAX_ITEMS).map((r) => ({
-            route: r.route,
-            url: r.url,
-            title: r.title,
-          }));
+          items = ctx.siteMap
+            .listUnvisitedRoutes()
+            .slice(0, MAX_ITEMS)
+            .map((r) => ({
+              route: r.route,
+              url: r.url,
+              title: r.title,
+            }));
           break;
         }
         case 'untested forms': {
-          items = ctx.siteMap
-            .listFormsUntested('crud_create_form')
-            .slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listFormsUntested('crud_create_form').slice(0, MAX_ITEMS);
           break;
         }
         case 'unsorted tables': {
-          items = ctx.siteMap
-            .listTablesUntested('table_sort_each_column')
-            .slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listTablesUntested('table_sort_each_column').slice(0, MAX_ITEMS);
           break;
         }
         case 'unexercised modals': {
-          items = ctx.siteMap
-            .listModalsUntested('modal_open_close')
-            .slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listModalsUntested('modal_open_close').slice(0, MAX_ITEMS);
           break;
         }
         case 'unexercised wizards': {
-          items = ctx.siteMap
-            .listWizardsUntested('wizard_full_walkthrough')
-            .slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listWizardsUntested('wizard_full_walkthrough').slice(0, MAX_ITEMS);
           break;
         }
         case '4xx routes': {
@@ -220,7 +215,7 @@ function deriveRoute(rawUrl: string): string {
 export const discoverRouteAffordances: Playbook<DiscoverRouteAffordancesInput> = {
   name: 'discover_route_affordances',
   description:
-    'Probe the current route non-destructively: click toolbar/header buttons and table row kebabs, observe what each opens (modal, wizard, menu, navigation, toast, inert), then dismiss. Surfaces affordances the link-graph crawler can\'t see — Add forms behind buttons, Edit screens reached via row actions, multi-step wizards. Auto-runs on first agent visit per route; invoke manually with `force: true` after you create new rows or otherwise change page state. Returns a list of discovered triggers + outcomes.',
+    "Probe the current route non-destructively: click toolbar/header buttons and table row kebabs, observe what each opens (modal, wizard, menu, navigation, toast, inert), then dismiss. Surfaces affordances the link-graph crawler can't see — Add forms behind buttons, Edit screens reached via row actions, multi-step wizards. Auto-runs on first agent visit per route; invoke manually with `force: true` after you create new rows or otherwise change page state. Returns a list of discovered triggers + outcomes.",
   categories: ['discovery'],
   estimatedDurationMs: 8_000,
   inputShape: discoverRouteAffordancesShape,
@@ -332,4 +327,3 @@ export const discoverRouteAffordances: Playbook<DiscoverRouteAffordancesInput> =
     );
   },
 };
-
