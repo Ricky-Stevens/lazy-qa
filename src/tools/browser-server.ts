@@ -25,6 +25,7 @@ import {
   recordHttpStatus,
   setAgentPause,
 } from '../orchestrator/registry.ts';
+import type { SharedKnowledge } from '../orchestrator/shared-knowledge.ts';
 import { parsePage } from '../page-model/parser.ts';
 import { serializeForAgent } from '../page-model/serialize.ts';
 import type { ConsoleEntry, NetworkAnomaly, PageModel } from '../page-model/types.ts';
@@ -95,6 +96,10 @@ export interface BrowserServerInput {
   /** Persistent selector cache for find_and_click. Optional — undefined when
    *  selector_cache.enabled is false in the run config. */
   selectorCache?: SelectorCache;
+  /** Shared cross-agent intelligence store. Used by `try_login` to mark
+   *  credentials as verified after a successful login attempt — other agents
+   *  on their next turn see the [verified] tag and trust the creds. */
+  sharedKnowledge?: SharedKnowledge;
 }
 
 /** Accessibility node interface for rendering the AX tree. */
@@ -958,6 +963,202 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     ),
 
     defTool(
+      'try_login',
+      'Attempt to log in with the given username/password. Use this when you have CREDENTIALS (from team intelligence, a SQLi dump, an exposed config file, or an FTP backup file). The tool: navigates to a login URL (or the current page if it already looks like a login form), finds username/password fields by AX role, fills them, clicks a submit-like button, and verifies success by checking that the URL or page state changed and no error message appeared. On success, the credential is auto-marked as verified in team intelligence so other agents trust it. AFTER A SUCCESSFUL LOGIN you have a much larger surface — explore authenticated routes (admin panels, account settings, order history, etc.) before going back to anonymous probing.',
+      {
+        username: z.string().min(1).describe('Username / email / login.'),
+        password: z.string().min(1).describe('Password.'),
+        login_url: z
+          .string()
+          .optional()
+          .describe(
+            'Optional explicit login URL. If omitted, the tool first checks if the current page looks like a login form; if not, it tries common paths (/login, /#/login, /signin, /auth/login).',
+          ),
+      },
+      async ({ username, password, login_url }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        invalidateModelCache();
+
+        const tryLoginCandidates = login_url
+          ? [login_url]
+          : [
+              page.url(),
+              new URL('/#/login', page.url()).toString(),
+              new URL('/login', page.url()).toString(),
+              new URL('/signin', page.url()).toString(),
+              new URL('/auth/login', page.url()).toString(),
+            ];
+
+        const errors: string[] = [];
+        for (const url of tryLoginCandidates) {
+          // For the `page.url()` candidate, only proceed if it looks like a
+          // login form already (saves a redundant navigation).
+          if (url !== tryLoginCandidates[0] || login_url) {
+            try {
+              if (!isHostAllowed(url, allowedHosts ?? [])) continue;
+              await page.goto(url, { timeout: 10_000, waitUntil: 'domcontentloaded' });
+            } catch (err) {
+              errors.push(
+                `goto(${url}) failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              continue;
+            }
+          }
+
+          // Locate username / password fields by role + heuristic. Try AX
+          // textbox / role=email / input[type=password] etc.
+          const userField = page
+            .locator(
+              'input[type="email"], input[name="email"], input[id="email"], input[name="username"], input[id="username"], input[name="user"], input[autocomplete="username"]',
+            )
+            .first();
+          const passField = page
+            .locator('input[type="password"], input[autocomplete="current-password"]')
+            .first();
+          if ((await userField.count()) === 0 || (await passField.count()) === 0) {
+            errors.push(`no login form on ${page.url()}`);
+            continue;
+          }
+
+          try {
+            await userField.fill(username, { timeout: 3_000 });
+            await passField.fill(password, { timeout: 3_000 });
+          } catch (err) {
+            errors.push(`fill failed: ${err instanceof Error ? err.message : String(err)}`);
+            continue;
+          }
+
+          // Find a submit-like button. Prefer the password field's enclosing
+          // form's submit; fall back to text-based locators.
+          const preLoginUrl = page.url();
+          const submitCandidates = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'role=button[name=/log\\s?in|sign\\s?in|submit/i]',
+            'text=/^\\s*(log\\s?in|sign\\s?in)\\s*$/i',
+          ];
+          let submitted = false;
+          for (const sel of submitCandidates) {
+            try {
+              const loc = page.locator(sel).first();
+              if ((await loc.count()) === 0) continue;
+              await loc.click({ timeout: 3_000 });
+              submitted = true;
+              break;
+            } catch {
+              /* try next */
+            }
+          }
+          if (!submitted) {
+            // Last resort: press Enter in the password field.
+            try {
+              await passField.press('Enter', { timeout: 3_000 });
+              submitted = true;
+            } catch (err) {
+              errors.push(`submit failed: ${err instanceof Error ? err.message : String(err)}`);
+              continue;
+            }
+          }
+
+          // Wait briefly for navigation/SPA state change. We don't insist on a
+          // hard navigation — many SPAs replace state without a URL change.
+          await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+          const postLoginUrl = page.url();
+
+          // Heuristic success: URL changed away from the login route OR a
+          // user-identifying element appears (an account/avatar/logout button).
+          // We additionally check for visible error messages — common failure
+          // indicators on Material/Bootstrap login forms.
+          const errorVisible = await page
+            .locator(
+              '[class*="error"], [role=alert], .mat-error, .invalid-feedback, .text-danger, .alert-danger',
+            )
+            .first()
+            .isVisible({ timeout: 500 })
+            .catch(() => false);
+          const accountMarker = await page
+            .locator(
+              'role=button[name=/account|profile|logout|sign\\s?out/i], [data-testid*="account"], [aria-label*="account" i], [aria-label*="logout" i]',
+            )
+            .first()
+            .isVisible({ timeout: 500 })
+            .catch(() => false);
+          const urlChanged =
+            postLoginUrl !== preLoginUrl && !/login|signin|sign-in/i.test(postLoginUrl);
+          const success = !errorVisible && (urlChanged || accountMarker);
+
+          if (success) {
+            input.sharedKnowledge?.markCredentialVerified(username, password);
+            // Also auto-add the credential if not already in shared store —
+            // an attacker may call try_login on creds they got from local
+            // observation (without first sharing) and we still want the team
+            // to see them.
+            input.sharedKnowledge?.addCredential({
+              username,
+              password,
+              source: `try_login by ${input.agentId ?? 'agent'}`,
+              foundBy: input.agentId ?? 'unknown',
+              foundAt: new Date().toISOString(),
+              loginVerified: true,
+            });
+            await events?.write({
+              type: 'auth.try_login',
+              agentId: input.agentId ?? 'unknown',
+              username,
+              success: true,
+              detail: urlChanged
+                ? `URL changed: ${preLoginUrl} → ${postLoginUrl}`
+                : 'account marker visible',
+              postLoginUrl,
+            });
+            logger.info('try_login.success', {
+              agentId: input.agentId,
+              username,
+              postLoginUrl,
+            });
+            return textResult(
+              `OK try_login: logged in as ${username}. URL: ${postLoginUrl}. Now explore authenticated routes (admin panel, account settings, order history). Other agents have been told the credential is verified.`,
+            );
+          }
+
+          // Failed but page found — record and stop trying further URLs (we
+          // got far enough to fill the form, which is the strongest signal
+          // we had the right page).
+          await events?.write({
+            type: 'auth.try_login',
+            agentId: input.agentId ?? 'unknown',
+            username,
+            success: false,
+            detail: errorVisible
+              ? 'error message visible after submit'
+              : 'no auth marker after submit',
+            postLoginUrl,
+          });
+          logger.info('try_login.failed', {
+            agentId: input.agentId,
+            username,
+            errorVisible,
+          });
+          return textResult(
+            `FAILED try_login: form submitted but login appears unsuccessful (${errorVisible ? 'error message shown' : 'no account marker, URL still on login route'}). The credentials may be wrong, or the app uses MFA / additional steps. URL: ${postLoginUrl}`,
+          );
+        }
+
+        await events?.write({
+          type: 'auth.try_login',
+          agentId: input.agentId ?? 'unknown',
+          username,
+          success: false,
+          detail: `no login form located. Tried: ${tryLoginCandidates.join(' ')}. Errors: ${errors.join(' | ')}`,
+        });
+        return textResult(
+          `FAILED try_login: could not locate a login form. Tried ${tryLoginCandidates.length} URL(s). Last errors: ${errors.slice(-3).join(' | ')}. Try passing an explicit login_url.`,
+        );
+      },
+    ),
+
+    defTool(
       'read_recent',
       'One-call sweep returning: serialized PageModel, console errors since last check, and last 5 network entries. Use this when you want to assess the current state after weird behaviour.',
       {},
@@ -1192,6 +1393,7 @@ export const BROWSER_TOOL_NAMES = [
   'mcp__browser__evaluate',
   'mcp__browser__fill_form',
   'mcp__browser__find_and_click',
+  'mcp__browser__try_login',
   'mcp__browser__read_recent',
   'mcp__browser__storage_inspect',
 ] as const;

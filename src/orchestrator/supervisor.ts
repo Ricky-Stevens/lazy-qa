@@ -13,6 +13,7 @@ import {
   setGlobalPause,
   snapshotAll,
 } from './registry.ts';
+import type { SharedKnowledge } from './shared-knowledge.ts';
 
 /**
  * Supervisor agent. Watches the explorer agents via the runtime registry,
@@ -49,6 +50,10 @@ export interface SupervisorInput {
    *  tactic is hidden (there's no login to perform; the recovery handler
    *  would just fail with a confusing message). */
   authType: 'form' | 'none';
+  /** Shared cross-agent intelligence store. The supervisor reads from this to
+   *  surface team intel in list_agents and writes to it via broadcast_to_team
+   *  to push directives at all explorers. */
+  sharedKnowledge?: SharedKnowledge;
 }
 
 export interface SupervisorResult {
@@ -58,6 +63,7 @@ export interface SupervisorResult {
   reloginCount: number;
   nudgeCount: number;
   pauseCount: number;
+  broadcastCount: number;
 }
 
 function buildSystemPrompt(authType: 'form' | 'none'): string {
@@ -111,6 +117,12 @@ ${stormRule}
 3. NO PROGRESS — Date.now() - agent.lastActionAt > 60_000 (>60s since last browser action) AND status === 'active' AND NOT currently paused
    → ACTION: nudge_agent(agentId, "You haven't taken an action in over a minute. Try a completely different approach: <reference their recentTools and currentUrl to suggest something specific, e.g. 'open a kebab menu on a table row' or 'navigate to the dashboard and pick a different module'>.")
 
+4. NEW TEAM INTELLIGENCE — list_agents shows teamIntel.credentials > 0 OR teamIntel.routes > 0 (whatever growth happened since the last cycle). Specifically watch for newly shared CREDENTIALS — they are gold and must be broadcast immediately.
+   → CREDENTIALS: broadcast_to_team({message: "Team intelligence: credentials available — username=<X>, password=<Y> (source: <Z>). Call try_login(<X>, <Y>) on your next turn. The authenticated surface has many more affordances; explore there before returning to anonymous routes."})
+       Also nudge the SHARING agent: "You just shared credentials with the team — IMMEDIATELY call try_login(<X>, <Y>) yourself before continuing."
+   → NEW AUTH-REQUIRED ROUTE: broadcast_to_team({message: "New authenticated route discovered: <URL> (note: <Z>). Once you've logged in via try_login, navigate there to explore."}) — only broadcast if not previously broadcast.
+   → DO NOT spam broadcasts. One broadcast per credential set, one per significant route. The harness watermarks per-agent so messages aren't re-shown, but excessive broadcasts crowd out your other directives.
+
 WHEN TO STOP:
 - All agents have status='finished' or 'errored' → call end_session({reason: "all explorers done"}).
 - You have called list_agents and it returned an empty array AFTER you've previously seen agents → wait 60s, check again. If still empty, end_session.
@@ -128,6 +140,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
   let reloginCount = 0;
   let nudgeCount = 0;
   let pauseCount = 0;
+  let broadcastCount = 0;
   let selfEnded = false;
   let endedReason: SupervisorResult['endedReason'] = 'max-turns';
 
@@ -175,11 +188,98 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
           globalPauseRemainingSec > 0
             ? `Global pause: ${globalPauseRemainingSec}s remaining (reason: ${globalPause.reason}).\n`
             : '';
+
+        // Team intel block — credentials and discovered routes the team has
+        // accumulated. Surfacing these is how the supervisor decides when
+        // to broadcast "creds available, log in NOW" directives.
+        let intelText = '';
+        if (input.sharedKnowledge) {
+          const snap = input.sharedKnowledge.snapshot();
+          if (snap.credentials.length > 0 || snap.routes.length > 0) {
+            const intelLines: string[] = ['Team intelligence:'];
+            if (snap.credentials.length > 0) {
+              intelLines.push(`  Credentials (${snap.credentials.length}):`);
+              for (const c of snap.credentials.slice(0, 8)) {
+                const ver = c.loginVerified ? ' [verified]' : '';
+                intelLines.push(
+                  `    ${c.username}:${c.password.slice(0, 3)}***${ver} (by ${c.foundBy}, source: ${c.source})`,
+                );
+              }
+            }
+            if (snap.routes.length > 0) {
+              intelLines.push(`  Discovered routes (${snap.routes.length}):`);
+              for (const r of snap.routes.slice(0, 10)) {
+                intelLines.push(
+                  `    ${r.url} ${r.requiresAuth ? '[auth]' : ''} status=${r.lastStatus} (by ${r.foundBy})`,
+                );
+              }
+            }
+            intelText = `${intelLines.join('\n')}\n\n`;
+          }
+        }
+
         const text =
           lines.length === 0
-            ? 'No agents registered yet. Wait and check again.'
-            : `${header}Agents (${lines.length}):\n${lines.join('\n')}`;
+            ? `${intelText}No agents registered yet. Wait and check again.`
+            : `${header}${intelText}Agents (${lines.length}):\n${lines.join('\n')}`;
         return { content: [{ type: 'text' as const, text }] };
+      },
+    },
+    {
+      name: 'broadcast_to_team',
+      description:
+        'Push a directive to ALL agents (or all agents matching a profile). Distinct from nudge_agent which targets ONE agent — broadcasts go to every explorer. Use for team-wide intelligence: "credentials X:Y are available, log in now", "admin panel discovered at /admin/users, prioritise it", "target backend is down for everyone, switch to read-only exploration". The harness watermarks per-agent so each broadcast renders exactly once per agent. Cap broadcasts at one per significant team event — repeated broadcasts on the same topic are noise.',
+      shape: {
+        message: z
+          .string()
+          .min(20)
+          .max(800)
+          .describe(
+            'The directive. Be concrete: include the credentials/URL/instructions agents will need.',
+          ),
+        for_profile: z
+          .string()
+          .optional()
+          .describe(
+            'Optional: scope the broadcast to agents whose profileName matches (e.g. "insider-attacker"). Omit to broadcast to all profiles.',
+          ),
+      },
+      handler: async (args) => {
+        const { message, for_profile } = args as { message: string; for_profile?: string };
+        if (!input.sharedKnowledge) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'broadcast_to_team is unavailable in this run (no SharedKnowledge instance). Use nudge_agent instead.',
+              },
+            ],
+          };
+        }
+        input.sharedKnowledge.addBroadcast({
+          message,
+          forProfile: for_profile,
+          issuedBy: 'supervisor',
+          issuedAt: new Date().toISOString(),
+        });
+        broadcastCount += 1;
+        input.logger.info('supervisor.broadcast', {
+          forProfile: for_profile,
+          preview: message.slice(0, 200),
+        });
+        await events?.write({
+          type: 'team.broadcast',
+          message,
+          forProfile: for_profile,
+        });
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Broadcast queued${for_profile ? ` for profile=${for_profile}` : ' for all agents'}. Each agent will see the message exactly once on their next turn.`,
+            },
+          ],
+        };
       },
     },
     {
@@ -462,8 +562,9 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
     reloginCount,
     nudgeCount,
     pauseCount,
+    broadcastCount,
     endedReason,
   });
 
-  return { turns, costUsd, endedReason, reloginCount, nudgeCount, pauseCount };
+  return { turns, costUsd, endedReason, reloginCount, nudgeCount, pauseCount, broadcastCount };
 }

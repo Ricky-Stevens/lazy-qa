@@ -37,6 +37,7 @@ import { EventWriter, formatEventLine } from './events.ts';
 import { FindingCache } from './finding-cache.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
+import { SharedKnowledge } from './shared-knowledge.ts';
 import { spawnAgent } from './spawn-agent.ts';
 import { runSupervisor } from './supervisor.ts';
 
@@ -276,6 +277,15 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // dominated the previous Juice Shop run (10 of 18 findings were dupes).
     const findingCache = new FindingCache();
 
+    // 9c. Shared cross-agent intelligence. Credentials dumped via SQLi,
+    // routes discovered post-login, JWTs scraped from page state — anything
+    // an agent thinks the team should know goes here. Every agent's per-turn
+    // user message renders the contents; the supervisor reads it via
+    // list_agents and broadcasts directives ("creds available, log in NOW").
+    // Try_login also writes here on successful login (auto-marks the
+    // credential as verified).
+    const sharedKnowledge = new SharedKnowledge();
+
     // 10. Launch agents in parallel. The supervisor runs concurrently and
     // finishes when every agent terminates.
     const runStartedAt = new Date().toISOString();
@@ -300,6 +310,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         events,
         selectorCache,
         findingCache,
+        sharedKnowledge,
       }),
     );
 
@@ -314,6 +325,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
           logger: logger.child({ agentId: 'supervisor' }),
           events,
           authType: cfg.target.auth.type,
+          sharedKnowledge,
         }).catch((err) => {
           // Supervisor is best-effort — never fail the run if it errors.
           logger.error('supervisor.crashed', {

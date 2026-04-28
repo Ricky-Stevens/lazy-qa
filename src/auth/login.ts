@@ -300,5 +300,10 @@ export async function dismissPersistentBanners(page: Page, logger: Logger): Prom
       });
     }
   }
-  if (dismissed > 0) logger.info('banners.dismissed', { count: dismissed });
+  // Demoted to debug — the auto-dismiss runs once per session (crawler +
+  // each agent + verifier), so on a 4-agent run with banners that's 6 info
+  // lines that say "we did the predictable thing". The operator gets no
+  // signal from it. The dismiss event is still recorded at debug level and
+  // visible in events.jsonl for any operator who wants to verify wiring.
+  if (dismissed > 0) logger.debug('banners.dismissed', { count: dismissed });
 }

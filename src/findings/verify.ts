@@ -102,7 +102,60 @@ const VerifyResponseSchema = z.object({
   detail: z.string().min(1),
 });
 
+/** Extract the first absolute http(s) URL from a string. Returns null if no
+ *  match. Used to preserve query params from `stepsToReproduce[0]` — the
+ *  bare `finding.route` field strips them, which silently kills SQLi /
+ *  injection findings in the verifier (the payload IS the query string).
+ *
+ *  We accept fairly liberal characters in the path/query — most injection
+ *  payloads include `'`, `(`, `)`, `;`, `%`-encoded bytes, etc. We stop at
+ *  whitespace or a quote that isn't URL-safe. */
+function extractUrlFromText(text: string): string | null {
+  const match = text.match(/\bhttps?:\/\/[^\s'"`<>]+/);
+  return match ? match[0] : null;
+}
+
+/** Decide which URL to navigate to during verification.
+ *
+ *  Preference order:
+ *    1. `stepsToReproduce[0]` if it contains an absolute URL — preserves
+ *       query string / fragment / encoded-payload that finding.route omits.
+ *    2. `finding.route` resolved against rootUrl.
+ *    3. rootUrl as fallback.
+ *
+ *  Why we prefer steps[0] over `route`: the agent records the bare
+ *  origin+pathname in `route` (the sitemap key). Injection findings put the
+ *  actual exploit payload in the query string, which is captured in the
+ *  `stepsToReproduce` text. The previous Juice Shop run lost two real SQLi
+ *  findings to this gap — the verifier re-navigated to `/rest/products/search`
+ *  with no `?q=` and saw a clean response. */
 function deriveTargetUrl(finding: Finding, rootUrl: string): string {
+  // 1. Try to recover a fuller URL from the first reproduction step.
+  const firstStep = finding.stepsToReproduce?.[0];
+  if (firstStep) {
+    const stepUrl = extractUrlFromText(firstStep);
+    if (stepUrl) {
+      const stepUrlNoFragment = stepUrl.split('#')[0] ?? stepUrl;
+      const routePathOnly =
+        finding.route && !/^https?:/.test(finding.route) ? finding.route.split('?')[0] : null;
+      // Sanity: if the step URL's path matches the route's path (or there's
+      // no route to compare against), trust it. Otherwise the agent may have
+      // pasted a different URL into the steps and we shouldn't follow that.
+      try {
+        const u = new URL(stepUrl);
+        if (!routePathOnly || u.pathname === routePathOnly || stepUrl.includes(routePathOnly)) {
+          // Prefer the URL with query params; only strip fragment when route
+          // didn't carry one.
+          const wantsHash = finding.route?.includes('#') ?? false;
+          return wantsHash ? stepUrl : stepUrlNoFragment;
+        }
+      } catch {
+        // bad URL parse — fall through.
+      }
+    }
+  }
+
+  // 2. Fall back to the bare route.
   const r = finding.route;
   if (!r) return rootUrl;
   if (/^https?:/.test(r)) return r;

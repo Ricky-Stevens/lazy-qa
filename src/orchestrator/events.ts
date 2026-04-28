@@ -207,6 +207,41 @@ export type Event =
         | 'environmental'
         | 'different_bug';
       costUsd: number;
+    }
+  | {
+      // An agent published intelligence (credentials, route, or token) to the
+      // shared knowledge store via share_with_team.
+      type: 'team.intel.share';
+      ts: string;
+      seq: number;
+      runId: string;
+      agentId: string;
+      kind: 'credentials' | 'route' | 'token';
+      added: boolean;
+      summary: string;
+      source: string;
+    }
+  | {
+      // Supervisor issued a broadcast directive to one or all agents.
+      type: 'team.broadcast';
+      ts: string;
+      seq: number;
+      runId: string;
+      message: string;
+      forProfile?: string;
+    }
+  | {
+      // try_login attempt result. Logged regardless of outcome — failure is
+      // useful signal for the supervisor too.
+      type: 'auth.try_login';
+      ts: string;
+      seq: number;
+      runId: string;
+      agentId: string;
+      username: string;
+      success: boolean;
+      detail: string;
+      postLoginUrl?: string;
     };
 
 /**
@@ -291,6 +326,12 @@ export function formatEventLine(e: Event): string | null {
       return `  ${e.agentId} playbook ${e.playbookName} → ${e.status}`;
     case 'supervisor.intervention':
       return `  ⚠ supervisor ${e.kind}  ${e.detail.slice(0, 80)}`;
+    case 'team.intel.share':
+      return `  ✦ team-intel ${e.agentId} ${e.kind}${e.added ? '' : ' (dup)'}  ${e.summary.slice(0, 80)}`;
+    case 'team.broadcast':
+      return `  ✦ team-broadcast${e.forProfile ? ` [${e.forProfile}]` : ''}  ${e.message.slice(0, 80)}`;
+    case 'auth.try_login':
+      return `  ${e.success ? '✓' : '✗'} try_login ${e.agentId} as ${e.username}  ${e.detail.slice(0, 80)}`;
     case 'critic.start':
       return `▶ critic start  findings=${e.findingCount} model=${e.model}`;
     case 'critic.verdict':

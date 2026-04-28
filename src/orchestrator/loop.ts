@@ -32,6 +32,12 @@ import type { EventWriter } from './events.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
 import type { FindingCache, KnownFindingRef } from './finding-cache.ts';
 import { consumeNudge, updateOnTurn } from './registry.ts';
+import type {
+  SharedBroadcast,
+  SharedCredential,
+  SharedDiscoveredRoute,
+  SharedKnowledge,
+} from './shared-knowledge.ts';
 import type { MemoryEntry, SummaryMemory } from './summary-memory.ts';
 
 /**
@@ -79,6 +85,10 @@ export interface LoopInput {
    *  a "Findings already reported by other agents" block in the user message
    *  so this agent skips rediscovery. */
   findingCache?: FindingCache;
+  /** Shared cross-agent intelligence store. Read at the start of every turn
+   *  to render the team intelligence block (credentials / routes / tokens)
+   *  and to drain pending broadcasts targeted at this agent. */
+  sharedKnowledge?: SharedKnowledge;
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
@@ -135,6 +145,10 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const knownFindings = input.findingCache
       ? input.findingCache.forAgent(agent.id).slice(0, 30)
       : [];
+    const sharedSnap = input.sharedKnowledge?.snapshot();
+    const broadcasts = input.sharedKnowledge
+      ? input.sharedKnowledge.consumeBroadcasts(agent.id, agent.profileName)
+      : [];
     const userContent = buildUserMessage({
       isFirstTurn: journey.turns === 0,
       targetUrl: input.targetUrl,
@@ -145,6 +159,9 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       findingsCount: journey.findings.length,
       remainingMin,
       knownFindings,
+      sharedCredentials: sharedSnap?.credentials ?? [],
+      sharedRoutes: sharedSnap?.routes ?? [],
+      broadcasts,
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -512,12 +529,25 @@ function buildUserMessage(args: {
   findingsCount: number;
   remainingMin: number;
   knownFindings: KnownFindingRef[];
+  sharedCredentials: SharedCredential[];
+  sharedRoutes: SharedDiscoveredRoute[];
+  broadcasts: SharedBroadcast[];
 }): string {
   const sections: string[] = [];
 
   if (args.nudge) {
     sections.push(`[SUPERVISOR INTERVENTION — read this first]\n${args.nudge}`);
   }
+
+  // Team broadcasts come BEFORE intelligence and findings so they catch the
+  // model's attention. They're issued by the supervisor and typically say
+  // "credentials available, log in NOW" — front-loading them is intentional.
+  for (const b of args.broadcasts) {
+    sections.push(`[TEAM BROADCAST]\n${b.message}`);
+  }
+
+  const intel = renderTeamIntel(args.sharedCredentials, args.sharedRoutes);
+  if (intel) sections.push(intel);
 
   const knownBlock = renderKnownFindings(args.knownFindings);
   if (knownBlock) sections.push(knownBlock);
@@ -542,6 +572,45 @@ function buildUserMessage(args: {
   }
 
   return sections.join('\n\n');
+}
+
+/** Render the team-intelligence block — shared credentials and discovered
+ *  routes. Empty string when both lists are empty. The credentials section
+ *  has a hard "USE THESE" instruction to nudge agents (especially the
+ *  attacker) toward calling `try_login` instead of going back to URL-guessing
+ *  after a SQLi dump. */
+function renderTeamIntel(credentials: SharedCredential[], routes: SharedDiscoveredRoute[]): string {
+  if (credentials.length === 0 && routes.length === 0) return '';
+  const lines: string[] = ['[team intelligence — discovered by other agents]'];
+
+  if (credentials.length > 0) {
+    lines.push('Credentials available — call try_login(username, password) to use them:');
+    for (const c of credentials.slice(0, 10)) {
+      const verified = c.loginVerified ? ' [verified]' : '';
+      const role = c.role ? ` role=${c.role}` : '';
+      lines.push(`  - ${c.username} : ${c.password}${role}${verified}  (source: ${c.source})`);
+    }
+    if (credentials.length > 10) {
+      lines.push(`  - ... +${credentials.length - 10} more`);
+    }
+    lines.push(
+      'If your tools include try_login, log in BEFORE continuing other exploration. Authenticated sites have a much larger surface than what you see now.',
+    );
+  }
+
+  if (routes.length > 0) {
+    lines.push('Discovered routes (not in original sitemap):');
+    for (const r of routes.slice(0, 15)) {
+      const auth = r.requiresAuth ? ' [auth-required]' : '';
+      const status = r.lastStatus > 0 ? ` (last:${r.lastStatus})` : '';
+      lines.push(`  - ${r.url}${auth}${status}  ${r.note}`.trim());
+    }
+    if (routes.length > 15) {
+      lines.push(`  - ... +${routes.length - 15} more`);
+    }
+  }
+
+  return lines.join('\n');
 }
 
 /** Render an "Already reported by other agents" block. Returns empty string

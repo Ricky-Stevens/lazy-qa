@@ -31,6 +31,7 @@ import type { EventWriter } from './events.ts';
 import type { FindingCache } from './finding-cache.ts';
 import { runAgentLoop } from './loop.ts';
 import { registerAgent, setStatus, updateOnAction } from './registry.ts';
+import type { SharedKnowledge } from './shared-knowledge.ts';
 import { SummaryMemory } from './summary-memory.ts';
 
 export interface SpawnAgentInput {
@@ -66,6 +67,11 @@ export interface SpawnAgentInput {
    *  instance so each turn the agent sees what others have already filed and
    *  skips rediscovery. */
   findingCache?: FindingCache;
+  /** Shared cross-agent intelligence store. Threads through to the harness
+   *  server (so `share_with_team` writes here), to try_login (so successful
+   *  logins auto-register the credential as verified), and to the loop (so
+   *  every turn renders the team intelligence block). */
+  sharedKnowledge?: SharedKnowledge;
 }
 
 export interface SpawnAgentResult {
@@ -77,6 +83,7 @@ export interface SpawnAgentResult {
  *  this list; the loop accepts them via the rawTools bridge. */
 export const ALLOWED_TOOL_NAMES: readonly string[] = [
   'mcp__harness__report_finding',
+  'mcp__harness__share_with_team',
   'mcp__harness__end_session',
   ...BROWSER_TOOL_NAMES,
 ];
@@ -185,6 +192,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     runDir,
     events,
     findingCache: input.findingCache,
+    sharedKnowledge: input.sharedKnowledge,
   });
   const browserKit = createBrowserMcpServer({
     getPage: () => {
@@ -201,6 +209,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     allowedHosts,
     events,
     selectorCache,
+    sharedKnowledge: input.sharedKnowledge,
   });
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the
@@ -252,6 +261,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       memoryPath,
       events,
       findingCache: input.findingCache,
+      sharedKnowledge: input.sharedKnowledge,
     });
   } catch (err) {
     if (abortController.signal.aborted) {

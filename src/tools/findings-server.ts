@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
 import type { FindingCache } from '../orchestrator/finding-cache.ts';
+import type { SharedKnowledge } from '../orchestrator/shared-knowledge.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
@@ -33,6 +34,11 @@ export interface HarnessServerInput {
    *  is registered so OTHER agents see it in their per-turn user message and
    *  skip rediscovering the same issue. */
   findingCache?: FindingCache;
+  /** Shared cross-agent intelligence store (credentials / discovered routes /
+   *  tokens). When supplied, the agent gets a `share_with_team` tool that
+   *  publishes intelligence into this store; every other agent's next turn
+   *  renders the contents. */
+  sharedKnowledge?: SharedKnowledge;
 }
 
 export function createHarnessMcpServer(
@@ -44,7 +50,7 @@ export function createHarnessMcpServer(
     'journey' in inputOrJourney
       ? inputOrJourney
       : { journey: inputOrJourney, logger: loggerArg as Logger };
-  const { journey, logger, getPage, runDir, events, findingCache } = input;
+  const { journey, logger, getPage, runDir, events, findingCache, sharedKnowledge } = input;
   const rawTools: RawToolDef[] = [];
   function defTool<S extends Record<string, z.ZodTypeAny>>(
     name: string,
@@ -203,6 +209,160 @@ export function createHarnessMcpServer(
               {
                 type: 'text',
                 text: `Finding recorded (id: ${finding.id}). Now KEEP using the app — find another bug.`,
+              },
+            ],
+          };
+        },
+      ),
+      defTool(
+        'share_with_team',
+        'Share intelligence with the team. Use this whenever you find something OTHER AGENTS could exploit: credentials (from SQLi dumps, exposed configs, FTP files, etc.), authenticated routes you discovered post-login, JWTs/bearer tokens. The supervisor sees these and may broadcast a directive to all agents; every agent\'s next turn renders the team intelligence inline. Distinct from report_finding — a finding is a bug; team intelligence is REUSABLE STATE that helps the next exploration step. Examples: dumped admin password from UNION SQLi, found "/admin/users" route that 200s with admin cookie, found JWT in localStorage post-login.',
+        {
+          kind: z.enum(['credentials', 'route', 'token']).describe('What you are sharing.'),
+          // credentials fields
+          username: z.string().optional().describe('Required if kind=credentials.'),
+          password: z.string().optional().describe('Required if kind=credentials.'),
+          role: z.string().optional().describe('Optional: role/privilege if known (e.g. admin).'),
+          // route fields
+          url: z
+            .string()
+            .optional()
+            .describe(
+              'Required if kind=route. Absolute or origin-relative URL of the discovered route.',
+            ),
+          last_status: z.number().int().optional().describe('Last HTTP status seen at this URL.'),
+          requires_auth: z
+            .boolean()
+            .optional()
+            .describe(
+              'True if this route requires authentication (observed redirect to login, or 401/403 without auth).',
+            ),
+          // token fields
+          token_kind: z
+            .enum(['jwt', 'bearer', 'cookie', 'other'])
+            .optional()
+            .describe('Required if kind=token.'),
+          token_value: z.string().optional().describe('Required if kind=token.'),
+          cookie_name: z.string().optional(),
+          // common
+          source: z
+            .string()
+            .min(5)
+            .describe(
+              'Short phrase describing where you obtained this — e.g. "UNION SQLi /rest/products/search", "ftp/users.json", "post-login localStorage".',
+            ),
+          note: z
+            .string()
+            .optional()
+            .describe('Optional extra context for the team. Visible in the intelligence block.'),
+        },
+        async (args) => {
+          if (!sharedKnowledge) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'share_with_team is unavailable in this run (no SharedKnowledge instance configured). Skipping.',
+                },
+              ],
+            };
+          }
+          const ts = new Date().toISOString();
+          let summary: string;
+          let added = false;
+          if (args.kind === 'credentials') {
+            if (!args.username || !args.password) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'share_with_team(kind=credentials) requires both username and password. Re-call with both fields.',
+                  },
+                ],
+              };
+            }
+            added = sharedKnowledge.addCredential({
+              username: args.username,
+              password: args.password,
+              role: args.role,
+              source: args.source,
+              foundBy: journey.agentId,
+              foundAt: ts,
+            });
+            summary = `credentials ${args.username}:${args.password.slice(0, 2)}*** (role=${args.role ?? 'unknown'})`;
+          } else if (args.kind === 'route') {
+            if (!args.url) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'share_with_team(kind=route) requires url. Re-call with the discovered route.',
+                  },
+                ],
+              };
+            }
+            added = sharedKnowledge.addRoute({
+              url: args.url,
+              lastStatus: args.last_status ?? -1,
+              requiresAuth: args.requires_auth ?? false,
+              note: args.note ?? '',
+              foundBy: journey.agentId,
+              foundAt: ts,
+            });
+            summary = `route ${args.url} (status=${args.last_status ?? '?'}, requiresAuth=${args.requires_auth ?? false})`;
+          } else {
+            // token
+            if (!args.token_kind || !args.token_value) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'share_with_team(kind=token) requires token_kind and token_value. Re-call with both.',
+                  },
+                ],
+              };
+            }
+            const origin = (() => {
+              try {
+                if (getPage) return new URL(getPage().url()).origin;
+              } catch {}
+              return '';
+            })();
+            added = sharedKnowledge.addToken({
+              kind: args.token_kind,
+              value: args.token_value,
+              cookieName: args.cookie_name,
+              origin,
+              source: args.source,
+              foundBy: journey.agentId,
+              foundAt: ts,
+            });
+            summary = `token kind=${args.token_kind} (length=${args.token_value.length})`;
+          }
+          // Always emit an event — the durable record. `added=false` means
+          // dedup hit; the team already had it.
+          await events?.write({
+            type: 'team.intel.share',
+            agentId: journey.agentId,
+            kind: args.kind,
+            added,
+            summary,
+            source: args.source,
+          });
+          logger.info('team.intel.share', {
+            agentId: journey.agentId,
+            kind: args.kind,
+            added,
+            summary,
+            source: args.source,
+          });
+          return {
+            content: [
+              {
+                type: 'text',
+                text: added
+                  ? `Shared with team: ${summary}. Other agents will see this on their next turn. ${args.kind === 'credentials' ? 'CRITICAL: now call try_login(username, password) to use these credentials yourself before continuing.' : ''}`
+                  : `Already known to team: ${summary}. No new entry added.`,
               },
             ],
           };
