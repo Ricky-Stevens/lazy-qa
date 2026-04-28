@@ -89,6 +89,11 @@ export interface LoopInput {
    *  to render the team intelligence block (credentials / routes / tokens)
    *  and to drain pending broadcasts targeted at this agent. */
   sharedKnowledge?: SharedKnowledge;
+  /** Pre-resolved session identity. When present, every per-turn user message
+   *  starts with `[session: authenticated as <user> (role=<role>) — DO NOT
+   *  log out, DO NOT re-attempt login]` so the agent knows it's already
+   *  authed via inherited storageState. */
+  sessionInfo?: { username: string; role?: string };
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
@@ -162,6 +167,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       sharedCredentials: sharedSnap?.credentials ?? [],
       sharedRoutes: sharedSnap?.routes ?? [],
       broadcasts,
+      sessionInfo: input.sessionInfo,
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -532,8 +538,21 @@ function buildUserMessage(args: {
   sharedCredentials: SharedCredential[];
   sharedRoutes: SharedDiscoveredRoute[];
   broadcasts: SharedBroadcast[];
+  sessionInfo?: { username: string; role?: string };
 }): string {
   const sections: string[] = [];
+
+  // Session banner — appears FIRST on every turn so the agent always knows
+  // it's already authenticated. Without this, agents that inherited auth via
+  // storageState would burn turns re-firing try_login against the inherited
+  // session (the page at /login looks like a normal login form even when
+  // the cookie+localStorage already carry a valid token).
+  if (args.sessionInfo) {
+    const roleStr = args.sessionInfo.role ? ` (role=${args.sessionInfo.role})` : '';
+    sections.push(
+      `[session: AUTHENTICATED as ${args.sessionInfo.username}${roleStr}] You are already logged in via inherited storageState (cookies + localStorage carry a valid session token). DO NOT call try_login. DO NOT log out under ANY circumstances. DO NOT navigate to /logout, /signout, /sign-out, or click any "Logout"/"Sign out" link — even by accident. If team intelligence credentials match this session, ignore them. Spend your turns exercising authenticated functionality.`,
+    );
+  }
 
   if (args.nudge) {
     sections.push(`[SUPERVISOR INTERVENTION — read this first]\n${args.nudge}`);

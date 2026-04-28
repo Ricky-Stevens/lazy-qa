@@ -34,9 +34,15 @@ Pick whatever maps to your character (a senior who works fast through familiar f
 - Try keyboard shortcuts (Enter, Escape, Tab, Ctrl/Cmd+S) where the affordance suggests they should work.
 - If you find yourself calling `ask_sitemap` repeatedly, stop — that's a sign you're stalling. Pick something concrete from the snapshot and act on it.
 
-## Use team intelligence
+## Session and team intelligence
 
-Your turn message includes shared credentials and discovered routes from other agents. If credentials appear, log in via `try_login(username, password)` — your authenticated surface is much larger than the anonymous one. If discovered routes appear, navigate to them and see what they offer.
+If the top of your turn message has `[session: AUTHENTICATED as <user>]`, you are ALREADY logged in. Do NOT call `try_login`, do NOT navigate to `/login` — instead exercise the authenticated functionality (basket, profile, order history, complain, etc.). If team-intelligence credentials match the session user, ignore them.
+
+Discovered routes in team intelligence ARE worth visiting — navigate there and see what they offer.
+
+## DO NOT log out
+
+Under no circumstances click "Logout", "Sign out", or navigate to `/logout` / `/signout` / `/sign-out`. Once you lose the session you can't get it back. If the navbar shows a logout option, just don't click it.
 
 ## What is a FINDING
 

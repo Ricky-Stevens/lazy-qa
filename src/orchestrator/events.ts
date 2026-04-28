@@ -242,6 +242,30 @@ export type Event =
       success: boolean;
       detail: string;
       postLoginUrl?: string;
+    }
+  | {
+      // Site-playbook generator: starting analysis of the crawler's sitemap.
+      type: 'site-playbook.start';
+      ts: string;
+      seq: number;
+      runId: string;
+      rootUrl: string;
+      routeCount: number;
+      personas: string[];
+      model: string;
+    }
+  | {
+      // Site-playbook generator: analysis finished (success or failure).
+      type: 'site-playbook.complete';
+      ts: string;
+      seq: number;
+      runId: string;
+      ok: boolean;
+      siteShape: string;
+      personas: string[];
+      costUsd: number;
+      durationMs: number;
+      detail?: string;
     };
 
 /**
@@ -332,6 +356,12 @@ export function formatEventLine(e: Event): string | null {
       return `  ✦ team-broadcast${e.forProfile ? ` [${e.forProfile}]` : ''}  ${e.message.slice(0, 80)}`;
     case 'auth.try_login':
       return `  ${e.success ? '✓' : '✗'} try_login ${e.agentId} as ${e.username}  ${e.detail.slice(0, 80)}`;
+    case 'site-playbook.start':
+      return `▶ site-playbook  routes=${e.routeCount} personas=${e.personas.length} model=${e.model}`;
+    case 'site-playbook.complete':
+      return e.ok
+        ? `■ site-playbook  shape=${e.siteShape} personas=${e.personas.length} cost=$${e.costUsd.toFixed(4)} ${e.durationMs}ms`
+        : `■ site-playbook FAILED  ${(e.detail ?? '').slice(0, 80)}`;
     case 'critic.start':
       return `▶ critic start  findings=${e.findingCount} model=${e.model}`;
     case 'critic.verdict':

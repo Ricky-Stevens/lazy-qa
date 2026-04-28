@@ -6,6 +6,7 @@
  */
 
 import type { PageModel } from '../page-model/types.ts';
+import { isHostAllowed } from '../safety/guards.ts';
 import type { RouteEntry, SiteMap, SiteMapAccessor } from './types.ts';
 
 type PlaybookOutcomeStatus = 'ok' | 'failed' | 'suspicious';
@@ -14,6 +15,7 @@ type PlaybookOutcomeStatus = 'ok' | 'failed' | 'suspicious';
 export class SiteMapImpl implements SiteMapAccessor {
   private readonly startedAt: string;
   private readonly rootUrl: string;
+  private readonly allowedHosts: string[];
   private readonly routes = new Map<string, RouteEntry>();
   private readonly pageModels = new Map<string, PageModel>();
   /**
@@ -24,9 +26,10 @@ export class SiteMapImpl implements SiteMapAccessor {
    */
   private readonly playbookAttempts = new Map<string, Set<string>>();
 
-  constructor(opts: { rootUrl: string; startedAt?: string }) {
+  constructor(opts: { rootUrl: string; startedAt?: string; allowedHosts?: string[] }) {
     this.rootUrl = opts.rootUrl;
     this.startedAt = opts.startedAt ?? new Date().toISOString();
+    this.allowedHosts = opts.allowedHosts ?? [];
   }
 
   getRoute(route: string): RouteEntry | undefined {
@@ -104,6 +107,15 @@ export class SiteMapImpl implements SiteMapAccessor {
   }
 
   upsertRoute(entry: RouteEntry, model: PageModel): void {
+    // Host filter — drop entries that aren't on the configured allowlist.
+    // Without this, a stray external link in the page (e.g. a github.com
+    // anchor in a footer) leaks into "unvisited routes" and agents waste
+    // turns trying to navigate off-host. Only enforced when allowedHosts
+    // was supplied — backward-compatible with callers that don't pass it.
+    if (this.allowedHosts.length > 0) {
+      const candidate = entry.url || entry.route;
+      if (!isHostAllowed(candidate, this.allowedHosts)) return;
+    }
     const existing = this.routes.get(entry.route);
     const merged: RouteEntry = {
       ...entry,

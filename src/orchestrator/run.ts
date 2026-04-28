@@ -30,14 +30,17 @@ import type { Logger } from '../logging/logger.ts';
 import { createLogger } from '../logging/logger.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
 import { loadSkills } from '../skills/loader.ts';
+import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import { SelectorCache } from '../tools/selector-cache.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+import { runAuthAgent } from './auth-agent.ts';
 import { EventWriter, formatEventLine } from './events.ts';
 import { FindingCache } from './finding-cache.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
 import { SharedKnowledge } from './shared-knowledge.ts';
+import { generateSitePlaybook, type SitePlaybookResult } from './site-playbook.ts';
 import { spawnAgent } from './spawn-agent.ts';
 import { runSupervisor } from './supervisor.ts';
 
@@ -174,15 +177,52 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     process.once('SIGINT', () => handleSignal('SIGINT'));
     process.once('SIGTERM', () => handleSignal('SIGTERM'));
 
-    // 8. Pre-run crawl. Open a temporary tab on the shared session — first
-    // call here triggers login, every subsequent agent's acquireSession()
-    // shares the same authed context. Persist the sitemap to disk before
-    // spawning agents so the run is debuggable from the moment crawling
-    // finishes.
     const firstAgent = agents[0];
     if (!firstAgent) {
       throw new Error('runScan: no agents resolved from config');
     }
+
+    // 7a. AI-driven authentication phase. Replaces the brittle CSS-selector
+    // form-fill — a small Haiku agent reads the page, dismisses banners,
+    // fills the form, and verifies success. On success the captured
+    // storageState is written to runs/<runId>/auth-state.json; the crawler
+    // and every agent session below loads it and inherits the auth.
+    let sessionInfo: { username: string; role?: string } | undefined;
+    if (cfg.target.auth.type === 'form' && firstAgent.credentials) {
+      const authStatePath = path.join(runDir, 'auth-state.json');
+      const authResult = await runAuthAgent({
+        targetUrl: cfg.target.url,
+        loginUrl: cfg.target.auth.login_url,
+        credentials: firstAgent.credentials,
+        allowedHosts: cfg.target.allowed_hosts,
+        apiKey,
+        // Haiku is plenty for login-form filling and is the cheap path.
+        model: 'claude-haiku-4-5-20251001',
+        storageStatePath: authStatePath,
+        logger: logger.child({ phase: 'auth-agent' }),
+        events,
+        stealth: cfg.target.stealth,
+        abortSignal: runAbortController.signal,
+      });
+      if (!authResult.ok) {
+        // Non-fatal: log and continue. Agents will still try to log in via
+        // their own session-pool path (which falls back to selector form-fill
+        // if auth-state.json is absent).
+        logger.warn('auth-agent.unsuccessful', {
+          detail: authResult.detail,
+          turns: authResult.turns,
+          costUsd: authResult.costUsd.toFixed(4),
+        });
+      } else {
+        sessionInfo = authResult.sessionInfo;
+      }
+    }
+
+    // 8. Pre-run crawl. Open a temporary tab on the shared session — first
+    // call here triggers login (or loads auth-state.json), every subsequent
+    // agent's acquireSession() shares the same authed context. Persist the
+    // sitemap to disk before spawning agents so the run is debuggable from
+    // the moment crawling finishes.
 
     const crawlerLogger = logger.child({ phase: 'crawl' });
     let siteMap: SiteMapImpl;
@@ -248,11 +288,63 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     siteMap = new SiteMapImpl({
       rootUrl: crawledMap.rootUrl,
       startedAt: crawledMap.startedAt,
+      allowedHosts: cfg.target.allowed_hosts,
     });
     for (const route of Object.values(crawledMap.routes)) {
       const model = crawledMap.pageModels[route.route];
       if (!model) continue;
       siteMap.upsertRoute(route, model);
+    }
+
+    // 8a. Site-playbook generation. Sonnet reads the crawler's sitemap and
+    // produces a per-persona concrete plan ("on /#/foo click X then go to
+    // /#/bar"). This separates persona character (who you are) from
+    // site-specific intent (what to do here), which fixes the regression
+    // where personas navigated without ever completing a flow.
+    //
+    // Best-effort: failure is non-fatal. Agents fall back to persona-only
+    // prompts. The result is persisted to runs/<runId>/site-playbook.json
+    // so the operator can inspect what was generated, but the run does NOT
+    // wait for human approval — it proceeds immediately.
+    let sitePlaybook: SitePlaybookResult | null = null;
+    try {
+      // Site-playbook is for HONEST personas only. The attacker has its own
+      // OWASP-driven methodology in its persona body and should be free to
+      // attack whatever it likes — not constrained to the visible site shape.
+      // Filtering here also saves Sonnet output tokens (no attacker brief
+      // generated that we'd then discard).
+      const personaBriefs = Array.from(
+        new Map(
+          agents
+            .filter((a) => !ATTACKER_PROFILES.has(a.profileName))
+            .map((a) => {
+              const persona = skillsBundle.personas.get(a.profileName);
+              return [a.profileName, persona?.description ?? a.profileName];
+            }),
+        ).entries(),
+      ).map(([name, description]) => ({ name, description }));
+
+      sitePlaybook = await generateSitePlaybook({
+        rootUrl: cfg.target.url,
+        sitemap: crawledMap,
+        personas: personaBriefs,
+        apiKey,
+        model: 'claude-sonnet-4-6',
+        logger: logger.child({ phase: 'site-playbook' }),
+        events,
+        abortSignal: runAbortController.signal,
+      });
+
+      await writeFile(
+        path.join(runDir, 'site-playbook.json'),
+        JSON.stringify(sitePlaybook, null, 2),
+        'utf8',
+      );
+    } catch (err) {
+      // Non-fatal — log and continue without a playbook.
+      logger.warn('site-playbook.crashed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     // 9. Resolve and initialise the per-target memory directory. Created once
@@ -311,6 +403,10 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         selectorCache,
         findingCache,
         sharedKnowledge,
+        sessionInfo,
+        sitePlaybookText: sitePlaybook?.perPersona[agent.profileName],
+        siteSummary: sitePlaybook?.siteSummary,
+        siteShape: sitePlaybook?.siteShape,
       }),
     );
 

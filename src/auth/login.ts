@@ -1,4 +1,4 @@
-import { chmod, mkdir } from 'node:fs/promises';
+import { access, chmod, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { chromium as playwrightChromium } from 'playwright';
@@ -205,9 +205,60 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
     );
   }
 
+  // Auth-agent path: when a `<runDir>/auth-state.json` file exists, the
+  // pre-run AI auth-agent has already logged in and persisted the session.
+  // Skip the selector form-fill entirely — load the stored state instead.
+  // This is the new default; the form-fill below is a fallback for runs
+  // where the auth-agent failed or was never invoked.
+  const authStatePath = path.join(runDir, 'auth-state.json');
+  const authStateExists = await access(authStatePath)
+    .then(() => true)
+    .catch(() => false);
+
+  if (authStateExists) {
+    logger.info('login.storageState.use', { agentId, authStatePath });
+    const browser = await launchChrome();
+    try {
+      const context = await browser.newContext({ storageState: authStatePath });
+      // Match the post-login allowlist behaviour the form-fill path sets up.
+      await context.route('**/*', async (route) => {
+        const req = route.request();
+        const type = req.resourceType();
+        if (type !== 'document' && type !== 'xhr' && type !== 'fetch') {
+          return route.continue();
+        }
+        if (isHostAllowed(req.url(), allowedHosts)) return route.continue();
+        logger.warn('browser.route.blocked', { url: req.url(), type });
+        return route.abort('blockedbyclient');
+      });
+      const page = await context.newPage();
+      await page
+        .goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+        .catch((err) => {
+          logger.warn('login.storageState.goto.failed', {
+            agentId,
+            targetUrl,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      // Persist a forensic snapshot of the LIVE state (post-storageState load
+      // + initial nav) for post-mortem debugging.
+      await context
+        .storageState({ path: storageStatePath, indexedDB: true })
+        .catch(() => undefined);
+      await chmod(storageStatePath, 0o600).catch(() => undefined);
+      logger.info('login.success', { agentId, currentUrl: page.url(), via: 'storageState' });
+      return { browser, context, page, storageStatePath };
+    } catch (err) {
+      await browser.close().catch(() => undefined);
+      throw err;
+    }
+  }
+
+  // ── Fallback: selector form-fill path (used when no auth-state.json) ──
   const loginUrl = auth.login_url ?? targetUrl;
 
-  logger.info('login.start', { agentId, loginUrl });
+  logger.info('login.start', { agentId, loginUrl, via: 'form-fill-fallback' });
 
   const browser = await launchChrome();
   try {
@@ -219,6 +270,12 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
     const page = await context.newPage();
 
     await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+    // Dismiss cookie / welcome banners BEFORE filling the form. Without this,
+    // GDPR-banner-wearing apps (Juice Shop's cookie+welcome stack) leave a
+    // modal overlay that intercepts the submit button click and the login
+    // times out.
+    await dismissPersistentBanners(page, logger.child({ agentId, phase: 'auto-dismiss' }));
 
     await fillAuthForm(page, auth, credentials);
 
@@ -266,12 +323,23 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
  * blocked-by-modal until both modals close.
  */
 const PERSISTENT_BANNER_PATTERNS: Array<{ name: string; locator: string }> = [
+  // cookieconsent library — Juice Shop uses this. The dismiss target is an
+  // <a class="cc-btn cc-dismiss"> with text "Me want it!" (or app-specific).
+  // Matched by class because the role is link, not button, and the visible
+  // text varies per deployment.
+  { name: 'cookieconsent-dismiss', locator: 'a.cc-btn.cc-dismiss, a.cc-dismiss' },
+  { name: 'cookieconsent-allow', locator: 'a.cc-btn.cc-allow' },
   // GDPR / cookie banners — broadest match patterns, all dismiss intents.
   { name: 'cookie-dismiss', locator: 'role=button[name=/dismiss cookie|dismiss/i]' },
   { name: 'cookie-accept', locator: 'role=button[name=/accept cookies|accept all|accept/i]' },
-  { name: 'cookie-got-it', locator: 'role=button[name=/got it|i agree|ok/i]' },
+  { name: 'cookie-got-it', locator: 'role=button[name=/got it|i agree|^ok$|me want/i]' },
   // Welcome / splash overlays.
   { name: 'welcome-close', locator: 'role=button[name=/close welcome|close banner|got it!/i]' },
+  // Angular Material snackbar dismiss — Juice Shop's welcome banner.
+  {
+    name: 'mat-snackbar-dismiss',
+    locator: 'button.mat-mdc-snack-bar-action, button[mat-button]:has-text("Dismiss")',
+  },
   // Material / Bootstrap dialog close buttons (last-ditch).
   { name: 'mat-dialog-close', locator: 'button[mat-dialog-close]' },
   { name: 'aria-close-dialog', locator: 'role=dialog >> role=button[name=/^close$/i]' },

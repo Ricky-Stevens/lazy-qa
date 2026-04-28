@@ -8,8 +8,10 @@
 # Output:   runs/<runId>/{findings.json, review.md, summary.md, journeys/}
 #
 # Why Juice Shop? It's deliberately broken in well-known ways, so a fresh
-# clone can verify the harness end-to-end without needing real credentials
-# or a target portal. Compare findings against http://localhost:3000/#/score-board.
+# clone can verify the harness end-to-end. The seeded admin account
+# (admin@juice-sh.op / admin123) is the default — supply it in .env as
+# JUICE_SHOP_USER / JUICE_SHOP_PASS. Compare findings against
+# http://localhost:3000/#/score-board.
 #
 # Sections in this file are roughly ordered: REQUIRED on top, then optional /
 # tunable. Commented-out blocks show defaults — uncomment to override.
@@ -24,21 +26,21 @@ target:
     - localhost:3000
 
   auth:
-    # 'none' (public site, OR supply pre-built storage_state_path) | 'form'
-    # (orchestrator fills the login form). Juice Shop's interesting bugs all
-    # reproduce against unauthenticated routes too — start with 'none' and
-    # layer in registered credentials later.
-    type: none
+    # 'form' = pre-run AI auth-agent (Haiku) navigates to the login URL,
+    # dismisses banners, fills the form, and verifies success. The captured
+    # storageState is then loaded by the crawler and every persona session.
+    # 'none' = anonymous browsing only (no auth-agent runs).
+    #
+    # The auth-agent reads the page semantically — it doesn't need brittle
+    # CSS selectors and handles GDPR banners, multi-step flows, and
+    # framework-specific button quirks (e.g. Angular Material's <a class
+    # ="cc-dismiss"> "Me want it!" cookie button on Juice Shop) without
+    # configuration. Just supply credentials.
+    type: form
+    login_url: http://localhost:3000/#/login
 
-    # ─── Form auth (uncomment when targeting a real portal) ──────────────
-    # type: form
-    # login_url: https://your-app.example.com/login
-    # username_selector: 'input[name="username"]'
-    # password_selector: 'input[name="password"]'
-    # submit_selector: 'button[type="submit"]'
-    # success_url_pattern: '^https://your-app\.example\.com/dashboard'
-    # # Optional: pre-built storage state from `bunx playwright codegen`
-    # # storage_state_path: ./fixtures/your-app-session.json
+    # ─── Anonymous-only browsing (uncomment to revert) ───────────────────
+    # type: none
 
   # Default Playwright Chromium — Juice Shop has no bot-detection. Set true
   # for targets behind Cloudflare / DataDome / similar.
@@ -80,7 +82,7 @@ selector_cache:
   enabled: true                     # persistent locator cache for find_and_click
 
 run:
-  max_budget_usd: 3.00              # informational cap; per-agent budgets enforce
+  max_budget_usd: 6.00              # informational cap; per-agent budgets enforce
   output_dir: ./runs
 
 memory:
@@ -103,41 +105,58 @@ agents:
   #   credentials         env-var names (values stay in .env)
   #   budget              per-agent caps (turns, USD, minutes)
 
+  # Default Juice Shop credentials — `admin@juice-sh.op:admin123` is the seeded
+  # admin from the demo fixtures. Add to your .env as JUICE_SHOP_USER and
+  # JUICE_SHOP_PASS. Every agent shares ONE login (session-pool dedups by
+  # credentials), so the actual Auth0/login form fills only once per run.
+
   - id: attacker
     profile: insider-attacker
     model: claude-sonnet-4-6
     max_thinking_tokens: 2000
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
     budget:
-      max_minutes: 6
-      max_turns: 120
-      max_usd: 0.80
+      max_minutes: 15
+      max_turns: 250
+      max_usd: 2.00
 
   - id: power-user
     profile: power-user
     model: claude-haiku-4-5-20251001
     max_thinking_tokens: 1024
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
     budget:
-      max_minutes: 5
-      max_turns: 200
-      max_usd: 0.50
+      max_minutes: 10
+      max_turns: 250
+      max_usd: 0.80
 
   - id: chaos
     profile: chaos-clicker
     model: claude-haiku-4-5-20251001
     max_thinking_tokens: 1024
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
     budget:
-      max_minutes: 5
-      max_turns: 200
-      max_usd: 0.40
+      max_minutes: 10
+      max_turns: 250
+      max_usd: 0.60
 
   - id: completionist
     profile: completionist
     model: claude-sonnet-4-6
     max_thinking_tokens: 1500
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
     budget:
-      max_minutes: 6
-      max_turns: 200
-      max_usd: 0.80
+      max_minutes: 12
+      max_turns: 250
+      max_usd: 1.20
 
   # ─── Orphan example: confused-newcomer (uncomment to add) ───────────────
   # First-time user who reads every label and panics at jargon. Catches UX
@@ -146,21 +165,10 @@ agents:
   #   profile: confused-newcomer
   #   model: claude-haiku-4-5-20251001
   #   max_thinking_tokens: 1024
+  #   credentials:
+  #     username_env: JUICE_SHOP_USER
+  #     password_env: JUICE_SHOP_PASS
   #   budget:
   #     max_minutes: 5
   #     max_turns: 200
   #     max_usd: 0.40
-
-  # ─── Authenticated example (uncomment when target.auth.type is 'form') ──
-  # Per-agent credentials — values come from .env via the env-var names below.
-  # - id: power-user-authed
-  #   profile: power-user
-  #   model: claude-haiku-4-5-20251001
-  #   max_thinking_tokens: 1024
-  #   credentials:
-  #     username_env: PORTAL_USER
-  #     password_env: PORTAL_PASS
-  #   budget:
-  #     max_minutes: 5
-  #     max_turns: 200
-  #     max_usd: 0.50

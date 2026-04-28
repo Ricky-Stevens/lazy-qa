@@ -86,6 +86,45 @@ export interface ReviewResult {
   verifyCostUsd: number;
 }
 
+/** Patterns recognised by the critic rule-floor. A finding whose route
+ *  matches AND whose body/title looks like real exposure cannot be flipped
+ *  below `likely_bug` by the critic — verifier still re-checks. Patterns
+ *  are intentionally conservative: only paths whose 200 with non-trivial
+ *  body is mechanically a real bug regardless of app shape. */
+const RULE_FLOOR_PATTERNS: ReadonlyArray<RegExp> = [
+  /\/\.git\/HEAD\b/,
+  /\/\.git\/config\b/,
+  /\/\.env(?:[/?#]|$)/,
+  /\/api-docs\b/,
+  /\/swagger\.json\b/,
+  /\/swagger-ui\b/,
+  /\/metrics\b/,
+  /\/actuator\/(?:env|heapdump|threaddump|mappings)\b/,
+  /\/ftp\/?(?:[?#]|$)/,
+];
+
+/** Apply the critic rule-floor. If the finding's route matches a high-signal
+ *  pattern AND the agent's report indicates real exposure (mention of 200 /
+ *  publicly accessible / etc), refuse classifications below `likely_bug`. */
+function applyRuleFloor(finding: Finding, current: ReviewClassification): ReviewClassification {
+  if (current === 'confirmed_bug' || current === 'likely_bug') return current;
+  const route = finding.route ?? '';
+  const matches = RULE_FLOOR_PATTERNS.some((re) => re.test(route));
+  if (!matches) return current;
+  // Sanity-check against the finding text — agents sometimes file findings
+  // that MENTION these paths but aren't about exposure (e.g. "/ftp link in
+  // navbar is broken"). We only floor when the report indicates real
+  // exposure: status 200 OR explicit "publicly accessible / exposed" prose.
+  const hay =
+    `${finding.title} ${finding.description} ${finding.actual} ${finding.expected}`.toLowerCase();
+  const looksLikeExposure =
+    /\b200\b/.test(hay) ||
+    /publicly accessible|publicly exposed|exposed without auth|accessible without auth/.test(hay) ||
+    /directory listing|stack trace|secret|credential/.test(hay);
+  if (!looksLikeExposure) return current;
+  return 'likely_bug';
+}
+
 /** Apply a verify verdict to a review item. Returns a (possibly new) review
  *  item with classification adjusted per the merge rules. The verifier never
  *  *upgrades* a finding — it only confirms or downgrades — so this is a safe
@@ -514,6 +553,27 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   for (const entry of reviews) {
     if (entry.review.duplicateOf && !findingsById.has(entry.review.duplicateOf)) {
       entry.review.duplicateOf = undefined;
+    }
+  }
+
+  // Critic rule-floor — protect deterministically-real findings from critic
+  // variance. Across runs we've seen `/metrics`, `/api-docs`, `/.git/HEAD`,
+  // `/ftp/` etc. flip between `confirmed_bug` and `not_a_bug` on identical
+  // evidence. The critic's job is interpretation; for a small set of routes
+  // the answer is mechanical (200 with non-shell body = exposure). This step
+  // floors those to at least `likely_bug` so the verifier still re-checks
+  // them but they can't be silently dropped.
+  for (const entry of reviews) {
+    const flooredVerdict = applyRuleFloor(entry.finding, entry.review.classification);
+    if (flooredVerdict !== entry.review.classification) {
+      logger.info('review.rulefloor.applied', {
+        findingId: entry.finding.id,
+        from: entry.review.classification,
+        to: flooredVerdict,
+        route: entry.finding.route,
+      });
+      entry.review.classification = flooredVerdict;
+      entry.review.reasoning = `[rule-floor] ${entry.review.reasoning ?? ''}`;
     }
   }
 

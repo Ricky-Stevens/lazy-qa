@@ -67,7 +67,17 @@ export interface RawToolDef {
   handler: (
     args: Record<string, unknown>,
   ) => Promise<{ content: { type: 'text'; text: string }[] }>;
+  /** When true, only agents whose profileName is in `ATTACKER_PROFILES` see
+   *  this tool. Used for primitives that are only valuable to attack-flavoured
+   *  personas (raw HTTP, JWT decode, storage inspect, JS evaluate). Functional
+   *  personas don't need them and granting them encourages security drift. */
+  attackerOnly?: boolean;
 }
+
+/** Profiles considered "attacker-flavoured". Tools marked `attackerOnly` are
+ *  only exposed to agents whose profileName matches. Listed here (not on the
+ *  tool definitions themselves) so we can add new attacker profiles centrally. */
+export const ATTACKER_PROFILES: ReadonlySet<string> = new Set(['insider-attacker']);
 
 export interface BrowserServerInput {
   /** Returns the page the agent should drive. Closure-style so caller can
@@ -136,6 +146,101 @@ function renderAxTree(node: AxNode, maxDepth: number, depth = 0): string {
     .filter(Boolean)
     .join('\n');
   return children ? `${self}\n${children}` : self;
+}
+
+/** Detect whether the page's browser context is already authenticated as the
+ *  given username. Returns a short evidence string when matched, null otherwise.
+ *  Looks at:
+ *   1. localStorage `token`-shaped entries (decoded JWT email/sub matches)
+ *   2. Cookies `token`-shaped entries (decoded JWT email/sub matches)
+ *   3. Generic session cookies (length > 16) — when no JWT decodes successfully,
+ *      we accept "session-shaped cookie present" as evidence to skip the
+ *      re-login. The username comparison is best-effort.
+ *
+ *  This is the short-circuit used by try_login to avoid re-filling the login
+ *  form when an agent has already inherited auth via storageState. */
+async function detectExistingAuth(
+  page: import('playwright').Page,
+  username: string,
+): Promise<string | null> {
+  // 1. localStorage tokens — Juice Shop puts the JWT here under `token`.
+  const lsHit = await page
+    .evaluate(() => {
+      try {
+        const ls = (globalThis as { localStorage?: Storage }).localStorage;
+        if (!ls) return null;
+        const candidates: Array<{ key: string; value: string }> = [];
+        for (let i = 0; i < ls.length; i += 1) {
+          const k = ls.key(i);
+          if (!k) continue;
+          if (/token|jwt|auth|session|access/i.test(k)) {
+            const v = ls.getItem(k) ?? '';
+            if (v.length >= 16) candidates.push({ key: k, value: v });
+          }
+        }
+        return candidates;
+      } catch {
+        return null;
+      }
+    })
+    .catch(() => null);
+  if (lsHit && lsHit.length > 0) {
+    for (const cand of lsHit) {
+      const claim = decodeJwtClaim(cand.value);
+      if (claim && claimMatchesUser(claim, username)) {
+        return `localStorage[${cand.key}] JWT matches ${username}`;
+      }
+    }
+    // No JWT match — the bare presence of a session-shaped key is still
+    // strong evidence the storageState carried an auth from a previous phase.
+    return `localStorage[${lsHit[0]?.key}] session value present`;
+  }
+
+  // 2. Cookies — fall back when localStorage was empty.
+  try {
+    const cookies = await page.context().cookies(page.url());
+    for (const c of cookies) {
+      if (!/token|jwt|auth|session/i.test(c.name)) continue;
+      if (c.value.length < 16) continue;
+      const claim = decodeJwtClaim(c.value);
+      if (claim && claimMatchesUser(claim, username)) {
+        return `cookie[${c.name}] JWT matches ${username}`;
+      }
+      return `cookie[${c.name}] session value present`;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/** Best-effort JWT-payload decode. Returns null on any structural failure. */
+function decodeJwtClaim(token: string): Record<string, unknown> | null {
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const pad = (s: string): string => s + '='.repeat((4 - (s.length % 4)) % 4);
+    const std = (parts[1] ?? '').replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = Buffer.from(pad(std), 'base64').toString('utf8');
+    return JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Walk a JWT claim looking for the requested username. Juice Shop nests it
+ *  under `data.email`; many providers use `email` or `sub` at the top level. */
+function claimMatchesUser(claim: Record<string, unknown>, username: string): boolean {
+  const target = username.toLowerCase();
+  function walk(node: unknown): boolean {
+    if (typeof node === 'string') return node.toLowerCase() === target;
+    if (Array.isArray(node)) return node.some((n) => walk(n));
+    if (node && typeof node === 'object') {
+      for (const v of Object.values(node)) if (walk(v)) return true;
+    }
+    return false;
+  }
+  return walk(claim);
 }
 
 /** Strip query/fragment so /clients?page=2 and /clients/123 count as the same area. */
@@ -526,6 +631,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     handler: (args: { [K in keyof S]: z.infer<S[K]> }) => Promise<{
       content: { type: 'text'; text: string }[];
     }>,
+    options?: { attackerOnly?: boolean },
   ) {
     rawTools.push({
       name,
@@ -534,6 +640,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       handler: handler as (args: Record<string, unknown>) => Promise<{
         content: { type: 'text'; text: string }[];
       }>,
+      attackerOnly: options?.attackerOnly,
     });
     return tool(name, description, shape, handler as never);
   }
@@ -772,20 +879,36 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
 
     defTool(
       'evaluate',
-      'Run a small JS expression in the page and return its JSON-stringified result. Read-only inspection only (document.title, localStorage, performance entries). Do NOT use to mutate state.',
+      'Run a small JS expression OR multi-statement body in the page and return its JSON-stringified result. Read-only inspection only (document.title, localStorage, performance entries). Multi-statement bodies (containing `;`) are supported automatically — the wrapper falls back to body-mode on syntax error. Do NOT use to fetch — `fetch_resource` / `request_with_session` are the right tools for that.',
       { expression: z.string().min(1).max(2000) },
       async ({ expression }) => {
         const page = ensureListeners();
         await awaitPauseIfNeeded();
+        // Two-pass evaluation: try expression-mode first (single expression
+        // wrapped in parens — succeeds for `localStorage.length`,
+        // `document.title.toUpperCase()` etc.). If that produces a SyntaxError,
+        // fall back to body-mode (multi-statement function body — succeeds
+        // for `localStorage.setItem('foo','bar'); 'done'`). Without the
+        // body-mode fallback the attacker's typical "set a token then probe
+        // it" patterns hit `SyntaxError: Unexpected token ';'` at the wrapper.
+        const exprWrapped = `async () => { try { return JSON.stringify(await Promise.resolve((${expression}))); } catch (e) { try { return String(await Promise.resolve((${expression}))); } catch (e2) { return 'evaluate threw: ' + (e2 && e2.message || String(e2)); } } }`;
+        const bodyWrapped = `async () => { try { const __r = await (async () => { ${expression} })(); return typeof __r === 'undefined' ? 'undefined' : JSON.stringify(__r); } catch (e) { return 'evaluate threw: ' + (e && e.message || String(e)); } }`;
+        async function runWrapped(wrapped: string): Promise<string> {
+          return (page.evaluate as unknown as (fn: string) => Promise<string>)(wrapped);
+        }
         try {
-          // Async wrapper so the expression can use top-level `await` (e.g.
-          // `await fetch('/api/foo').then(r=>r.json())`). page.evaluate
-          // resolves the returned promise. We Promise.resolve() the inner
-          // expression so a non-promise value is also valid.
-          const wrapped = `async () => { try { return JSON.stringify(await Promise.resolve((${expression}))); } catch (e) { try { return String(await Promise.resolve((${expression}))); } catch (e2) { return 'evaluate threw: ' + (e2 && e2.message || String(e2)); } } }`;
-          const result = await (page.evaluate as unknown as (fn: string) => Promise<string>)(
-            wrapped,
-          );
+          let result: string;
+          try {
+            result = await runWrapped(exprWrapped);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (/SyntaxError/.test(msg)) {
+              // Almost certainly a multi-statement body — retry with body wrapper.
+              result = await runWrapped(bodyWrapped);
+            } else {
+              throw err;
+            }
+          }
           // result is the JSON.stringify output from the page. Parse it back so
           // deepRedact can walk the object tree and strip secret-keyed fields.
           // If the result is not valid JSON (e.g. the String() fallback fired),
@@ -806,6 +929,134 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           return textResult(`evaluate failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       },
+      { attackerOnly: true },
+    ),
+
+    defTool(
+      'fetch_resource',
+      "Plain HTTP GET (or other method) of a URL on the same origin or any allowed host. Cookie-less by default — does NOT use the agent's session cookies. Returns the response status, headers, and body (truncated to 4 KB). Use this for: reading exposed paths (.git/HEAD, .env, swagger.json), reading JSON API responses without rendering them, fetching response bodies that the SPA shell would otherwise hide. For session-aware requests use `request_with_session` instead.",
+      {
+        url: z.string().url(),
+        method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+        body: z.string().optional(),
+      },
+      async ({ url, method, headers, body }) => {
+        if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
+          return textResult(`fetch_resource refused: ${url} not in allowed_hosts.`);
+        }
+        const startedAt = Date.now();
+        try {
+          const resp = await fetch(url, {
+            method: method ?? 'GET',
+            headers: headers ?? {},
+            body: body ?? undefined,
+            redirect: 'manual',
+          });
+          const respHeaders: Record<string, string> = {};
+          resp.headers.forEach((v, k) => {
+            respHeaders[k] = v;
+          });
+          const text = await resp.text();
+          const truncated = text.length > 4096;
+          const safeBody = redactForLlm(truncated ? text.slice(0, 4096) : text, 4096);
+          return textResult(
+            [
+              `status: ${resp.status} ${resp.statusText}`,
+              `headers: ${JSON.stringify(respHeaders)}`,
+              `body (${text.length} bytes${truncated ? ', truncated to 4 KB' : ''}):`,
+              safeBody,
+              `durationMs: ${Date.now() - startedAt}`,
+            ].join('\n'),
+          );
+        } catch (err) {
+          return textResult(
+            `fetch_resource failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+      { attackerOnly: true },
+    ),
+
+    defTool(
+      'request_with_session',
+      "Same as fetch_resource but uses the current browser context's cookies — i.e. requests are made AS the logged-in user. Use after a login (yours, recon's, or a teammate's) when you want to hit an authenticated API endpoint without rendering it as a page. Body is truncated to 4 KB.",
+      {
+        url: z.string().url(),
+        method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+        body: z.string().optional(),
+      },
+      async ({ url, method, headers, body }) => {
+        if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
+          return textResult(`request_with_session refused: ${url} not in allowed_hosts.`);
+        }
+        const page = ensureListeners();
+        const startedAt = Date.now();
+        try {
+          const apiCtx = page.context().request;
+          const resp = await apiCtx.fetch(url, {
+            method: method ?? 'GET',
+            headers: headers ?? {},
+            data: body ?? undefined,
+            maxRedirects: 0,
+          });
+          const respHeaders = resp.headers();
+          const text = await resp.text();
+          const truncated = text.length > 4096;
+          const safeBody = redactForLlm(truncated ? text.slice(0, 4096) : text, 4096);
+          return textResult(
+            [
+              `status: ${resp.status()} ${resp.statusText()}`,
+              `headers: ${JSON.stringify(respHeaders)}`,
+              `body (${text.length} bytes${truncated ? ', truncated to 4 KB' : ''}):`,
+              safeBody,
+              `durationMs: ${Date.now() - startedAt}`,
+            ].join('\n'),
+          );
+        } catch (err) {
+          return textResult(
+            `request_with_session failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+      { attackerOnly: true },
+    ),
+
+    defTool(
+      'decode_jwt',
+      'Decode a JWT (the three base64url-encoded segments separated by `.`). Returns the parsed header + payload. Use this when you have a token from try_login, share_with_team, localStorage, a cookie, or a query parameter — to inspect alg, claims (sub, role, scope), expiry, and to spot weak signatures (alg=none, alg=HS256 with a guessable secret).',
+      { token: z.string().min(8) },
+      async ({ token }) => {
+        const parts = token.split('.');
+        if (parts.length < 2) {
+          return textResult(
+            `decode_jwt failed: not a JWT (got ${parts.length} segment(s), need 2-3).`,
+          );
+        }
+        function b64urlDecode(s: string): string {
+          const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
+          const std = s.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          return Buffer.from(std, 'base64').toString('utf8');
+        }
+        try {
+          const header = JSON.parse(b64urlDecode(parts[0] ?? ''));
+          const payload = JSON.parse(b64urlDecode(parts[1] ?? ''));
+          const sigPresent = parts.length === 3 && (parts[2] ?? '').length > 0;
+          return textResult(
+            [
+              `header: ${JSON.stringify(header)}`,
+              `payload: ${JSON.stringify(redactForLlm(payload))}`,
+              `signature: ${sigPresent ? `present (${(parts[2] ?? '').length} chars)` : 'EMPTY — alg=none vulnerability candidate'}`,
+            ].join('\n'),
+          );
+        } catch (err) {
+          return textResult(
+            `decode_jwt failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+      { attackerOnly: true },
     ),
 
     // ─── Compound macros ──────────────────────────────────────────────────
@@ -979,6 +1230,42 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         const page = ensureListeners();
         await awaitPauseIfNeeded();
         invalidateModelCache();
+
+        // SHORT-CIRCUIT: if the session already has a valid auth token whose
+        // decoded payload mentions the requested username (or any session token
+        // at all when we have no claim to compare), treat this as an immediate
+        // success. Without this, agents that inherited auth via storageState
+        // burn turns re-filling the login form against an already-authed page —
+        // Juice Shop doesn't redirect away from /#/login when authed, so
+        // `try_login` interprets the missing post-fresh-login marker as failure.
+        const existing = await detectExistingAuth(page, username).catch(() => null);
+        if (existing) {
+          input.sharedKnowledge?.markCredentialVerified(username, password);
+          input.sharedKnowledge?.addCredential({
+            username,
+            password,
+            source: `try_login (already authed) by ${input.agentId ?? 'agent'}`,
+            foundBy: input.agentId ?? 'unknown',
+            foundAt: new Date().toISOString(),
+            loginVerified: true,
+          });
+          await events?.write({
+            type: 'auth.try_login',
+            agentId: input.agentId ?? 'unknown',
+            username,
+            success: true,
+            detail: `already authenticated (${existing})`,
+            postLoginUrl: page.url(),
+          });
+          logger.info('try_login.skipped.already_authed', {
+            agentId: input.agentId,
+            username,
+            evidence: existing,
+          });
+          return textResult(
+            `OK try_login: session is ALREADY authenticated as ${username} (${existing}). Do NOT re-attempt login. Stop visiting /login routes — instead exercise authenticated functionality (admin panel, profile, basket, order history, /api endpoints with request_with_session).`,
+          );
+        }
 
         const tryLoginCandidates = login_url
           ? [login_url]
@@ -1256,6 +1543,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
 
         return textResult(lines.join('\n') || 'no storage entries');
       },
+      { attackerOnly: true },
     ),
   ];
 
@@ -1394,6 +1682,9 @@ export const BROWSER_TOOL_NAMES = [
   'mcp__browser__fill_form',
   'mcp__browser__find_and_click',
   'mcp__browser__try_login',
+  'mcp__browser__fetch_resource',
+  'mcp__browser__request_with_session',
+  'mcp__browser__decode_jwt',
   'mcp__browser__read_recent',
   'mcp__browser__storage_inspect',
 ] as const;

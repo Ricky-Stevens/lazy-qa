@@ -102,17 +102,28 @@ const VerifyResponseSchema = z.object({
   detail: z.string().min(1),
 });
 
-/** Extract the first absolute http(s) URL from a string. Returns null if no
- *  match. Used to preserve query params from `stepsToReproduce[0]` — the
- *  bare `finding.route` field strips them, which silently kills SQLi /
- *  injection findings in the verifier (the payload IS the query string).
+/** Extract the first URL-shaped token from a string. Returns either an absolute
+ *  http(s) URL or a relative path (possibly with query string) that can be
+ *  resolved against the rootUrl. Returns null if no match.
  *
- *  We accept fairly liberal characters in the path/query — most injection
- *  payloads include `'`, `(`, `)`, `;`, `%`-encoded bytes, etc. We stop at
- *  whitespace or a quote that isn't URL-safe. */
+ *  Used to preserve query params from `stepsToReproduce[0]` — the bare
+ *  `finding.route` field strips them, which silently kills SQLi / injection
+ *  findings in the verifier (the payload IS the query string).
+ *
+ *  Accepts liberal characters in path/query — most injection payloads include
+ *  `'`, `(`, `)`, `;`, `%`-encoded bytes, etc. We stop at whitespace or a
+ *  quote that isn't URL-safe. */
 function extractUrlFromText(text: string): string | null {
-  const match = text.match(/\bhttps?:\/\/[^\s'"`<>]+/);
-  return match ? match[0] : null;
+  // 1. Absolute URL preferred (most reliable when present).
+  const abs = text.match(/\bhttps?:\/\/[^\s'"`<>]+/);
+  if (abs) return abs[0];
+  // 2. Relative path with query string — common pattern in agent-written
+  //    repro steps: `Send GET to /rest/products/search?q='))...`. We need a
+  //    `?` to be present (otherwise we'd match every `/path` mention) so
+  //    plain-path findings still rely on `finding.route`. Stop at whitespace.
+  const rel = text.match(/(?:^|\s)(\/[^\s'"`<>]*\?[^\s'"`<>]+)/);
+  if (rel?.[1]) return rel[1];
+  return null;
 }
 
 /** Decide which URL to navigate to during verification.
@@ -135,19 +146,30 @@ function deriveTargetUrl(finding: Finding, rootUrl: string): string {
   if (firstStep) {
     const stepUrl = extractUrlFromText(firstStep);
     if (stepUrl) {
-      const stepUrlNoFragment = stepUrl.split('#')[0] ?? stepUrl;
+      // Resolve relative paths against the root.
+      let absoluteStepUrl: string;
+      try {
+        absoluteStepUrl = /^https?:/.test(stepUrl) ? stepUrl : new URL(stepUrl, rootUrl).toString();
+      } catch {
+        absoluteStepUrl = stepUrl;
+      }
+      const stepUrlNoFragment = absoluteStepUrl.split('#')[0] ?? absoluteStepUrl;
       const routePathOnly =
         finding.route && !/^https?:/.test(finding.route) ? finding.route.split('?')[0] : null;
       // Sanity: if the step URL's path matches the route's path (or there's
       // no route to compare against), trust it. Otherwise the agent may have
       // pasted a different URL into the steps and we shouldn't follow that.
       try {
-        const u = new URL(stepUrl);
-        if (!routePathOnly || u.pathname === routePathOnly || stepUrl.includes(routePathOnly)) {
+        const u = new URL(absoluteStepUrl);
+        if (
+          !routePathOnly ||
+          u.pathname === routePathOnly ||
+          absoluteStepUrl.includes(routePathOnly)
+        ) {
           // Prefer the URL with query params; only strip fragment when route
           // didn't carry one.
           const wantsHash = finding.route?.includes('#') ?? false;
-          return wantsHash ? stepUrl : stepUrlNoFragment;
+          return wantsHash ? absoluteStepUrl : stepUrlNoFragment;
         }
       } catch {
         // bad URL parse — fall through.

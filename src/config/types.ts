@@ -112,8 +112,13 @@ export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 const DEFAULT_USERNAME_SELECTOR =
   'input[type="email"], input[name="username"], input[name="email"], input[id*="user" i], input[autocomplete="username"]';
 const DEFAULT_PASSWORD_SELECTOR = 'input[type="password"]';
+// Cover the common patterns: explicit submit button, ID hints, plus visible
+// text fallbacks. Juice Shop's button is `#loginButton` with no `type=submit`,
+// so the ID hints catch it; many SaaS apps use button text-only.
+// Note: Playwright's :has-text() pseudo only takes quoted strings (no regex
+// literals) when used in a CSS-style locator — listing the common variants.
 const DEFAULT_SUBMIT_SELECTOR =
-  'button[type="submit"], input[type="submit"], button:has-text("Sign in")';
+  'button[type="submit"], input[type="submit"], button#loginButton, button#login-button, button#signInButton, button[id*="login" i][id*="button" i], button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), button:has-text("Signin"), button:has-text("Continue")';
 
 export const AuthConfigSchema = z
   .object({

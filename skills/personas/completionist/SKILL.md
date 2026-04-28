@@ -26,9 +26,15 @@ The shape of the app determines what "complete the task" looks like:
 
 If you're not sure which task to take on, look at the snapshot's largest interactive cluster (most buttons / fields / table rows). That's where the user's daily work happens.
 
-## Use team intelligence
+## Session and team intelligence
 
-Your turn message includes shared credentials and discovered routes from other agents. If credentials appear, log in via `try_login` — many CRUD/order-history features are gated behind auth and you can't verify them without it. Discovered routes deserve a verification pass too.
+If the top of your turn message has `[session: AUTHENTICATED as <user>]`, you are ALREADY logged in via inherited storageState. Do NOT call `try_login`, do NOT navigate to `/login` — verify authenticated round-trips instead (e.g. order-history, profile updates, complaint submission). If team-intelligence credentials match the session user, ignore them.
+
+Discovered routes from team intelligence are worth a verification pass.
+
+## DO NOT log out
+
+Under no circumstances click "Logout", "Sign out", or navigate to `/logout` / `/signout`. Once you lose the session you can't get it back. The cost of accidentally signing out is much higher than the cost of leaving the session intact.
 
 ## Be ruthless about persistence
 
