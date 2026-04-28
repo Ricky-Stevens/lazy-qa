@@ -9,7 +9,7 @@
 
 import { z } from 'zod';
 import { isHostAllowed } from '../safety/guards.ts';
-import type { Playbook, PlaybookContext, PlaybookRegistry } from './framework.ts';
+import type { Playbook, PlaybookContext } from './framework.ts';
 import { ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 // -----------------------------------------------------------------------------
@@ -444,12 +444,6 @@ export const __internal = {
   UUID_RE,
   NUMERIC_ID_RE,
 };
-
-export function registerSecurityPlaybooks(r: PlaybookRegistry): void {
-  r.register(idorProbe);
-  r.register(headerAudit);
-  r.register(sensitivePathAudit);
-}
 
 // Suppress unused-warning for context type by re-exporting nothing — but we
 // keep the type imported so downstream code that imports from this module via

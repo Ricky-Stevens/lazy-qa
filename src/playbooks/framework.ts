@@ -75,42 +75,6 @@ export interface RawToolDef {
   ) => Promise<{ content: { type: 'text'; text: string }[] }>;
 }
 
-/** Registry of available playbooks. */
-export class PlaybookRegistry {
-  private byName = new Map<string, Playbook>();
-
-  register<I>(pb: Playbook<I>): void {
-    if (this.byName.has(pb.name)) {
-      throw new Error(`Duplicate playbook registration: ${pb.name}`);
-    }
-    this.byName.set(pb.name, pb as Playbook);
-  }
-
-  get(name: string): Playbook | undefined {
-    return this.byName.get(name);
-  }
-
-  list(): Playbook[] {
-    return Array.from(this.byName.values());
-  }
-
-  size(): number {
-    return this.byName.size;
-  }
-
-  /** Convert all registered playbooks into MCP tool definitions. The caller
-   * supplies a `buildHandler` which constructs the per-playbook handler with
-   * access to the runtime context (page, siteMap, etc.). */
-  toMcpTools(buildHandler: (pb: Playbook) => RawToolDef['handler']): RawToolDef[] {
-    return this.list().map((pb) => ({
-      name: `mcp__playbooks__${pb.name}`,
-      description: pb.description,
-      shape: pb.inputShape,
-      handler: buildHandler(pb),
-    }));
-  }
-}
-
 /**
  * Run a playbook with timing + error handling. Always returns an outcome —
  * never throws. Captures unhandled exceptions as `failed` outcomes.

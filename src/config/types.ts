@@ -273,6 +273,16 @@ export const MemoryConfigSchema = z
   .default({ enabled: true });
 export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 
+// Selector cache configuration — persistent per-target locator cache for find_and_click.
+export const SelectorCacheConfigSchema = z
+  .object({
+    /** When true, find_and_click uses a persistent cache of resolved locators.
+     *  Cache file: ~/.regress-harness/cache/selectors/<targetHash>.json */
+    enabled: z.boolean().default(true),
+  })
+  .default({ enabled: true });
+export type SelectorCacheConfig = z.infer<typeof SelectorCacheConfigSchema>;
+
 // Top-level configuration schema
 export const ConfigSchema = z
   .object({
@@ -282,6 +292,7 @@ export const ConfigSchema = z
     supervisor: SupervisorConfigSchema,
     review: ReviewConfigSchema,
     memory: MemoryConfigSchema,
+    selector_cache: SelectorCacheConfigSchema,
     agents: z
       .array(AgentConfigSchema)
       .min(1)

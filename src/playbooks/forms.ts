@@ -10,7 +10,7 @@
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { FormFieldSpec, FormSpec } from '../page-model/types.ts';
-import type { Playbook, PlaybookRegistry } from './framework.ts';
+import type { Playbook } from './framework.ts';
 import { fail, ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 const SUBMIT_TIMEOUT_MS = 5_000;
@@ -270,7 +270,3 @@ export const fillAndVerify: Playbook<FillAndVerifyInput> = {
     );
   },
 };
-
-export function registerFormPlaybooks(r: PlaybookRegistry): void {
-  r.register(fillAndVerify);
-}

@@ -24,6 +24,7 @@ import type { PlaybookContext } from '../playbooks/framework.ts';
 import type { Skill, SkillsBundle } from '../skills/loader.ts';
 import { BROWSER_TOOL_NAMES, createBrowserMcpServer } from '../tools/browser-server.ts';
 import { createHarnessMcpServer } from '../tools/findings-server.ts';
+import type { SelectorCache } from '../tools/selector-cache.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
 import type { EventWriter } from './events.ts';
@@ -57,6 +58,9 @@ export interface SpawnAgentInput {
   skillsBundle: SkillsBundle;
   /** Event writer for this run. Optional — omitted in tests that don't need it. */
   events?: EventWriter;
+  /** Persistent selector cache for find_and_click. Optional — undefined when
+   *  selector_cache.enabled is false in the run config. */
+  selectorCache?: SelectorCache;
 }
 
 export interface SpawnAgentResult {
@@ -92,6 +96,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     memoryPath,
     skillsBundle,
     events,
+    selectorCache,
   } = input;
   const { budget } = agent;
 
@@ -168,6 +173,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     onAction: (patch) => updateOnAction(agent.id, patch),
     allowedHosts,
     events,
+    selectorCache,
   });
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the

@@ -21,7 +21,7 @@
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { WizardSpec } from '../page-model/types.ts';
-import type { Playbook, PlaybookRegistry } from './framework.ts';
+import type { Playbook } from './framework.ts';
 import { fail, ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 const STEP_TIMEOUT_MS = 5_000;
@@ -347,13 +347,3 @@ export const walkWizard: Playbook<WalkWizardInput> = {
     );
   },
 };
-
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
-
-/** Register the wizard playbook on the given registry. Called by the
- * default aggregator in `src/playbooks/index.ts`. */
-export function registerWizardPlaybooks(r: PlaybookRegistry): void {
-  r.register(walkWizard);
-}

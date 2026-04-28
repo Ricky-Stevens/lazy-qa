@@ -30,6 +30,7 @@ import type { Logger } from '../logging/logger.ts';
 import { createLogger } from '../logging/logger.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
 import { loadSkills } from '../skills/loader.ts';
+import { SelectorCache } from '../tools/selector-cache.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 import { EventWriter } from './events.ts';
@@ -101,6 +102,9 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   let aggregateFindings: Finding[] = [];
   let aggregateCostUsd = 0;
   const aggregateTerminationReasons: Record<string, string> = {};
+  // Hoisted so the finally block can flush the cache regardless of where in
+  // the try body control flow exits.
+  let selectorCache: SelectorCache | undefined;
 
   try {
     // 4. Best-effort `last` symlink so `runs/last` always points at the most
@@ -243,6 +247,14 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       await mkdir(memoryPath, { recursive: true });
     }
 
+    // 9a. Selector cache — load once per run (per-target file). Shared across
+    // all agents in the run; each agent receives the same instance so cache
+    // hits on one agent immediately benefit others in the same run.
+    const selectorCacheEnabled = cfg.selector_cache.enabled;
+    if (selectorCacheEnabled) {
+      selectorCache = await SelectorCache.load(cfg.target.url);
+    }
+
     // 10. Launch agents in parallel. The supervisor runs concurrently and
     // finishes when every agent terminates.
     const runStartedAt = new Date().toISOString();
@@ -265,6 +277,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         memoryPath,
         skillsBundle,
         events,
+        selectorCache,
       }),
     );
 
@@ -448,6 +461,18 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       logger.error('events.close.failed', {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Flush selector cache — best-effort. The 2s debounce will have persisted
+    // most entries during the run; this final close() catches the last batch.
+    if (selectorCache) {
+      try {
+        await selectorCache.close();
+      } catch (err) {
+        logger.error('selector-cache.close.failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 }

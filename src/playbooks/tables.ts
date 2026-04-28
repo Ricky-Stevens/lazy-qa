@@ -10,7 +10,7 @@
 import type { Locator, Page } from 'playwright';
 import { z } from 'zod';
 import type { TableSpec } from '../page-model/types.ts';
-import type { Playbook, PlaybookRegistry } from './framework.ts';
+import type { Playbook } from './framework.ts';
 import { fail, ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 const STEP_TIMEOUT_MS = 5_000;
@@ -165,9 +165,5 @@ export const walkPagination: Playbook<WalkPaginationInput> = {
     );
   },
 };
-
-export function registerTablePlaybooks(r: PlaybookRegistry): void {
-  r.register(walkPagination);
-}
 
 export type { PlaybookOutcome };

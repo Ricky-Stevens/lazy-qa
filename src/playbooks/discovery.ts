@@ -12,7 +12,7 @@
 import { z } from 'zod';
 import { probeAffordances } from '../crawler/affordance-probe.ts';
 import { buildRouteEntry } from '../crawler/sitemap.ts';
-import type { Playbook, PlaybookContext, PlaybookRegistry } from './framework.ts';
+import type { Playbook } from './framework.ts';
 import { fail, ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
 const ACTION_TIMEOUT_MS = 5_000;
@@ -333,10 +333,3 @@ export const discoverRouteAffordances: Playbook<DiscoverRouteAffordancesInput> =
   },
 };
 
-// ─── Registration ───────────────────────────────────────────────────────────
-
-export function registerDiscoveryPlaybooks(r: PlaybookRegistry): void {
-  r.register(askSitemap);
-  r.register(route404Probe);
-  r.register(discoverRouteAffordances);
-}

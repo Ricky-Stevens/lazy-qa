@@ -5,8 +5,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type Browser, type BrowserContext, chromium, type Page } from 'playwright';
-import { askSitemap, registerDiscoveryPlaybooks, route404Probe } from './discovery.ts';
-import { PlaybookRegistry, type PlaybookContext } from './framework.ts';
+import { askSitemap, discoverRouteAffordances, route404Probe } from './discovery.ts';
+import type { PlaybookContext } from './framework.ts';
 import type { NetworkAnomaly, PageModel } from '../page-model/types.ts';
 import type { RouteEntry, SiteMapAccessor } from '../crawler/types.ts';
 import { createLogger } from '../logging/logger.ts';
@@ -218,18 +218,12 @@ describe('route_404_probe', () => {
   }, 15_000);
 });
 
-// ─── registry ────────────────────────────────────────────────────────────────
+// ─── exports ─────────────────────────────────────────────────────────────────
 
-describe('registerDiscoveryPlaybooks', () => {
-  it('registers all discovery playbooks', () => {
-    const r = new PlaybookRegistry();
-    registerDiscoveryPlaybooks(r);
-    expect(r.size()).toBe(3);
-    const names = r.list().map((p) => p.name).sort();
-    expect(names).toEqual([
-      'ask_sitemap',
-      'discover_route_affordances',
-      'route_404_probe',
-    ]);
+describe('discovery playbook exports', () => {
+  it('exports all discovery playbooks', () => {
+    expect(askSitemap.name).toBe('ask_sitemap');
+    expect(route404Probe.name).toBe('route_404_probe');
+    expect(discoverRouteAffordances.name).toBe('discover_route_affordances');
   });
 });

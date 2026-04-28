@@ -48,7 +48,7 @@ const SITEMAP_TOP_N = 10;
 /** Anthropic SDK request hard cap for assistant output. */
 const MAX_OUTPUT_TOKENS = 4096;
 
-/** Playbook tool prefix the registry uses. Must match `PlaybookRegistry.toMcpTools`. */
+/** Playbook tool prefix. Must match the prefix used by the skills loader when building playbook tools. */
 const PLAYBOOK_TOOL_PREFIX = 'mcp__playbooks__';
 
 export interface LoopInput {

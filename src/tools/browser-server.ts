@@ -5,7 +5,7 @@
  * and hosting pluggable playbooks as MCP tools:
  *   - PageModel-based snapshots (parsePage → serializeForAgent)
  *   - Pluggable logout guard
- *   - Hosted playbook tools (mounted via PlaybookRegistry.toMcpTools)
+ *   - Hosted playbook tools (mounted via the skills loader)
  *   - Per-action site map recording and auth-wall detection
  *
  * Per-agent backoff and snapshot caching are optimized for latency-sensitive agent flows.
@@ -33,6 +33,7 @@ import type { PlaybookOutcome } from '../playbooks/outcome.ts';
 import { isHostAllowed } from '../safety/guards.ts';
 import { isLogoutLink } from '../safety/logout-guard.ts';
 import type { Skill } from '../skills/loader.ts';
+import type { SelectorCache } from './selector-cache.ts';
 
 /** Per-agent backoff thresholds (carried over from v1). */
 const BACKOFF_4XX_THRESHOLD = 5;
@@ -56,7 +57,7 @@ const MODEL_CACHE_TTL_MS = 2_500;
  * JSON Schema via z.toJSONSchema).
  *
  * Shape type intentionally matches `z.ZodRawShape` so playbook-derived raw
- * tools (from `PlaybookRegistry.toMcpTools`) are assignment-compatible with
+ * tools (from the skills loader) are assignment-compatible with
  * the locally-built ones. */
 export interface RawToolDef {
   name: string;
@@ -91,6 +92,9 @@ export interface BrowserServerInput {
   allowedHosts?: string[];
   /** Event writer for this run. Optional — emits navigate events. */
   events?: EventWriter;
+  /** Persistent selector cache for find_and_click. Optional — undefined when
+   *  selector_cache.enabled is false in the run config. */
+  selectorCache?: SelectorCache;
 }
 
 /** Accessibility node interface for rendering the AX tree. */
@@ -243,6 +247,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     onAction,
     allowedHosts = [],
     events,
+    selectorCache,
   } = input;
 
   // Console + network buffers. Drained into PageModel.signals on each parse,
@@ -558,7 +563,13 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             /* invalid url — use raw */
           }
           // Emit refused navigate event.
-          const fromUrl = (() => { try { return getPage().url(); } catch { return ''; } })();
+          const fromUrl = (() => {
+            try {
+              return getPage().url();
+            } catch {
+              return '';
+            }
+          })();
           await events?.write({
             type: 'navigate',
             agentId: agentId ?? 'unknown',
@@ -859,6 +870,27 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             `REFUSED find_and_click("${hint}") — hint matches a logout control. ${statusOk(page, `find_and_click_blocked("${hint}")`)}`,
           );
         }
+
+        // ── Selector cache lookup ─────────────────────────────────────────
+        // On a cache hit, attempt to click the cached locator with a short
+        // timeout. Success: return early and skip the multi-strategy probe.
+        // Failure (stale): invalidate the route and fall through.
+        const urlForCache = new URL(page.url());
+        const cachedLocator = selectorCache?.get(urlForCache.pathname, hint, role);
+        if (cachedLocator) {
+          try {
+            await page.locator(cachedLocator).first().click({ timeout: 2_000 });
+            speculate(page);
+            return textResult(
+              `OK find_and_click("${hint}") via cache → ${cachedLocator} | URL: ${page.url()}`,
+            );
+          } catch {
+            // Cached locator is stale — remove route entries and re-probe.
+            selectorCache?.invalidateRoute(urlForCache.pathname);
+          }
+        }
+
+        // ── Multi-strategy probe ──────────────────────────────────────────
         const escapedHint = hint.replace(/"/g, '\\"');
         const candidates: string[] = [];
         if (role && role !== 'any') {
@@ -883,6 +915,8 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
               );
             }
             await loc.click({ timeout: 3_000 });
+            // Write back to cache on successful probe resolution.
+            selectorCache?.set(urlForCache.pathname, hint, role, sel);
             speculate(page);
             return textResult(
               `find_and_click: matched "${hint}" via \`${sel}\` | URL: ${page.url()}`,

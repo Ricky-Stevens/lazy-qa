@@ -490,3 +490,97 @@ describe('navigate handler — host allowlist', () => {
     );
   });
 });
+
+describe('find_and_click — selector cache integration', () => {
+  let runDir: string;
+  beforeAll(async () => {
+    runDir = await mkdtemp(path.join(tmpdir(), 'browser-server-test-'));
+  });
+  afterAll(async () => {
+    await rm(runDir, { recursive: true, force: true });
+  });
+
+  function makeStubLocator(opts: { count: number; clickFails?: boolean }) {
+    const click = vi.fn(
+      opts.clickFails ? () => Promise.reject(new Error('stale')) : () => Promise.resolve(),
+    );
+    const count = vi.fn().mockResolvedValue(opts.count);
+    const first = vi.fn().mockReturnThis();
+    return { click, count, first };
+  }
+
+  it('cache hit skips multi-strategy probe; miss falls through and writes back; invalidateRoute forces re-probe', async () => {
+    const { accessor: siteMap } = makeFakeSiteMap();
+
+    // Build a SelectorCache mock that exercises the three branches.
+    const cacheGet = vi.fn();
+    const cacheSet = vi.fn();
+    const cacheInvalidate = vi.fn();
+    // biome-ignore lint/suspicious/noExplicitAny: minimal SelectorCache stub
+    const stubCache: any = {
+      get: cacheGet,
+      set: cacheSet,
+      invalidateRoute: cacheInvalidate,
+    };
+
+    // Page that returns a fresh locator stub on each call so we can count
+    // .count() invocations (= probe attempts).
+    const probeLocator = makeStubLocator({ count: 1 });
+    const cachedLocator = makeStubLocator({ count: 1 });
+    const pageLocator = vi.fn();
+    // biome-ignore lint/suspicious/noExplicitAny: stub Page subset
+    const stubPage: any = {
+      url: vi.fn().mockReturnValue('https://staging.example.com/dashboard'),
+      locator: pageLocator,
+      on: vi.fn(),
+      waitForTimeout: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const { rawTools } = createBrowserMcpServer({
+      getPage: () => stubPage as Page,
+      logger: makeSilentLogger(),
+      runDir,
+      siteMap,
+      playbooks: [],
+      allowedHosts: ['staging.example.com'],
+      selectorCache: stubCache,
+    });
+
+    const findAndClick = rawTools.find((t) => t.name === 'find_and_click');
+    if (!findAndClick) throw new Error('find_and_click tool not registered');
+
+    // 1. COLD CACHE: get returns null → multi-strategy probe runs → set called.
+    cacheGet.mockReturnValueOnce(null);
+    pageLocator.mockReturnValue(probeLocator);
+    const cold = await findAndClick.handler({ hint: 'Save', role: 'button' });
+    expect(cold.content[0]?.text ?? '').toContain('via');
+    expect(cacheGet).toHaveBeenCalledTimes(1);
+    expect(cacheSet).toHaveBeenCalledTimes(1);
+    expect(cacheSet).toHaveBeenCalledWith('/dashboard', 'Save', 'button', expect.any(String));
+    // Probe ran: at least one .count() call
+    expect(probeLocator.count).toHaveBeenCalled();
+
+    // 2. WARM CACHE: get returns a locator → cached path clicks it → no probe.
+    cacheGet.mockReturnValueOnce('role=button[name="Save"]');
+    pageLocator.mockReturnValue(cachedLocator);
+    const probeCallsBefore = probeLocator.count.mock.calls.length;
+    const warm = await findAndClick.handler({ hint: 'Save', role: 'button' });
+    expect(warm.content[0]?.text ?? '').toContain('via cache');
+    expect(cachedLocator.click).toHaveBeenCalled();
+    // Probe locator's count() must NOT have been called again
+    expect(probeLocator.count.mock.calls.length).toBe(probeCallsBefore);
+
+    // 3. STALE CACHE: get returns a locator but click fails → invalidateRoute called → probe runs.
+    const staleLocator = makeStubLocator({ count: 0, clickFails: true });
+    const reprobeLocator = makeStubLocator({ count: 1 });
+    cacheGet.mockReturnValueOnce('role=button[name="Save"]');
+    // First .locator() call = stale cache attempt; subsequent = re-probe candidates
+    pageLocator.mockImplementationOnce(() => staleLocator).mockReturnValue(reprobeLocator);
+    const stale = await findAndClick.handler({ hint: 'Save', role: 'button' });
+    expect(stale.content[0]?.text ?? '').toContain('via');
+    expect(stale.content[0]?.text ?? '').not.toContain('via cache');
+    expect(cacheInvalidate).toHaveBeenCalledWith('/dashboard');
+    // Re-probe ran
+    expect(reprobeLocator.count).toHaveBeenCalled();
+  });
+});

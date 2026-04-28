@@ -9,7 +9,7 @@
  *
  * The loader lives at src/skills/loader.ts (inside src/) but reads from
  * <repoRoot>/skills/ (outside src/).  The root is resolved via:
- *   path.resolve(import.meta.dirname, '../../skills')
+ *   path.dirname(fileURLToPath(import.meta.url))
  *
  * Design: shared playbook helper code stays in src/playbooks/*.ts.  Each
  * handler.ts re-exports the matching playbook object from those files.
