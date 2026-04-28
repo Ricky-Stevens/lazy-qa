@@ -58,6 +58,12 @@ export interface CrawlOptions {
   logger: Logger;
   /** Event writer for this run. Optional — emits crawl.* events. */
   events?: EventWriter;
+  /** Number of concurrent tabs the crawler may open from the input page's
+   * BrowserContext. 1 = serial (uses the input page, preserves any
+   * `page.route()` mocks attached by tests). >1 = parallel pool (opens new
+   * tabs which inherit `context.route()` handlers but not page-level ones).
+   * Default 1. */
+  parallelism?: number;
 }
 
 /**

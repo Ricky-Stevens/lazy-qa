@@ -214,4 +214,58 @@ describe('crawlSite', () => {
     expect(broken?.title).toBe('');
     expect(broken?.source).toBe('crawler');
   });
+
+  it('parallelism > 1 visits the same routes as serial (modulo order)', async () => {
+    // browser.newPage() opens a "default" context that disallows additional
+    // pages — so the crawler's `context.newPage()` would fail. Build a real
+    // context here, then mock at the context level so any tab inherits it.
+    const ctx = await browser.newContext();
+    const tab = await ctx.newPage();
+
+    const slug = (path: string) => path.replace(/^\//, '') || 'root';
+    const linkBlock = (paths: string[]): string =>
+      paths.map((p) => `<a href="${p}">${slug(p)}</a>`).join(' ');
+
+    // Fan-out tree: root → /a /b /c; /a → /a1 /a2; /b → /b1; the rest are leaves.
+    const tree: Record<string, string[]> = {
+      '/': ['/a', '/b', '/c'],
+      '/a': ['/a1', '/a2'],
+      '/b': ['/b1'],
+      '/c': [],
+      '/a1': [],
+      '/a2': [],
+      '/b1': [],
+    };
+    await ctx.route(`${ORIGIN}/**`, (route) => {
+      const url = route.request().url();
+      const path = new URL(url).pathname;
+      const children = tree[path] ?? [];
+      route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: `<!doctype html><html><body><h1>${slug(path)}</h1>${linkBlock(children)}</body></html>`,
+      });
+    });
+    await tab.goto(`${ORIGIN}/`);
+
+    const baseOpts = {
+      maxDepth: 3,
+      maxRoutes: 60,
+      maxWallClockMs: 30_000,
+      allowedHosts: ['app.test'] as string[],
+      linkExtractor: extractLinks,
+      logger: silentLogger(),
+    };
+
+    const serial = await crawlSite(tab, { ...baseOpts });
+    await tab.goto(`${ORIGIN}/`);
+    const parallel = await crawlSite(tab, { ...baseOpts, parallelism: 3 });
+
+    const serialRoutes = new Set(Object.keys(serial.routes));
+    const parallelRoutes = new Set(Object.keys(parallel.routes));
+    expect(parallelRoutes).toEqual(serialRoutes);
+    expect(serialRoutes.size).toBe(7);
+
+    await ctx.close();
+  }, 15_000);
 });

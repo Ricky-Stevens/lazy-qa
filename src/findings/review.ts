@@ -1,12 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
+import type { BrowserContext } from 'playwright';
 import { z } from 'zod';
 import type { Logger } from '../logging/logger.ts';
 import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+import { type VerifyResult, type VerifyVerdict, verifyFinding } from './verify.ts';
 
 /**
  * Post-run findings reviewer.
@@ -68,13 +70,133 @@ export interface ReviewResult {
   reviewCostUsd: number;
   reviewTokenUsage: { input: number; output: number; cacheRead: number; cacheWrite: number };
   /** All findings keyed by id, with their review attached. */
-  reviews: Array<{ finding: Finding; review: ReviewItem }>;
+  reviews: Array<{
+    finding: Finding;
+    review: ReviewItem;
+    /** Verifier verdict if critic-with-browser ran for this finding. */
+    verify?: VerifyResult;
+  }>;
   /** Findings without an LLM review (model didn't return one for them). */
   missing: Finding[];
   clusters: ReviewCluster[];
   overallNotes: string;
   /** Convenience counts. */
   counts: Record<ReviewClassification, number>;
+  /** Total cost spent on critic-with-browser verifications (0 if disabled). */
+  verifyCostUsd: number;
+}
+
+/** Apply a verify verdict to a review item. Returns a (possibly new) review
+ *  item with classification adjusted per the merge rules. The verifier never
+ *  *upgrades* a finding — it only confirms or downgrades — so this is a safe
+ *  one-way merge. */
+function applyVerifyVerdict(
+  review: ReviewItem,
+  verdict: VerifyVerdict,
+  detail: string,
+): ReviewItem {
+  const note = `[verifier: ${verdict}] ${detail}`;
+  const reasoning = `${review.reasoning}\n\n${note}`;
+  switch (verdict) {
+    case 'confirmed_reproducible':
+      return { ...review, reasoning };
+    case 'intermittent':
+      // Downgrade confirmed → likely; leave likely as-is.
+      return {
+        ...review,
+        classification:
+          review.classification === 'confirmed_bug' ? 'likely_bug' : review.classification,
+        reasoning,
+      };
+    case 'not_reproducible':
+      return { ...review, classification: 'not_a_bug', reasoning };
+    case 'environmental':
+      return { ...review, classification: 'environmental', reasoning };
+    case 'different_bug':
+      // Keep at likely_bug — there's something here, but it's not the claimed bug.
+      return { ...review, classification: 'likely_bug', reasoning };
+  }
+}
+
+/** Run verifications in parallel with a concurrency cap, returning a map of
+ *  findingId → VerifyResult. Errors per-finding are absorbed into a fallback
+ *  "intermittent" verdict; verification never throws back to reviewRun. */
+async function runVerifications(
+  candidates: Array<{ finding: Finding; review: ReviewItem }>,
+  ctx: VerifyContext,
+  apiKey: string,
+  logger: Logger,
+  events: EventWriter | undefined,
+): Promise<Map<string, VerifyResult>> {
+  const results = new Map<string, VerifyResult>();
+  if (candidates.length === 0) return results;
+  const concurrency = Math.max(1, Math.floor(ctx.concurrency ?? 3));
+  const client = new Anthropic({ apiKey });
+  const queue = [...candidates];
+  const inFlight = new Set<Promise<void>>();
+
+  const runOne = async (cand: { finding: Finding; review: ReviewItem }): Promise<void> => {
+    const tab = await ctx.context.newPage();
+    try {
+      const result = await verifyFinding({
+        finding: cand.finding,
+        page: tab,
+        rootUrl: ctx.rootUrl,
+        allowedHosts: ctx.allowedHosts,
+        client,
+        model: ctx.model,
+        logger,
+        events,
+      });
+      results.set(cand.finding.id, result);
+    } catch (err) {
+      logger.warn('verify.unhandled', {
+        findingId: cand.finding.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fall back to intermittent so a verifier crash doesn't accidentally
+      // clear a real finding.
+      results.set(cand.finding.id, {
+        findingId: cand.finding.id,
+        verdict: 'intermittent',
+        detail: `verifier crashed: ${err instanceof Error ? err.message : String(err)}`,
+        costUsd: 0,
+      });
+    } finally {
+      try {
+        await tab.close();
+      } catch {
+        // Tab may already be closed if context tore down — ignore.
+      }
+    }
+  };
+
+  while (queue.length > 0 || inFlight.size > 0) {
+    while (queue.length > 0 && inFlight.size < concurrency) {
+      const cand = queue.shift();
+      if (!cand) break;
+      const p = runOne(cand).finally(() => {
+        inFlight.delete(p);
+      });
+      inFlight.add(p);
+    }
+    if (inFlight.size > 0) await Promise.race(inFlight);
+  }
+  return results;
+}
+
+/** Optional verify-with-browser context. When provided, every finding the
+ *  triager classifies as `confirmed_bug` or `likely_bug` is re-checked against
+ *  the live app: a fresh tab navigates to the route, parses a PageModel, and
+ *  the verifier LLM renders a verdict. Verdicts merge back into the review
+ *  result, downgrading findings the live page contradicts. */
+export interface VerifyContext {
+  context: BrowserContext;
+  rootUrl: string;
+  allowedHosts: string[];
+  model: string;
+  /** Concurrency cap for parallel verifications. Default 3. */
+  concurrency?: number;
 }
 
 export interface ReviewInput {
@@ -89,6 +211,10 @@ export interface ReviewInput {
    * without an active writer. All emit calls silently no-op when undefined.
    */
   events?: EventWriter;
+  /** When provided, enable critic-with-browser verification of confirmed/
+   *  likely findings. Skipped entirely if undefined (e.g. the standalone
+   *  review CLI without an authenticated browser session). */
+  verify?: VerifyContext;
 }
 
 const SYSTEM_PROMPT = `You are a senior QA triager reviewing automated regression-scan findings.
@@ -293,6 +419,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
         environmental: 0,
         not_a_bug: 0,
       },
+      verifyCostUsd: 0,
     };
   }
 
@@ -365,7 +492,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   // Stitch reviews back to the original findings, by id.
   const findingsById = new Map(findings.map((f) => [f.id, f]));
   const reviewsById = new Map(parsed.reviews.map((r) => [r.id, r]));
-  const reviews: Array<{ finding: Finding; review: ReviewItem }> = [];
+  const reviews: Array<{ finding: Finding; review: ReviewItem; verify?: VerifyResult }> = [];
   const missing: Finding[] = [];
   for (const f of findings) {
     const r = reviewsById.get(f.id);
@@ -387,6 +514,39 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   for (const entry of reviews) {
     if (entry.review.duplicateOf && !findingsById.has(entry.review.duplicateOf)) {
       entry.review.duplicateOf = undefined;
+    }
+  }
+
+  // Critic-with-browser verification, if a verify context was provided.
+  let verifyCostUsd = 0;
+  if (input.verify) {
+    const candidates = reviews.filter(
+      (r) =>
+        r.review.classification === 'confirmed_bug' || r.review.classification === 'likely_bug',
+    );
+    if (candidates.length > 0) {
+      logger.info('verify.start', {
+        candidates: candidates.length,
+        concurrency: input.verify.concurrency ?? 3,
+      });
+      const verifyResults = await runVerifications(
+        candidates,
+        input.verify,
+        apiKey,
+        logger,
+        events,
+      );
+      for (const entry of reviews) {
+        const v = verifyResults.get(entry.finding.id);
+        if (!v) continue;
+        entry.review = applyVerifyVerdict(entry.review, v.verdict, v.detail);
+        entry.verify = v;
+        verifyCostUsd += v.costUsd;
+      }
+      logger.info('verify.complete', {
+        verified: verifyResults.size,
+        costUsd: verifyCostUsd.toFixed(4),
+      });
     }
   }
 
@@ -431,5 +591,6 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
     clusters,
     overallNotes: parsed.overallNotes,
     counts,
+    verifyCostUsd,
   };
 }

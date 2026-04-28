@@ -185,6 +185,28 @@ export type Event =
       runId: string;
       totalCostUsd: number;
       durationMs: number;
+    }
+  | {
+      type: 'critic.verify.start';
+      ts: string;
+      seq: number;
+      runId: string;
+      findingId: string;
+      model: string;
+    }
+  | {
+      type: 'critic.verify.end';
+      ts: string;
+      seq: number;
+      runId: string;
+      findingId: string;
+      verdict:
+        | 'confirmed_reproducible'
+        | 'intermittent'
+        | 'not_reproducible'
+        | 'environmental'
+        | 'different_bug';
+      costUsd: number;
     };
 
 /**

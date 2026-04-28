@@ -94,21 +94,38 @@ A sixth always-on supervisor agent (`src/orchestrator/supervisor.ts`) watches th
 
 The supervisor is best-effort: a crash never fails the run.
 
-### 7. Post-run critic LLM
+### 7. Post-run critic LLM (Agent-as-a-Judge)
 
-After all agents finish, the post-run reviewer (`src/findings/review.ts`) reads the persisted findings and journey metadata and asks a single batched LLM call to classify each finding: `confirmed_bug` / `likely_bug` / `duplicate` / `environmental` / `not_a_bug`. It also clusters findings by theme and suggests severity corrections. Output is `review.md` + `review.json`. Best-effort — a reviewer crash never fails the run; the raw findings are already on disk.
+After all agents finish, the post-run reviewer (`src/findings/review.ts`) reads the persisted findings and journey metadata and asks a single batched LLM call to classify each finding: `confirmed_bug` / `likely_bug` / `duplicate` / `environmental` / `not_a_bug`. It also clusters findings by theme and suggests severity corrections.
 
-### 8. Output layout
+For every `confirmed_bug` or `likely_bug`, a **critic-with-browser** verifier opens a fresh tab, navigates to the claimed route, captures a live PageModel snapshot, and asks a second LLM whether the bug is still reproducible. Verdicts (`confirmed_reproducible` / `intermittent` / `not_reproducible` / `environmental` / `different_bug`) merge back into the report — `not_reproducible` downgrades the finding to `not_a_bug`, blunting the trace-only false-positive rate. Set `review.verify_with_browser: false` (or omit credentials) to skip verification entirely.
+
+Output is `review.md` + `review.json`. Best-effort — a reviewer crash never fails the run; the raw findings are already on disk.
+
+### 8. Run replay (event-sourced)
+
+Every run writes `runs/<runId>/events.jsonl` — an append-only log of every meaningful state change (run start/end, agent turns, tool calls, findings, supervisor interventions, critic verdicts, verifier verdicts, crawl probes). The locked 19-event taxonomy is in `src/orchestrator/events.ts`.
+
+```bash
+bun run replay <runId>            # reconstruct findings.replayed.json from events alone
+bun run replay <runId> --diff     # exit 1 if replayed findings differ from the live findings.json
+```
+
+Replay is the deterministic-validation pillar: a healthy run replays to the same finding set. Divergence in CI flags a regression in the harness, not the SUT.
+
+### 9. Output layout
 
 ```
 runs/<runId>/
   findings.json           all deduplicated findings
-  review.md               critic's triage report
+  events.jsonl            full event-sourced run trace
+  review.md               critic's triage report (incl. verifier verdicts)
   review.json             structured review data
   summary.md              quick per-agent summary table
   sitemap.json            pre-run crawler snapshot
   coverage.md             per-route + playbook coverage report
   manifest.json           run metadata
+  selector-cache.json     persistent locator cache (find_and_click hits)
   journeys/
     <agentId>.meta.json   per-agent journey (turns, cost, token usage, findings)
   auth/
@@ -158,6 +175,14 @@ review:
   enabled: true
   model: claude-sonnet-4-6
   batch_mode: auto                  # 'auto' (batch for large payloads) | 'inline' | 'force_batch'
+  verify_with_browser: true         # critic-with-browser: re-verify confirmed/likely findings on the live app
+  verify_concurrency: 3             # parallel verifier tabs
+
+crawler:
+  parallelism: 3                    # concurrent tabs during pre-run crawl (1 = serial)
+
+selector_cache:
+  enabled: true                     # persistent locator cache for find_and_click
 
 run:
   max_budget_usd: 5
@@ -353,9 +378,11 @@ See `skills/playbooks/` for 9 built-in examples. Reference the [Anthropic Agent 
 ## Commands
 
 ```bash
-bun run scan <config.yaml>      # full run: crawler + explorers + supervisor + post-run review
+bun run scan <config.yaml>      # full run: crawler + explorers + supervisor + post-run review + verifier
 bun run review <runDir>         # re-review a past run with a fresh critic pass
 bun run review <runDir> --inline-critic  # immediate review (full price, no batch queuing)
+bun run replay <runDir>         # reconstruct findings from the events.jsonl trace
+bun run replay <runDir> --diff  # CI gate — exit 1 if replayed findings differ from findings.json
 bun run typecheck               # TypeScript check
 bun run lint                    # Biome check
 bun run lint:fix                # Biome format + safe-fix
@@ -371,8 +398,8 @@ captures the v3 direction:
 - **Phase 1 (done):** cleanup + security hardening (auth pool, playbook consolidation, allowlist enforcement).
 - **Phase 2 (done):** simplified the playbook framework from 31 scripted flows to 9 focused playbooks. Persona-first system prompt — primitives are the default action vocabulary; playbooks are deterministic shortcuts when they fit exactly. Supervisor trimmed to 3 intervention modes; `storage_inspect` primitive replaces the deleted playbook.
 - **Phase 3 (done):** prompt caching (system + tools + message tail, ~90% cacheRead savings), model routing (Haiku 4.5 for actions / Sonnet 4.6 for post-compaction synthesis), Anthropic Memory tool for cross-run learning (per-target persistent notebook), Agent Skills as the format for personas + playbooks, `ax_snapshot` primitive (cheap AX-tree outline), Batch API critic (50% off output), CloakBrowser stealth opt-in.
-- **Phase 4 (next):** critic LLM with browser access (Agent-as-a-Judge — re-runs suspect findings to confirm), event-sourced run trace.
-- **Phase 5:** end-to-end validation against OWASP Juice Shop.
+- **Phase 4 (done):** event-sourced run trace + replay (`runs/<runId>/events.jsonl`, `bun run replay`), critic-with-browser verification (Agent-as-a-Judge — re-checks `confirmed_bug` / `likely_bug` findings against the live app, downgrades `not_reproducible` to `not_a_bug`), full AX-tree replacement of the DOM-walker `parser.ts` (smaller, cleaner, uses platform accessibility info), parallel-tab pre-run crawl (default 3 tabs), persistent selector cache (per-run `find_and_click` locator memoisation).
+- **Phase 5 (next):** end-to-end validation against OWASP Juice Shop.
 
 ## Tuning notes
 

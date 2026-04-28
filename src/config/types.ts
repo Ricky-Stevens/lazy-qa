@@ -257,8 +257,24 @@ export const ReviewConfigSchema = z
      * - 'force_batch' : always use the Batch API regardless of payload size
      */
     batch_mode: z.enum(['auto', 'inline', 'force_batch']).default('auto'),
+    /** When true, confirmed_bug / likely_bug findings are re-verified against
+     *  the live app via a fresh browser tab. Verifier verdicts can downgrade
+     *  findings (e.g. not_reproducible → not_a_bug). Default true; set false
+     *  to skip verification entirely (saves time + LLM cost). */
+    verify_with_browser: z.boolean().default(true),
+    /** Verifier model. Cheaper than the triager since each call is ~1KB.
+     *  Default: same as the triager model. */
+    verify_model: ModelSchema.optional(),
+    /** Concurrency cap on parallel verifier tabs. Default 3. */
+    verify_concurrency: z.number().int().min(1).max(8).default(3),
   })
-  .default({ enabled: true, model: 'claude-sonnet-4-6', batch_mode: 'auto' });
+  .default({
+    enabled: true,
+    model: 'claude-sonnet-4-6',
+    batch_mode: 'auto',
+    verify_with_browser: true,
+    verify_concurrency: 3,
+  });
 export type ReviewConfig = z.infer<typeof ReviewConfigSchema>;
 
 // Memory tool configuration — persistent per-target notebook for agents.
@@ -283,6 +299,16 @@ export const SelectorCacheConfigSchema = z
   .default({ enabled: true });
 export type SelectorCacheConfig = z.infer<typeof SelectorCacheConfigSchema>;
 
+export const CrawlerConfigSchema = z
+  .object({
+    /** Number of concurrent tabs the pre-run crawler may open. Default 3.
+     *  Tests should leave at default 1 if they rely on `page.route()` mocks
+     *  attached to the input page (those don't apply to new context tabs). */
+    parallelism: z.number().int().min(1).max(8).default(3),
+  })
+  .default({ parallelism: 3 });
+export type CrawlerConfig = z.infer<typeof CrawlerConfigSchema>;
+
 // Top-level configuration schema
 export const ConfigSchema = z
   .object({
@@ -293,6 +319,7 @@ export const ConfigSchema = z
     review: ReviewConfigSchema,
     memory: MemoryConfigSchema,
     selector_cache: SelectorCacheConfigSchema,
+    crawler: CrawlerConfigSchema,
     agents: z
       .array(AgentConfigSchema)
       .min(1)

@@ -193,6 +193,8 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         allowedHosts: cfg.target.allowed_hosts,
         linkExtractor: extractLinks,
         logger: crawlerLogger,
+        parallelism: cfg.crawler.parallelism,
+        events,
       });
     } catch (err) {
       crawlerLogger.error('crawl.failed', {
@@ -392,6 +394,37 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       reviewCostUsd: number;
     } | null = null;
     if (reviewEnabled) {
+      // Acquire a verifier session if critic-with-browser verification is on.
+      // We re-use the session pool's de-duplication: this will share the
+      // browser/context with any agent session still alive, otherwise it
+      // performs a fresh login. Released in a finally block below.
+      let verifySession: Awaited<ReturnType<typeof acquireSession>> | null = null;
+      if (cfg.review.verify_with_browser) {
+        try {
+          // Reuse the first resolved agent's credentials (they were already
+          // env-resolved upstream). The session pool de-duplicates against
+          // existing sessions for the same target+credentials.
+          const firstResolved = agents[0];
+          if (firstResolved) {
+            verifySession = await acquireSession({
+              targetUrl: cfg.target.url,
+              auth: cfg.target.auth,
+              allowedHosts: cfg.target.allowed_hosts,
+              credentials: firstResolved.credentials,
+              runDir,
+              agentId: 'verifier',
+              logger: logger.child({ tool: 'verify' }),
+              stealth: cfg.target.stealth,
+            });
+          }
+        } catch (err) {
+          logger.warn('verify.session.acquire.failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Fall through — review proceeds without verification.
+        }
+      }
+
       try {
         const review = await reviewRun({
           runDir,
@@ -400,6 +433,17 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
           batchMode: cfg.review.batch_mode,
           logger: logger.child({ tool: 'review' }),
           events,
+          ...(verifySession
+            ? {
+                verify: {
+                  context: verifySession.context,
+                  rootUrl: cfg.target.url,
+                  allowedHosts: cfg.target.allowed_hosts,
+                  model: cfg.review.verify_model ?? cfg.review.model,
+                  concurrency: cfg.review.verify_concurrency,
+                },
+              }
+            : {}),
         });
         await writeReviewArtefacts(runDir, review);
         reviewSummary = {
@@ -415,6 +459,16 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         logger.error('review.crashed', {
           error: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        if (verifySession) {
+          try {
+            await verifySession.release();
+          } catch (err) {
+            logger.warn('verify.session.release.failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
     }
 
