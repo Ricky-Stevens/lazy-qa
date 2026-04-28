@@ -49,12 +49,16 @@ function makeFinding(overrides: Partial<Finding> = {}): Finding {
   };
 }
 
-function makeStubPage(opts: { gotoStatus?: number; gotoThrows?: boolean } = {}) {
+function makeStubPage(opts: { gotoStatus?: number; gotoThrows?: boolean; body?: string } = {}) {
   return {
     goto: vi.fn(async () => {
       if (opts.gotoThrows) throw new Error('navigation failed');
-      return { status: () => opts.gotoStatus ?? 200 };
+      return {
+        status: () => opts.gotoStatus ?? 200,
+        text: async () => opts.body ?? '',
+      };
     }),
+    content: vi.fn(async () => `<html><body>${opts.body ?? ''}</body></html>`),
   } as never;
 }
 
@@ -184,6 +188,37 @@ describe('verifyFinding', () => {
     expect(create).toHaveBeenCalledTimes(1);
     const userMessage = create.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
     expect(userMessage).toContain('navigation failed');
+  });
+
+  it('passes HTTP status and body sample to the LLM so text-leakage claims can be verified', async () => {
+    // Simulate a JSON-endpoint response — Juice Shop's /swagger.json scenario
+    // where parsePage returns "looksBroken=true, no interactives" but the
+    // body itself proves the bug (full Swagger spec exposed).
+    const swaggerBody =
+      '{"openapi":"3.0.0","info":{"title":"Juice Shop API"},"paths":{"/api/Users":{"get":{"summary":"list users"}}}}';
+    const create = vi
+      .fn()
+      .mockResolvedValue(makeMessageResponse('confirmed_reproducible', 'body shows full API spec'));
+    await verifyFinding({
+      finding: makeFinding({
+        title: '/swagger.json full API docs exposed',
+        route: '/swagger.json',
+      }),
+      page: makeStubPage({ gotoStatus: 200, body: swaggerBody }),
+      rootUrl: 'https://app.test',
+      allowedHosts: ['app.test'],
+      client: { messages: { create } as never },
+      model: 'claude-sonnet-4-6',
+      logger: makeStubLogger(),
+    });
+    expect(create).toHaveBeenCalledTimes(1);
+    const userMessage = create.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    expect(userMessage).toContain('HTTP status: 200');
+    expect(userMessage).toContain('RESPONSE BODY SAMPLE');
+    expect(userMessage).toContain('Juice Shop API');
+    // Non-HTML body bypasses parsePage so the misleading "looksBroken=true"
+    // structural summary doesn't appear.
+    expect(userMessage).toContain('non-HTML response');
   });
 
   it('emits critic.verify.start and critic.verify.end events when an EventWriter is supplied', async () => {

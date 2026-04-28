@@ -51,7 +51,7 @@ selector_cache:
   enabled: true
 
 run:
-  max_budget_usd: 1.50            # tight cap for the smoke run
+  max_budget_usd: 3.00            # multi-persona run: 4 agents + supervisor + critic + verifier
   output_dir: ./runs
 
 memory:
@@ -62,47 +62,42 @@ memory:
   enabled: false
 
 agents:
-  # Smoke run: ONE agent first. Verify the crawler and parser handle
-  # Juice Shop's Angular hash-routes (#/login, #/search?q=...) before
-  # spending budget on a multi-persona swarm.
-  #
-  # Auth.type=none means credentials are optional — but passing them in is
-  # harmless; agents may still register/login mid-run via the UI.
-  - id: attacker-smoke
+  # Multi-persona Juice Shop run: insider-attacker hunts security bugs,
+  # functional personas exercise the public surface (search, basket,
+  # registration). Personas diverge naturally — same agents twice will
+  # explore different paths.
+  - id: attacker
     profile: insider-attacker
     model: claude-sonnet-4-6
     max_thinking_tokens: 2000
     budget:
+      max_minutes: 6
+      max_turns: 120
+      max_usd: 0.80
+
+  - id: power-user
+    profile: power-user
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    budget:
       max_minutes: 5
-      max_turns: 80
+      max_turns: 200
       max_usd: 0.50
 
-  # Uncomment after the smoke run looks healthy. The full multi-persona
-  # scan exercises functional + security paths together.
-  #
-  # - id: power-user
-  #   profile: power-user
-  #   model: claude-haiku-4-5-20251001
-  #   max_thinking_tokens: 1024
-  #   budget:
-  #     max_minutes: 5
-  #     max_turns: 200
-  #     max_usd: 0.40
-  #
-  # - id: chaos
-  #   profile: chaos-clicker
-  #   model: claude-haiku-4-5-20251001
-  #   max_thinking_tokens: 1024
-  #   budget:
-  #     max_minutes: 5
-  #     max_turns: 200
-  #     max_usd: 0.30
-  #
-  # - id: completionist
-  #   profile: completionist
-  #   model: claude-sonnet-4-6
-  #   max_thinking_tokens: 1500
-  #   budget:
-  #     max_minutes: 5
-  #     max_turns: 200
-  #     max_usd: 0.60
+  - id: chaos
+    profile: chaos-clicker
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    budget:
+      max_minutes: 5
+      max_turns: 200
+      max_usd: 0.40
+
+  - id: completionist
+    profile: completionist
+    model: claude-sonnet-4-6
+    max_thinking_tokens: 1500
+    budget:
+      max_minutes: 6
+      max_turns: 200
+      max_usd: 0.80
