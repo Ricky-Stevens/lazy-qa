@@ -1334,22 +1334,46 @@ function buildTableFromAx(
   });
 
   // Rows: count rowgroup>row that contain `cell` (skip header-only rows).
+  // Also extract sample row content (first 5 data rows) so the agent can read
+  // table data straight from the snapshot without having to click into cells.
+  // This is the fix for the Juice Shop /#/administration feedback-table case
+  // where the BIP39 mnemonic was invisible in run #7.
+  const SAMPLE_ROW_LIMIT = 5;
+  const SAMPLE_CELL_CHAR_CAP = 120;
   let rowCount = 0;
+  const sampleRows: string[][] = [];
   for (const c of axNode.children) {
-    if (c.role === 'rowgroup') {
-      for (const r of c.children) {
-        if (
-          r.role === 'row' &&
-          r.children.some((x) => x.role === 'cell' || x.role === 'gridcell')
-        ) {
-          rowCount++;
+    const dataRows: AXNode[] =
+      c.role === 'rowgroup'
+        ? c.children.filter(
+            (r) =>
+              r.role === 'row' &&
+              r.children.some((x) => x.role === 'cell' || x.role === 'gridcell'),
+          )
+        : c.role === 'row' && c.children.some((x) => x.role === 'cell' || x.role === 'gridcell')
+          ? [c]
+          : [];
+    for (const r of dataRows) {
+      rowCount++;
+      if (sampleRows.length < SAMPLE_ROW_LIMIT) {
+        const cells: string[] = [];
+        for (const cell of r.children) {
+          if (cell.role !== 'cell' && cell.role !== 'gridcell') continue;
+          // Cell text comes from .name (AX accessible-name) when present, else
+          // descendants' visible text. We collect descendant text content
+          // recursively so dynamic Material cells (which often wrap text in
+          // nested span/div) still surface their value.
+          let text = cell.name?.trim() ?? '';
+          if (!text) text = collectVisibleText(cell);
+          if (text.length > SAMPLE_CELL_CHAR_CAP) {
+            text = `${text.slice(0, SAMPLE_CELL_CHAR_CAP)}…`;
+          }
+          cells.push(text);
+        }
+        if (cells.some((c) => c.length > 0)) {
+          sampleRows.push(cells);
         }
       }
-    } else if (
-      c.role === 'row' &&
-      c.children.some((x) => x.role === 'cell' || x.role === 'gridcell')
-    ) {
-      rowCount++;
     }
   }
 
@@ -1399,7 +1423,24 @@ function buildTableFromAx(
     rowActions,
     bulkActions: [], // AX tree can't reliably localise bulk-action toolbars; parser drops these for now.
     filters: [],
+    sampleRows: sampleRows.length > 0 ? sampleRows : undefined,
   };
+}
+
+/** Concatenate visible text content under an AX node. Handles the common
+ *  Material table case where a cell wraps its value in nested role=text /
+ *  generic nodes — `cell.name` is empty but the value is in descendants.
+ *  Returns `''` for empty subtrees. Whitespace is normalised. */
+function collectVisibleText(node: AXNode): string {
+  const parts: string[] = [];
+  function walk(n: AXNode): void {
+    // Skip interactive children — they're tracked as rowActions, not cell text.
+    if (isActionRole(n.role)) return;
+    if (n.name && n.name.trim().length > 0) parts.push(n.name.trim());
+    for (const c of n.children) walk(c);
+  }
+  for (const c of node.children) walk(c);
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
 function hasButtonChild(node: AXNode): boolean {
@@ -1746,14 +1787,47 @@ export async function parsePage(
     forms.push(buildFormFromDom(df, locators, route, forms.length));
   }
 
-  // Tables.
-  const consumedDomTables = new Set<DomScan['tables'][number]>();
-  const tables: TableSpec[] = [];
+  // Tables. If any built table has columnheaders but zero data rows, the most
+  // common cause on Angular SPAs (Juice Shop /#/administration is the canonical
+  // case) is the snapshot firing before the data-fetch+render completed. Retry
+  // ONCE with a short settle wait, re-take just the AX snapshot, and rebuild
+  // tables. The DOM scan stays — only AX changes once data renders.
+  let consumedDomTables = new Set<DomScan['tables'][number]>();
+  let tables: TableSpec[] = [];
   for (const { node } of walkAx(axRoots)) {
     if (node.role !== 'table' && node.role !== 'grid') continue;
     tables.push(
       buildTableFromAx(node, dom.tables, consumedDomTables, locators, route, tables.length),
     );
+  }
+  const needsTableRetry = tables.some((t) => t.columns.length > 0 && t.rowCount === 0);
+  if (needsTableRetry) {
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 1200 }).catch(() => undefined);
+      await page.waitForTimeout(300);
+      const retryYaml = await page.ariaSnapshot({ mode: 'ai' }).catch(() => '');
+      if (retryYaml && retryYaml !== yamlStr) {
+        const retryRoots = parseAxYaml(retryYaml);
+        const retryConsumed = new Set<DomScan['tables'][number]>();
+        const retryTables: TableSpec[] = [];
+        for (const { node } of walkAx(retryRoots)) {
+          if (node.role !== 'table' && node.role !== 'grid') continue;
+          retryTables.push(
+            buildTableFromAx(node, dom.tables, retryConsumed, locators, route, retryTables.length),
+          );
+        }
+        // Only adopt the retry result if it actually populated rows. Otherwise
+        // the table is genuinely empty (an honest "No records to show") and we
+        // keep the original parse to avoid masking a real empty-state bug.
+        const retryYieldsRows = retryTables.some((t) => t.rowCount > 0);
+        if (retryYieldsRows) {
+          tables = retryTables;
+          consumedDomTables = retryConsumed;
+        }
+      }
+    } catch {
+      // Best-effort — fall back to the original empty-row tables.
+    }
   }
 
   // Wizards.
@@ -1874,6 +1948,26 @@ export async function parsePage(
     if (bareFields.length >= 30) break;
   }
 
+  // Notices — toast/snackbar text containing strong bug signals. The structured
+  // PageModel otherwise discards plain text nodes; without this, OWASP Juice
+  // Shop's "You successfully solved a challenge: X" popups vanish from the
+  // snapshot and the agent has no cue to file. We grep the raw AX yaml for the
+  // canonical toast patterns. Generic enough to catch other testbed scorers
+  // without app-specific config.
+  const notices: string[] = [];
+  if (yamlStr) {
+    const challengeRe = /successfully solved a challenge:\s*([^"\n)]+?)(?:\s*\([^)]*\))?["\n]/gi;
+    const seenNotices = new Set<string>();
+    challengeRe.lastIndex = 0;
+    for (let m = challengeRe.exec(yamlStr); m !== null; m = challengeRe.exec(yamlStr)) {
+      const name = (m[1] ?? '').trim();
+      if (!name || seenNotices.has(name)) continue;
+      seenNotices.add(name);
+      notices.push(`successfully solved a challenge: ${name}`);
+      if (notices.length >= 10) break;
+    }
+  }
+
   const model: PageModel = {
     url: dom.url || page.url(),
     route,
@@ -1895,5 +1989,6 @@ export async function parsePage(
     capturedAt: new Date().toISOString(),
   };
   if (dom.primaryHeading) model.primaryHeading = dom.primaryHeading;
+  if (notices.length > 0) model.notices = notices;
   return model;
 }

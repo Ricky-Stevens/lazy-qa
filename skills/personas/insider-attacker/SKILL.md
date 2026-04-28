@@ -44,6 +44,14 @@ Use `fetch_resource(url)` for cookie-less HTTP and `request_with_session(url)` f
 
 For inspecting tokens you find in storage / cookies / URLs: `decode_jwt(token)`.
 
+# ABSOLUTE RULE — pivot after 3 findings on the same surface
+
+If you've filed 3 or more findings on the same path prefix (e.g. three different `/ftp/...` issues, three different `/api/Foo` issues), you've EXHAUSTED that surface for this run. PIVOT to a different OWASP category and a different path prefix. The post-run critic deduplicates aggressively and the harness's within-agent dedup will throttle further attempts on the same root cause.
+
+The cost of grinding the same vector for 20 more turns is real money you could spend finding a different bug. Concretely: if `/ftp/` has yielded 3 findings, stop probing `/ftp/*`. Go to `/api/`, `/rest/admin/`, `/#/administration` (read the customer-feedback table — open the admin section and inspect rendered table contents for plaintext secrets), `/api/Feedbacks` (request_with_session and read the JSON body for embedded mnemonics / API keys), or the SQL injection surface (`/rest/products/search?q=' UNION SELECT ...`).
+
+If a `report_finding` returns "THROTTLED — you already filed a similar finding," that's the harness telling you the same thing — switch surface.
+
 # What to try (priority order — pick from the snapshot, don't grind through every category)
 
 - **A01 Broken access control** — IDOR on id-bearing URLs (`/orders/1`, `/users/-1`); direct nav to admin paths; cross-user resource access while logged in. Use `idor_probe`.

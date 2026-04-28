@@ -497,11 +497,13 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // events.jsonl trace — every runPlaybook call emits one.
     try {
       const playbookOutcomes = await collectPlaybookOutcomesFromEvents(eventsPath);
+      const primitiveActivity = await collectPrimitiveActivityFromEvents(eventsPath);
       await writeCoverageReport(runDir, {
         runId,
         siteMap: siteMap.serialize(),
         journeys,
         playbookOutcomes,
+        primitiveActivity,
       });
     } catch (err) {
       logger.error('coverage.failed', {
@@ -699,4 +701,59 @@ async function collectPlaybookOutcomesFromEvents(
     });
   }
   return out;
+}
+
+/** Read events.jsonl and tally per-agent primitive tool calls. Used to drive
+ *  the "Primitive interactions" section of the coverage report — the playbook-
+ *  only stats hide what honest personas actually did with click/fill_form/etc. */
+async function collectPrimitiveActivityFromEvents(eventsPath: string): Promise<
+  Array<{
+    agentId: string;
+    fillForm: number;
+    click: number;
+    type: number;
+    navigate: number;
+    reportFinding: number;
+  }>
+> {
+  let raw: string;
+  try {
+    raw = await readFile(eventsPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const map = new Map<
+    string,
+    { fillForm: number; click: number; type: number; navigate: number; reportFinding: number }
+  >();
+  function bucket(agentId: string) {
+    let b = map.get(agentId);
+    if (!b) {
+      b = { fillForm: 0, click: 0, type: 0, navigate: 0, reportFinding: 0 };
+      map.set(agentId, b);
+    }
+    return b;
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let e: Record<string, unknown>;
+    try {
+      e = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (e.type !== 'tool.call') continue;
+    const agentId = String(e.agentId ?? '');
+    if (!agentId) continue;
+    const name = String(e.name ?? '');
+    if (name === 'fill_form') bucket(agentId).fillForm += 1;
+    else if (name === 'click' || name === 'find_and_click') bucket(agentId).click += 1;
+    else if (name === 'type') bucket(agentId).type += 1;
+    else if (name === 'navigate') bucket(agentId).navigate += 1;
+    else if (name === 'report_finding' || name === 'mcp__harness__report_finding')
+      bucket(agentId).reportFinding += 1;
+  }
+  return Array.from(map.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([agentId, counts]) => ({ agentId, ...counts }));
 }

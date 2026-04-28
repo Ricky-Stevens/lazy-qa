@@ -166,4 +166,113 @@ export const walkPagination: Playbook<WalkPaginationInput> = {
   },
 };
 
+/**
+ * table_sort_each_column — clicks every sortable column header and verifies
+ * the row order actually changes. Catches "sort doesn't sort" bugs (sort
+ * indicator updates but rows stay put), "sort only the visible page" (rows
+ * change but pagination resets unexpectedly), and "sort throws 5xx" (server
+ * crashes on certain orderBy values).
+ */
+const tableSortShape = {
+  tableId: z.string(),
+} satisfies z.ZodRawShape;
+
+export interface TableSortInput {
+  tableId: string;
+}
+
+export const tableSortEachColumn: Playbook<TableSortInput> = {
+  name: 'table_sort_each_column',
+  description:
+    'Click each sortable column header on the named table and verify the row order changes. Detects "sort indicator updates but rows are unchanged" (broken sort) and "sort throws 5xx". Inputs: `tableId` from the latest snapshot.',
+  categories: ['table'],
+  estimatedDurationMs: 8_000,
+  inputShape: tableSortShape,
+  async run(input, ctx): Promise<PlaybookOutcome> {
+    const steps: PlaybookStep[] = [];
+    const evidence: Record<string, unknown> = { tableId: input.tableId };
+
+    const model = await ctx.pageModel();
+    const table = model.tables.find((t) => t.id === input.tableId);
+    if (!table) {
+      return fail(
+        tableSortEachColumn.name,
+        `table '${input.tableId}' not found (${model.tables.length} table(s) on page)`,
+        evidence,
+        steps,
+      );
+    }
+
+    const sortableCols = table.columns.filter((c) => c.sortable);
+    if (sortableCols.length === 0) {
+      return ok(
+        tableSortEachColumn.name,
+        `Table '${input.tableId}' has no sortable columns. Nothing to test.`,
+        evidence,
+        steps,
+      );
+    }
+
+    const baseline = await snapshotTable(ctx.page, table, 0);
+    evidence.baseline = baseline;
+    evidence.columnsTested = sortableCols.map((c) => c.label);
+
+    const failures: Array<{ column: string; reason: string }> = [];
+    for (const col of sortableCols) {
+      const headerLoc = ctx.page.locator(col.headerLocator).first();
+      const before = await snapshotTable(ctx.page, table, 0);
+      try {
+        await headerLoc.click({ timeout: STEP_TIMEOUT_MS });
+      } catch (err) {
+        failures.push({
+          column: col.label,
+          reason: `click failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        steps.push({ label: `sort '${col.label}': click failed`, ok: false });
+        continue;
+      }
+      await ctx.page
+        .waitForLoadState('networkidle', { timeout: STEP_TIMEOUT_MS })
+        .catch(() => undefined);
+      await ctx.page.waitForTimeout(200);
+      const after = await snapshotTable(ctx.page, table, 0);
+      const orderChanged = before.firstRowText !== after.firstRowText;
+      const rowCountSame = before.rowCount === after.rowCount;
+      if (!orderChanged && before.rowCount > 1) {
+        failures.push({
+          column: col.label,
+          reason:
+            'first-row text identical after sort click — sort indicator may have updated but rows did not',
+        });
+      } else if (!rowCountSame) {
+        failures.push({
+          column: col.label,
+          reason: `row count changed (${before.rowCount} → ${after.rowCount}) — sort may have triggered an unexpected filter`,
+        });
+      }
+      steps.push({
+        label: `sort '${col.label}': orderChanged=${orderChanged} rowCount=${before.rowCount}→${after.rowCount}`,
+        ok: orderChanged && rowCountSame,
+      });
+    }
+
+    evidence.failures = failures;
+
+    if (failures.length > 0) {
+      return suspicious(
+        tableSortEachColumn.name,
+        `${failures.length}/${sortableCols.length} sortable column(s) misbehaved: ${failures.map((f) => f.column).join(', ')}. Each is a candidate finding (broken sort).`,
+        evidence,
+        steps,
+      );
+    }
+    return ok(
+      tableSortEachColumn.name,
+      `All ${sortableCols.length} sortable column(s) on '${input.tableId}' changed row order on click; sort behaves correctly.`,
+      evidence,
+      steps,
+    );
+  },
+};
+
 export type { PlaybookOutcome };

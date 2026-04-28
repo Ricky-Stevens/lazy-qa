@@ -645,6 +645,14 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     return tool(name, description, shape, handler as never);
   }
 
+  // Per-agent recent-navigate ring buffer for loop detection. Tracks the last
+  // 12 navigates so a repeated visit to the same URL can return a hint instead
+  // of silently re-loading. Last run, power-user navigated to /#/complain 15
+  // times — burning ~30 turns on a single dead route.
+  const recentNavTargets: string[] = [];
+  const NAV_LOOP_WINDOW = 12;
+  const NAV_LOOP_THRESHOLD = 3;
+
   const primitiveTools = [
     defTool(
       'snapshot',
@@ -718,6 +726,12 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         const fromUrl = page.url();
         await awaitPauseIfNeeded();
         invalidateModelCache();
+
+        // Loop-detection: count this URL's recurrence in the recent ring.
+        const occurrences = recentNavTargets.filter((u) => u === url).length;
+        recentNavTargets.push(url);
+        if (recentNavTargets.length > NAV_LOOP_WINDOW) recentNavTargets.shift();
+
         try {
           await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
           // Wait briefly for SPA hydration so the post-nav PageModel sees the
@@ -752,7 +766,15 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           });
         }
         speculate(page);
-        return textResult(statusOk(page, `navigate(${url})`));
+        // Append a loop-detection hint to the navigate result when we've been
+        // here repeatedly. The page actually loaded — we're not blocking. Just
+        // signalling that further visits to the same route are unlikely to
+        // surface new affordances and the agent should pick something else.
+        let baseStatus = statusOk(page, `navigate(${url})`);
+        if (occurrences >= NAV_LOOP_THRESHOLD) {
+          baseStatus = `${baseStatus}\n[nav-loop] You've navigated to this URL ${occurrences + 1} times in your last ${recentNavTargets.length} navigations and nothing new has surfaced. STOP returning here. Pick a route from the snapshot you have NOT yet exercised, or pivot to a different action class (fill_form, click an unexplored button, fetch_resource a new endpoint).`;
+        }
+        return textResult(baseStatus);
       },
     ),
 
@@ -766,6 +788,239 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       speculate(page);
       return textResult(statusOk(page, 'back'));
     }),
+
+    defTool(
+      'reload',
+      'Reload the current page. Critical for QA persistence verification — after saving a form, reload to confirm the change actually persisted. Returns a status line.',
+      {},
+      async () => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        invalidateModelCache();
+        await page
+          .reload({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
+          .catch(() => undefined);
+        await page.waitForLoadState('networkidle', { timeout: 2_500 }).catch(() => undefined);
+        speculate(page);
+        return textResult(statusOk(page, 'reload'));
+      },
+    ),
+
+    defTool(
+      'hover',
+      "Hover the cursor over an element. Reveals hover-only menus (kebabs, tooltips, dropdown menus) that aren't visible until hovered. Locator follows the same shape as click. Returns a status line.",
+      { locator: z.string().min(1) },
+      async ({ locator }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        invalidateModelCache();
+        try {
+          await page.locator(locator).first().hover({ timeout: 5_000 });
+          // Brief settle so hover-triggered menus render before next action.
+          await page.waitForTimeout(150);
+          return textResult(statusOk(page, `hover(${locator})`));
+        } catch (err) {
+          return textResult(statusFail(page, `hover(${locator})`, err));
+        }
+      },
+    ),
+
+    defTool(
+      'wait_for_selector',
+      'Wait for a Playwright locator to be visible (or hidden) before continuing. Use this when an action triggered an async render and you want to assert the new element appeared. `state` defaults to "visible"; pass "hidden" for the inverse. `timeoutMs` defaults to 5000.',
+      {
+        locator: z.string().min(1),
+        state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional(),
+        timeoutMs: z.number().int().min(100).max(30_000).optional(),
+      },
+      async ({ locator, state, timeoutMs }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        try {
+          await page
+            .locator(locator)
+            .first()
+            .waitFor({ state: state ?? 'visible', timeout: timeoutMs ?? 5_000 });
+          return textResult(`OK wait_for_selector(${locator}, state=${state ?? 'visible'})`);
+        } catch (err) {
+          return textResult(
+            `FAIL wait_for_selector(${locator}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+
+    defTool(
+      'scroll_to',
+      "Scroll an element into view. Use when a button or link is below the fold and Playwright's auto-scroll on click isn't doing enough (e.g. inside a virtualised list). Locator follows the same shape as click.",
+      { locator: z.string().min(1) },
+      async ({ locator }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        try {
+          await page.locator(locator).first().scrollIntoViewIfNeeded({ timeout: 3_000 });
+          return textResult(`OK scroll_to(${locator})`);
+        } catch (err) {
+          return textResult(
+            `FAIL scroll_to(${locator}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+
+    defTool(
+      'get_text',
+      'Read the visible text content of an element. Returns the trimmed innerText (capped at 2 KB). Use this to verify a saved value is displayed correctly without dropping back into evaluate. Locator follows the same shape as click.',
+      { locator: z.string().min(1) },
+      async ({ locator }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        try {
+          const text = await page.locator(locator).first().innerText({ timeout: 3_000 });
+          const trimmed = (text ?? '').trim();
+          const capped = trimmed.length > 2048 ? `${trimmed.slice(0, 2048)}…` : trimmed;
+          return textResult(`text(${locator}): ${redactForLlm(capped)}`);
+        } catch (err) {
+          return textResult(
+            `FAIL get_text(${locator}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+
+    defTool(
+      'get_value',
+      'Read the current value of an input/textarea/select. Use to verify a form field carries the expected value (round-trip persistence checks). Locator follows the same shape as click.',
+      { locator: z.string().min(1) },
+      async ({ locator }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        try {
+          const value = await page.locator(locator).first().inputValue({ timeout: 3_000 });
+          const capped = (value ?? '').length > 2048 ? `${value.slice(0, 2048)}…` : value;
+          return textResult(`value(${locator}): ${redactForLlm(capped)}`);
+        } catch (err) {
+          return textResult(
+            `FAIL get_value(${locator}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+
+    defTool(
+      'upload_file',
+      'Set the files on a file input. The harness writes a small synthetic file (PNG/PDF/text per kind) to a temp path and points the input at it. Use this to test file-size limits, content-type validation, and upload error handling. `kind` controls the file type generated; `sizeBytes` controls payload size (capped at 5 MB). Locator must point at an `<input type="file">`.',
+      {
+        locator: z.string().min(1),
+        kind: z.enum(['png', 'jpeg', 'pdf', 'txt', 'svg', 'html']).optional(),
+        sizeBytes: z.number().int().min(1).max(5_000_000).optional(),
+      },
+      async ({ locator, kind, sizeBytes }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        const k = kind ?? 'png';
+        const size = sizeBytes ?? 1024;
+        try {
+          const tmp = await import('node:os').then((m) => m.tmpdir());
+          const path = await import('node:path');
+          const fs = await import('node:fs/promises');
+          const filename = `regress-upload-${Date.now()}.${k}`;
+          const filepath = path.join(tmp, filename);
+          // Generate a small synthetic file. For binary kinds we just write
+          // padding bytes — most upload validators check magic-bytes / mime-type
+          // separately and the test value is in seeing how the app handles
+          // arbitrary content under that extension.
+          const header = (() => {
+            switch (k) {
+              case 'png':
+                return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+              case 'jpeg':
+                return Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+              case 'pdf':
+                return Buffer.from('%PDF-1.4\n');
+              case 'svg':
+                return Buffer.from(
+                  '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>',
+                );
+              case 'html':
+                return Buffer.from(
+                  '<!doctype html><html><body><script>alert(1)</script></body></html>',
+                );
+              default:
+                return Buffer.from('regress-harness synthetic upload\n');
+            }
+          })();
+          const padBytes = Math.max(0, size - header.length);
+          const buf = Buffer.concat([header, Buffer.alloc(padBytes, 0x41)]);
+          await fs.writeFile(filepath, buf);
+          await page.locator(locator).first().setInputFiles(filepath, { timeout: 5_000 });
+          return textResult(
+            `OK upload_file(${locator}, ${k}, ${buf.length} bytes) — file at ${filepath}`,
+          );
+        } catch (err) {
+          return textResult(
+            `FAIL upload_file(${locator}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+
+    defTool(
+      'set_dialog_response',
+      'Configure how the next browser-native dialog (alert, confirm, prompt) is handled. Default behaviour without this is to dismiss. Pass `accept: true` to accept the dialog (clicks OK / yes); supply `text` to fill a prompt(). The setting applies to the NEXT dialog only and is then cleared.',
+      {
+        accept: z.boolean(),
+        text: z.string().optional(),
+      },
+      async ({ accept, text }) => {
+        const page = ensureListeners();
+        const handler = async (dialog: import('playwright').Dialog) => {
+          try {
+            if (accept) await dialog.accept(text);
+            else await dialog.dismiss();
+          } catch {
+            // ignore
+          } finally {
+            page.off('dialog', handler);
+          }
+        };
+        page.once('dialog', handler);
+        return textResult(
+          `OK set_dialog_response(accept=${accept}${text !== undefined ? `, text=${JSON.stringify(text)}` : ''}) — applies to next dialog only`,
+        );
+      },
+    ),
+
+    defTool(
+      'submit_form',
+      'Submit a form programmatically via form.requestSubmit() (or .submit() fallback). Use when the visible submit button is disabled by client validation but you want to test the server-side path anyway. Locator must point at a `<form>` element. Returns a status line.',
+      { locator: z.string().min(1) },
+      async ({ locator }) => {
+        const page = ensureListeners();
+        await awaitPauseIfNeeded();
+        invalidateModelCache();
+        try {
+          await page
+            .locator(locator)
+            .first()
+            .evaluate(((el: unknown) => {
+              // biome-ignore lint/suspicious/noExplicitAny: DOM types not in Node lib
+              const node = el as any;
+              const form = node?.tagName === 'FORM' ? node : node?.closest?.('form');
+              if (!form) throw new Error('no form ancestor found');
+              if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+              } else {
+                form.submit();
+              }
+            }) as never);
+          await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => undefined);
+          return textResult(statusOk(page, `submit_form(${locator})`));
+        } catch (err) {
+          return textResult(statusFail(page, `submit_form(${locator})`, err));
+        }
+      },
+    ),
 
     defTool(
       'click',
@@ -1673,6 +1928,15 @@ export const BROWSER_TOOL_NAMES = [
   'mcp__browser__snapshot',
   'mcp__browser__navigate',
   'mcp__browser__back',
+  'mcp__browser__reload',
+  'mcp__browser__hover',
+  'mcp__browser__wait_for_selector',
+  'mcp__browser__scroll_to',
+  'mcp__browser__get_text',
+  'mcp__browser__get_value',
+  'mcp__browser__upload_file',
+  'mcp__browser__set_dialog_response',
+  'mcp__browser__submit_form',
   'mcp__browser__click',
   'mcp__browser__type',
   'mcp__browser__press_key',

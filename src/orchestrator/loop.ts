@@ -25,6 +25,7 @@ import type { Logger } from '../logging/logger.ts';
 import { redactForLlm } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
+import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
 import { computeCostUsd } from './cost.ts';
@@ -94,6 +95,12 @@ export interface LoopInput {
    *  log out, DO NOT re-attempt login]` so the agent knows it's already
    *  authed via inherited storageState. */
   sessionInfo?: { username: string; role?: string };
+  /** Site-playbook text generated for this persona. When present AND the agent
+   *  is not an attacker, a compact reminder block is rendered in every per-turn
+   *  user message. Without per-turn reinforcement the brief stops being
+   *  load-bearing past turn 1 — agents follow the first sentence then drift.
+   *  Excluded for attackers (their freedom-to-attack is a deliberate property). */
+  sitePlaybookText?: string;
 }
 
 /** Run the agent loop. Resolves when the loop terminates. Never throws —
@@ -115,6 +122,14 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
   });
 
   const handlerByName = new Map(rawTools.map((rt) => [rt.name, rt.handler]));
+
+  // Per-agent tracker for form interactions. We add a formId here whenever the
+  // agent calls form_fuzz_validation / form_double_submit / fill_and_verify
+  // with that formId. The per-turn user message reads this and surfaces
+  // un-fuzzed forms in the sitemap as a TODO. Without this, honest personas
+  // chronically navigate without acting on visible forms (run #8: 12 fill_form
+  // calls across 434 tool invocations from honest agents).
+  const fuzzedFormIds = new Set<string>();
 
   // 2. Continuous conversation. We only ever push to this array; the
   // sliding-window compaction rewrites the head in-place when needed.
@@ -150,6 +165,12 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const knownFindings = input.findingCache
       ? input.findingCache.forAgent(agent.id).slice(0, 30)
       : [];
+    // Only honest personas get a per-turn site-playbook reminder. The attacker
+    // is intentionally unconstrained by the inferred site shape — its OWASP
+    // methodology drives target selection.
+    const sitePlaybookForTurn = ATTACKER_PROFILES.has(agent.profileName)
+      ? undefined
+      : input.sitePlaybookText;
     const sharedSnap = input.sharedKnowledge?.snapshot();
     const broadcasts = input.sharedKnowledge
       ? input.sharedKnowledge.consumeBroadcasts(agent.id, agent.profileName)
@@ -168,6 +189,9 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       sharedRoutes: sharedSnap?.routes ?? [],
       broadcasts,
       sessionInfo: input.sessionInfo,
+      sitePlaybookText: sitePlaybookForTurn,
+      fuzzedFormIds,
+      isAttacker: ATTACKER_PROFILES.has(agent.profileName),
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -389,6 +413,19 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           input: capToolCallInput(use.input),
         });
 
+        // Track form interactions for the un-fuzzed-forms TODO. Any of the
+        // three form-touching playbooks count: a fill_and_verify counts because
+        // the agent has at least filled the form once, even if not fuzzed.
+        const formTouchingTools = new Set([
+          'mcp__playbooks__form_fuzz_validation',
+          'mcp__playbooks__form_double_submit',
+          'mcp__playbooks__fill_and_verify',
+        ]);
+        if (formTouchingTools.has(use.name)) {
+          const formId = (use.input as Record<string, unknown> | undefined)?.['formId'];
+          if (typeof formId === 'string' && formId.length > 0) fuzzedFormIds.add(formId);
+        }
+
         const handler = handlerByName.get(use.name);
         if (!handler) {
           const errContent = `Unknown tool: ${use.name}`;
@@ -539,6 +576,13 @@ function buildUserMessage(args: {
   sharedRoutes: SharedDiscoveredRoute[];
   broadcasts: SharedBroadcast[];
   sessionInfo?: { username: string; role?: string };
+  sitePlaybookText?: string;
+  /** Form IDs the agent has already touched (fuzzed / filled / verified) this
+   *  run. Used to render an "Un-fuzzed forms" TODO so honest personas notice
+   *  forms they haven't acted on. */
+  fuzzedFormIds: Set<string>;
+  /** True for attacker profiles. Skips the form-fuzz TODO render for them. */
+  isAttacker: boolean;
 }): string {
   const sections: string[] = [];
 
@@ -568,8 +612,29 @@ function buildUserMessage(args: {
   const intel = renderTeamIntel(args.sharedCredentials, args.sharedRoutes);
   if (intel) sections.push(intel);
 
+  // Per-turn site-playbook reminder. The brief is also in the system prompt,
+  // but a compact reinforcement here keeps it load-bearing past turn 1 — without
+  // it agents follow the first sentence then drift back to "explore the
+  // snapshot." Skipped for attackers (filtered upstream).
+  if (args.sitePlaybookText && args.sitePlaybookText.trim().length > 0) {
+    sections.push(
+      [
+        "[your plan for this site — pursue it, don't drift]",
+        args.sitePlaybookText.trim(),
+        'If a step in the plan succeeds with no surprises, move to the NEXT step rather than re-exploring. Plan steps not yet attempted are higher-priority than the snapshot below.',
+      ].join('\n'),
+    );
+  }
+
   const knownBlock = renderKnownFindings(args.knownFindings);
   if (knownBlock) sections.push(knownBlock);
+
+  // Un-fuzzed forms TODO. Honest personas only — attackers have a different
+  // job (they probe APIs, not UI forms, in the typical attack surface).
+  if (!args.isAttacker) {
+    const todo = renderUnfuzzedFormsTodo(args.siteMap, args.fuzzedFormIds);
+    if (todo) sections.push(todo);
+  }
 
   const snapshot = renderSiteMapSnapshot(args.siteMap);
   if (snapshot) sections.push(snapshot);
@@ -656,6 +721,39 @@ function renderKnownFindings(refs: KnownFindingRef[]): string {
   }
   lines.push(
     'Skip routes already on this list unless you can demonstrate a NEW kind of bug there. Prefer unexplored ground.',
+  );
+  return lines.join('\n');
+}
+
+/** Render the un-fuzzed forms TODO. Walks every route in the sitemap, lists
+ *  any formIds the agent hasn't yet touched (passed any of the form-touching
+ *  playbooks). Empty string when every visible form has been touched.
+ *
+ *  Why: honest personas spent ~3% of tool calls on fill_form across run #8 and
+ *  zero of those used invalid input. Surfacing the duty in every turn message
+ *  forces the agent to act on visible forms instead of just navigating. */
+function renderUnfuzzedFormsTodo(siteMap: SiteMapAccessor, fuzzedFormIds: Set<string>): string {
+  const unfuzzedByRoute = new Map<string, string[]>();
+  let totalUnfuzzed = 0;
+  for (const r of siteMap.listAllRoutes()) {
+    if (!r.formIds || r.formIds.length === 0) continue;
+    const unfuzzed = r.formIds.filter((id) => !fuzzedFormIds.has(id));
+    if (unfuzzed.length === 0) continue;
+    unfuzzedByRoute.set(r.url, unfuzzed);
+    totalUnfuzzed += unfuzzed.length;
+    if (totalUnfuzzed >= 12) break; // cap to keep the message tight
+  }
+  if (totalUnfuzzed === 0) return '';
+
+  const lines: string[] = [
+    `[forms not yet fuzzed by you — ${totalUnfuzzed} pending]`,
+    `Each form on the site is a target. Call mcp__playbooks__form_fuzz_validation({formId: "<id>"}) on each. Forms NOT yet touched:`,
+  ];
+  for (const [url, formIds] of unfuzzedByRoute) {
+    lines.push(`  - ${url}  formIds: ${formIds.join(', ')}`);
+  }
+  lines.push(
+    'You are a QA agent — un-fuzzed forms are unfinished work. Pick one, navigate to its route if not already there, and call form_fuzz_validation.',
   );
   return lines.join('\n');
 }

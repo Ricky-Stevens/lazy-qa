@@ -165,6 +165,28 @@ export function createHarnessMcpServer(
             confidence: args.confidence,
             source: 'agent',
           };
+          // Within-agent dedup. Catches the "same bug, three different titles"
+          // pattern that cost ~9 redundant findings per attacker run. A match
+          // here is treated like the rate-limit branch: synthetic THROTTLED
+          // response, no journey/event/cache write.
+          const dup = findingCache?.findWithinAgentDuplicate(journey.agentId, finding);
+          if (dup) {
+            logger.info('finding.dedup.within_agent', {
+              agentId: journey.agentId,
+              droppedTitle: args.title,
+              droppedRoute: args.route,
+              existingTitle: dup.title,
+              existingRoute: dup.route,
+            });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `THROTTLED — you already filed a similar finding (${dup.severity}: "${dup.title.slice(0, 80)}"). Same route family, same severity, overlapping title. The post-run critic would dedupe this anyway. Move to a DIFFERENT root cause: a different route prefix, a different OWASP category, or a different bug class. If you've now found 3+ findings on the same path prefix, pivot to a new attack surface entirely.`,
+                },
+              ],
+            };
+          }
           if (args.reproduction_actions && args.reproduction_actions.length > 0) {
             finding.reproductionActions = args.reproduction_actions;
           }

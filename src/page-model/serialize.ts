@@ -80,6 +80,17 @@ function fmtTable(t: TableSpec, idx: number): string {
     for (const a of t.filters.slice(0, 4)) lines.push(fmtAction(a));
   }
   if (t.pagination) lines.push(`  pagination @ ${t.pagination.locator}`);
+  if (t.sampleRows && t.sampleRows.length > 0) {
+    lines.push(`  rows (sample, top ${t.sampleRows.length}):`);
+    for (const row of t.sampleRows) {
+      // Show up to 6 cells per row; agents inspecting wider tables can click in.
+      const compact = row
+        .slice(0, 6)
+        .map((c) => (c.length === 0 ? '∅' : c))
+        .join(' | ');
+      lines.push(`    [${compact}]`);
+    }
+  }
   return lines.join('\n');
 }
 
@@ -142,6 +153,20 @@ export function serializeForAgent(model: PageModel): string {
   ];
   if (model.primaryHeading) headerLines.push(`H1: ${model.primaryHeading}`);
   headerLines.push(`Interactive: ${model.interactiveCount}, looksBroken=${model.looksBroken}`);
+
+  // Notices — testbed-style "you just hit a known bug" toasts. Surfaced FIRST,
+  // before everything else, because they're the strongest "file a finding now"
+  // signal we have. Run #7 evidence: completionist auto-solved 7 distinct
+  // OWASP Juice Shop challenges via normal browsing and filed zero findings.
+  if (model.notices && model.notices.length > 0) {
+    headerLines.push(
+      `★ NOTICE — the page reports an in-app event you should treat as a confirmed bug:`,
+    );
+    for (const n of model.notices.slice(0, 5)) headerLines.push(`  • ${n}`);
+    headerLines.push(
+      '  → file_finding NOW with severity=major describing what you just did and the notice text. The post-run reviewer will dedupe duplicates; do NOT skip.',
+    );
+  }
 
   // Modal-blocking warning. Without this, agents on SPAs (Juice Shop's
   // cookie+welcome stack) repeatedly see "Bare interactives (0)" because

@@ -38,4 +38,16 @@ export interface CoverageReport {
   playbooks: Record<string, { ok: number; failed: number; suspicious: number }>;
   /** Per-agent depth. */
   perAgent: Record<string, { playbooks: number; findings: number }>;
+  /** Per-agent primitive interaction counts (click, fill_form, type, navigate,
+   *  report_finding). Optional — present when the runner has parsed events.jsonl
+   *  to populate it. Surfaces "what really happened" alongside playbook-only
+   *  coverage. */
+  primitiveActivity?: Array<{
+    agentId: string;
+    fillForm: number;
+    click: number;
+    type: number;
+    navigate: number;
+    reportFinding: number;
+  }>;
 }

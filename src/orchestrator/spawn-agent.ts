@@ -309,6 +309,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
       findingCache: input.findingCache,
       sharedKnowledge: input.sharedKnowledge,
       sessionInfo: input.sessionInfo,
+      sitePlaybookText: input.sitePlaybookText,
     });
   } catch (err) {
     if (abortController.signal.aborted) {

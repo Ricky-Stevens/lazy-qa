@@ -22,11 +22,28 @@ export interface PlaybookOutcomeRecord {
   status: 'ok' | 'failed' | 'suspicious';
 }
 
+/** Per-agent counts of primitive tool calls. Drawn from events.jsonl alongside
+ *  playbook outcomes — primitive interactions (click, fill_form, type) are
+ *  invisible to the playbook-outcome tally but represent the bulk of what
+ *  honest personas actually do. Exposing them in the coverage report stops
+ *  "0/6 forms exercised" misreading what really happened. */
+export interface PrimitiveActivity {
+  agentId: string;
+  fillForm: number;
+  click: number;
+  type: number;
+  navigate: number;
+  reportFinding: number;
+}
+
 export interface CoverageInputs {
   runId: string;
   siteMap: SiteMap;
   journeys: Journey[];
   playbookOutcomes: PlaybookOutcomeRecord[];
+  /** Optional — when omitted the markdown's "Primitive interactions" section is
+   *  skipped. Caller is expected to derive this from events.jsonl. */
+  primitiveActivity?: PrimitiveActivity[];
 }
 
 const PCT = (numerator: number, denominator: number): string => {
@@ -123,6 +140,7 @@ export function buildCoverageReport(inputs: CoverageInputs): CoverageReport {
     },
     playbooks,
     perAgent,
+    primitiveActivity: inputs.primitiveActivity,
   };
 }
 
@@ -221,6 +239,22 @@ export function renderCoverageMarkdown(report: CoverageReport): string {
     }
   }
   lines.push('');
+
+  // Primitive interactions — only present when the caller supplied them. This
+  // is the honest "what actually happened" view; playbook-only stats hide
+  // primitive-driven exploration (clicks, fill_forms, navigates).
+  if (report.primitiveActivity && report.primitiveActivity.length > 0) {
+    lines.push('## Primitive interactions (per agent)');
+    lines.push('');
+    lines.push('| agent | navigate | click | type | fill_form | report_finding |');
+    lines.push('|---|---|---|---|---|---|');
+    for (const p of report.primitiveActivity) {
+      lines.push(
+        `| ${p.agentId} | ${p.navigate} | ${p.click} | ${p.type} | ${p.fillForm} | ${p.reportFinding} |`,
+      );
+    }
+    lines.push('');
+  }
 
   return lines.join('\n');
 }

@@ -116,6 +116,14 @@ export interface TableSpec {
   };
   /** Filter / search affordances near the table. */
   filters: ActionRef[];
+  /** Sample row data — up to 5 rows, each row being column-aligned text from
+   * AX cell/gridcell children. Without this, agents on Angular Material tables
+   * see only `Table #1 — N rows, 3 cols` with no clue about content (last run
+   * the BIP39 mnemonic in the admin feedback table was invisible to the agent
+   * because the snapshot stripped row content). Strings are truncated to 120
+   * chars per cell so the snapshot stays under the budget. Empty when
+   * extraction failed (table not yet hydrated, etc.). */
+  sampleRows?: string[][];
 }
 
 /** A discovered modal / dialog. */
@@ -216,6 +224,12 @@ export interface PageModel {
    *  where inputs are wrapped in `<mat-form-field>` or similar instead of a
    *  `<form>`. The agent often needs these to trigger search-driven flows. */
   bareFields: BareFieldRef[];
+  /** Page-level "notice" text — toasts, banners, success/failure messages
+   *  surfaced by the app or its testbed harness (e.g. OWASP Juice Shop's
+   *  "You successfully solved a challenge: X" popups). Without this, the
+   *  structured snapshot strips toast text entirely and agents miss strong
+   *  bug signals. Empty when no notices present. */
+  notices?: string[];
   /** Affordances surfaced by clicking buttons/kebabs/etc. and observing
    * what opened. Optional: absent (or empty) if the route hasn't been probed
    * yet. The probe is non-destructive but takes a few seconds, so it only
