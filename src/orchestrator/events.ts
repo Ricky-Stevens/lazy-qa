@@ -252,10 +252,68 @@ export function capToolCallInput(input: unknown): string {
 
 // ─── EventWriter ─────────────────────────────────────────────────────────────
 
+/** One-line audit summary of an event. Used by the optional console tap on
+ *  EventWriter so an interactive run shows progress without the operator
+ *  having to tail events.jsonl. Returns null for events not worth surfacing. */
+export function formatEventLine(e: Event): string | null {
+  switch (e.type) {
+    case 'run.start':
+      return `▶ run start  target=${e.targetUrl} agents=${e.agentIds.join(',')}`;
+    case 'run.end':
+      return `■ run end    findings=${e.totalFindings} cost=$${e.totalCostUsd.toFixed(4)}`;
+    case 'crawl.probe.submit':
+      return `  crawl probe ${e.kind}  ${e.route}`;
+    case 'crawl.probe.result': {
+      const tag = e.ok ? 'ok' : 'fail';
+      return `  crawl ${tag}     status=${e.status ?? '∅'} ${e.durationMs}ms`;
+    }
+    case 'crawl.complete':
+      return `✓ crawl done  routes=${e.routeCount} ${e.durationMs}ms`;
+    case 'agent.start':
+      return `▶ agent ${e.agentId} start  profile=${e.profileName} model=${e.model}`;
+    case 'agent.end':
+      return `■ agent ${e.agentId} end    reason=${e.terminationReason} turns=${e.turns} cost=$${e.costUsd.toFixed(4)} findings=${e.findingCount}`;
+    case 'agent.turn.start':
+      return `  ${e.agentId} turn ${e.turn} start (${e.modelUsed})`;
+    case 'agent.turn.end':
+      return null; // too chatty
+    case 'tool.call':
+      return `  ${e.agentId} t${e.turn} → ${e.name}`;
+    case 'tool.result':
+      return e.ok ? null : `  ${e.agentId} t${e.turn} ✗ ${e.name} failed`;
+    case 'navigate': {
+      const tag = e.refused ? `REFUSED (${e.reason ?? 'unknown'})` : 'ok';
+      return `  ${e.agentId} navigate → ${e.toUrl} ${tag}`;
+    }
+    case 'finding.report':
+      return `  ★ finding   ${e.agentId}  ${e.finding.severity}  ${e.finding.title.slice(0, 80)}`;
+    case 'playbook.outcome':
+      return `  ${e.agentId} playbook ${e.playbookName} → ${e.status}`;
+    case 'supervisor.intervention':
+      return `  ⚠ supervisor ${e.kind}  ${e.detail.slice(0, 80)}`;
+    case 'critic.start':
+      return `▶ critic start  findings=${e.findingCount} model=${e.model}`;
+    case 'critic.verdict':
+      return `  critic verdict ${e.findingId} → ${e.verdict}`;
+    case 'critic.end':
+      return `■ critic done  cost=$${e.totalCostUsd.toFixed(4)} ${e.durationMs}ms`;
+    case 'critic.verify.start':
+      return `  ▶ verify ${e.findingId} (${e.model})`;
+    case 'critic.verify.end':
+      return `  ■ verify ${e.findingId} → ${e.verdict} cost=$${e.costUsd.toFixed(4)}`;
+    default:
+      return null;
+  }
+}
+
 export class EventWriter {
   private seq = 0;
   private fd: FileHandle | null = null;
   private queue: Promise<void> = Promise.resolve();
+  /** Optional tap: when set, every event is also fed to this consumer in
+   *  addition to being persisted. Used by `bin/regress.ts` to print a
+   *  human-readable audit log to stderr while the run is in progress. */
+  public consoleTap: ((e: Event) => void) | null = null;
 
   constructor(
     private filepath: string,
@@ -281,6 +339,13 @@ export class EventWriter {
       ...event,
     } as Event;
     const line = `${JSON.stringify(enriched)}\n`;
+    if (this.consoleTap) {
+      try {
+        this.consoleTap(enriched);
+      } catch {
+        // Tap failures must not break the persistent write path.
+      }
+    }
     this.queue = this.queue.then(async () => {
       if (!this.fd) throw new Error('EventWriter not open');
       await this.fd.write(line);

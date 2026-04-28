@@ -156,7 +156,10 @@ export function recordHttpStatus(agentId: string, status: number): void {
   if (s.recentHttpStatuses.length > HTTP_STATUS_BUFFER_LIMIT) s.recentHttpStatuses.shift();
 }
 
-/** How many 4xx responses has this agent seen in the last `windowMs` ms? */
+/** How many 4xx responses has this agent seen in the last `windowMs` ms?
+ *  4xx is informational only — auth boundaries and IDOR probes legitimately
+ *  produce 4xx during security testing, so we no longer use this as a
+ *  storm trigger. Kept exported for diagnostics / future tuning. */
 export function count4xxIn(agentId: string, windowMs: number): number {
   const s = states.get(agentId);
   if (!s) return 0;
@@ -164,6 +167,21 @@ export function count4xxIn(agentId: string, windowMs: number): number {
   let n = 0;
   for (const entry of s.recentHttpStatuses) {
     if (entry.ts >= cutoff && entry.status >= 400 && entry.status < 500) n += 1;
+  }
+  return n;
+}
+
+/** How many 5xx responses has this agent seen in the last `windowMs` ms?
+ *  This is the canonical "is the backend sick?" signal — 5xx genuinely
+ *  indicates server-side breakage, distinct from honest 4xx auth/access
+ *  responses agents see during normal probing. */
+export function count5xxIn(agentId: string, windowMs: number): number {
+  const s = states.get(agentId);
+  if (!s) return 0;
+  const cutoff = Date.now() - windowMs;
+  let n = 0;
+  for (const entry of s.recentHttpStatuses) {
+    if (entry.ts >= cutoff && entry.status >= 500 && entry.status < 600) n += 1;
   }
   return n;
 }

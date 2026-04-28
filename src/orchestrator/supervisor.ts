@@ -7,6 +7,7 @@ import { computeCostUsd } from './cost.ts';
 import type { EventWriter } from './events.ts';
 import {
   count4xxIn,
+  count5xxIn,
   getGlobalPauseSnapshot,
   pushNudge,
   setGlobalPause,
@@ -44,6 +45,10 @@ export interface SupervisorInput {
   logger: Logger;
   /** Event writer for this run. Optional — emits supervisor.intervention events. */
   events?: EventWriter;
+  /** Target auth type — 'form' or 'none'. When 'none', the relogin_session
+   *  tactic is hidden (there's no login to perform; the recovery handler
+   *  would just fail with a confusing message). */
+  authType: 'form' | 'none';
 }
 
 export interface SupervisorResult {
@@ -55,14 +60,32 @@ export interface SupervisorResult {
   pauseCount: number;
 }
 
-const SYSTEM_PROMPT = `You are the SUPERVISOR. Other AI agents are exploring a target portal in parallel; your job is to keep them productive and unblock them aggressively.
+function buildSystemPrompt(authType: 'form' | 'none'): string {
+  const reloginAvailable = authType === 'form';
+  const authWalledRule = reloginAvailable
+    ? `1. AUTH-WALLED — agent.authWalled=true OR agent.currentUrl contains auth0.com/u/login or oidc/logout or v2/logout
+   → ACTION: relogin_session() once per detected auth wall (it dedupes, so calling it for multiple auth-walled agents in one turn is fine — call it ONCE).
+   → THEN: nudge_agent(each affected agentId, "Session was recovered by the supervisor. Reload the page (mcp__browser__navigate to the dashboard) and continue exploring. Do NOT try to log in yourself.")`
+    : `1. AUTH-WALLED — auth.type='none' for this run, so there is NO login to recover. The relogin_session tactic is unavailable. If an agent appears auth-walled (lots of 401/403, currentUrl on a login page) it means the agent has navigated somewhere that requires auth this run can't provide.
+   → ACTION: nudge_agent(agentId, "This run has no credentials. Stop trying to access authenticated endpoints; explore the public surface (homepage, search, public APIs returning 200) and stay focused on what's reachable.")`;
+
+  const stormRule = reloginAvailable
+    ? `2. BACKEND STORM — TWO OR MORE agents have recent5xxCount >= 3 in the same window, OR ANY agent has recent5xxCount >= 5. 5xx means the backend is genuinely broken (dependency down, unhandled exception, OOM, dependency timeout). 4xx is NOT a storm signal — auth boundaries and access-control probes legitimately produce 4xx during normal exploration.
+   → FIRST ACTION: try relogin_session() once — sometimes 5xx is downstream of a stale session.
+   → THEN: pause_agents({duration_seconds: 60, reason: "backend 5xx storm — waiting for recovery"}).
+   → AFTER PAUSE: on the next cycle, if recent5xxCount is now low, nudge each agent to retry. If it stays high after 2 pauses, the backend is genuinely down — let agents end naturally (do NOT keep pausing forever).`
+    : `2. BACKEND STORM — TWO OR MORE agents have recent5xxCount >= 3 in the same window, OR ANY agent has recent5xxCount >= 5. 5xx means the backend is genuinely broken. 4xx is NOT a storm signal — security probing legitimately produces 4xx.
+   → ACTION: pause_agents({duration_seconds: 60, reason: "backend 5xx storm — waiting for recovery"}).
+   → AFTER PAUSE: on the next cycle, if recent5xxCount is now low, nudge each agent to retry. If it stays high after 2 pauses, the backend is genuinely down — let agents end naturally.`;
+
+  return `You are the SUPERVISOR. Other AI agents are exploring a target portal in parallel; your job is to keep them productive and unblock them aggressively.
 
 You do NOT explore. You do NOT have browser tools. You only orchestrate.
 
 YOUR LOOP:
 1. Call list_agents to see all agents' state.
 2. Identify problems aggressively (see DETECTION RULES below).
-3. Take action: relogin_session for auth issues, pause_agents for backend storms, nudge_agent for stuck agents.
+3. Take action: ${reloginAvailable ? 'relogin_session for auth issues, ' : ''}pause_agents for backend storms, nudge_agent for stuck agents.
 4. Call wait({seconds: 30}) — DO NOT poll faster than every 30s. The agents need time to act on your interventions.
 5. Repeat until every agent is status='finished' or status='errored'.
 
@@ -70,14 +93,9 @@ OUTPUT FORMAT: Tool calls only. Zero prose. Zero "I'll now check...". Zero "Let 
 
 DETECTION RULES (intervene aggressively, don't second-guess):
 
-1. AUTH-WALLED — agent.authWalled=true OR agent.currentUrl contains auth0.com/u/login or oidc/logout or v2/logout
-   → ACTION: relogin_session() once per detected auth wall (it dedupes, so calling it for multiple auth-walled agents in one turn is fine — call it ONCE).
-   → THEN: nudge_agent(each affected agentId, "Session was recovered by the supervisor. Reload the page (mcp__browser__navigate to the dashboard) and continue exploring. Do NOT try to log in yourself.")
+${authWalledRule}
 
-2. BACKEND STORM — TWO OR MORE agents have recent4xxCount >= 5 in the same window, OR ANY agent has recent4xxCount >= 10. This means the backend is unhealthy (WAF cool-down, rate limit, dependency down) and agents will burn budget filing duplicate findings.
-   → FIRST ACTION: try relogin_session() once — sometimes the storm is just session expiry.
-   → THEN: pause_agents({duration_seconds: 60, reason: "backend 4xx storm — waiting for recovery"}). This makes ALL agents sleep on their next action; saves token cost while the backend recovers.
-   → AFTER PAUSE: on your next cycle, check list_agents again. If recent4xxCount is now low, nudge_agent each affected agent to retry the dashboard. If it's still high after 2 pauses, the backend is genuinely down — let the agents end naturally (do NOT keep pausing forever).
+${stormRule}
 
 3. NO PROGRESS — Date.now() - agent.lastActionAt > 60_000 (>60s since last browser action) AND status === 'active' AND NOT currently paused
    → ACTION: nudge_agent(agentId, "You haven't taken an action in over a minute. Try a completely different approach: <reference their recentTools and currentUrl to suggest something specific, e.g. 'open a kebab menu on a table row' or 'navigate to the dashboard and pick a different module'>.")
@@ -88,6 +106,7 @@ WHEN TO STOP:
 - Hard rule: never end_session while ANY agent is still active or auth_walled.
 
 BE SPECIFIC IN NUDGES. Reference what the agent was actually doing. A vague nudge is wasted; a nudge that names their currentUrl + recentTools and points to a concrete next step is what unblocks them.`;
+}
 
 export async function runSupervisor(input: SupervisorInput): Promise<SupervisorResult> {
   const client = new Anthropic({ apiKey: input.apiKey });
@@ -101,6 +120,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
   let selfEnded = false;
   let endedReason: SupervisorResult['endedReason'] = 'max-turns';
 
+  const systemPrompt = buildSystemPrompt(input.authType);
   const tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
   // Tool definitions. RawToolDef shape is reused so we get z.toJSONSchema for free.
@@ -118,6 +138,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
           const lastActionAgo = a.lastActionAt ? Math.round((now - a.lastActionAt) / 1000) : null;
           const lastTurnAgo = a.lastTurnAt ? Math.round((now - a.lastTurnAt) / 1000) : null;
           const recent4xx = count4xxIn(a.agentId, 30_000);
+          const recent5xx = count5xxIn(a.agentId, 30_000);
           const agentPauseRemainingSec =
             a.pauseUntil && a.pauseUntil > now ? Math.round((a.pauseUntil - now) / 1000) : 0;
           return JSON.stringify({
@@ -132,6 +153,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
             findings: a.findingsCount,
             recentTools: a.recentTools,
             recent4xxCount: recent4xx,
+            recent5xxCount: recent5xx,
             agentPauseRemainingSec,
             hasPendingNudge: a.pendingNudge !== null,
           });
@@ -271,7 +293,14 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
     },
   ];
 
-  const anthropicToolsRaw: Anthropic.Tool[] = rawTools.map((rt) => {
+  // For runs with auth.type='none' there is no login to recover. Hide the
+  // relogin_session tool entirely so the supervisor's LLM can't waste a turn
+  // calling it (and getting "Cannot recover: session was started without
+  // form credentials" back).
+  const enabledTools =
+    input.authType === 'form' ? rawTools : rawTools.filter((t) => t.name !== 'relogin_session');
+
+  const anthropicToolsRaw: Anthropic.Tool[] = enabledTools.map((rt) => {
     const objSchema = z.object(rt.shape);
     const jsonSchema = z.toJSONSchema(objSchema) as Record<string, unknown>;
     return {
@@ -294,7 +323,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
         ]
       : [];
 
-  const handlerByName = new Map(rawTools.map((rt) => [rt.name, rt.handler]));
+  const handlerByName = new Map(enabledTools.map((rt) => [rt.name, rt.handler]));
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -319,7 +348,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
         system: [
           {
             type: 'text',
-            text: SYSTEM_PROMPT,
+            text: systemPrompt,
             cache_control: { type: 'ephemeral', ttl: '1h' },
           },
         ],

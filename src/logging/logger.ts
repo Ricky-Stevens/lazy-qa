@@ -92,12 +92,60 @@ export interface LoggerOptions {
   level?: LogLevel;
   runId?: string;
   bindings?: Record<string, unknown>;
+  /** 'json' (default — one JSON object per line) | 'pretty' (compact human
+   *  text, color when stdout is a TTY). Override via LOG_FORMAT env var. */
+  format?: 'json' | 'pretty';
+}
+
+const ANSI = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  green: '\x1b[32m',
+  cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
+  gray: '\x1b[90m',
+} as const;
+
+const LEVEL_COLOR: Record<LogLevel, string> = {
+  debug: ANSI.gray,
+  info: ANSI.cyan,
+  warn: ANSI.yellow,
+  error: ANSI.red,
+};
+
+function shortTime(iso: string): string {
+  // "2026-04-28T13:46:36.178Z" → "13:46:36"
+  return iso.slice(11, 19);
+}
+
+function formatFields(fields: Record<string, unknown>, useColor: boolean): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined) continue;
+    let s: string;
+    if (typeof v === 'string') s = v;
+    else if (v === null) s = 'null';
+    else if (typeof v === 'object') s = JSON.stringify(v);
+    else s = String(v);
+    if (s.length > 120) s = `${s.slice(0, 117)}…`;
+    parts.push(useColor ? `${ANSI.dim}${k}=${ANSI.reset}${s}` : `${k}=${s}`);
+  }
+  return parts.join(' ');
 }
 
 export function createLogger(opts: LoggerOptions = {}): Logger {
   const envLevel = process.env.LOG_LEVEL as LogLevel | undefined;
   const level = opts.level ?? envLevel ?? 'info';
   const threshold = LEVEL_ORDER[level] ?? LEVEL_ORDER.info;
+  const envFormat = process.env.LOG_FORMAT as 'json' | 'pretty' | undefined;
+  // Default to pretty when stdout is a TTY (interactive shell) so users see
+  // a readable audit log without flag-flipping. Pipes / CI / file redirects
+  // get JSON, which downstream tooling can grep.
+  const interactiveDefault: 'json' | 'pretty' = process.stdout.isTTY ? 'pretty' : 'json';
+  const format = opts.format ?? envFormat ?? interactiveDefault;
+  const useColor = format === 'pretty' && process.stdout.isTTY === true;
   const baseBindings: Record<string, unknown> = {
     ...(opts.runId ? { runId: opts.runId } : {}),
     ...(opts.bindings ?? {}),
@@ -105,14 +153,41 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
 
   function emit(lvl: LogLevel, msg: string, fields?: Record<string, unknown>) {
     if (LEVEL_ORDER[lvl] < threshold) return;
-    const payload = {
-      ts: new Date().toISOString(),
-      level: lvl,
-      ...baseBindings,
-      msg,
-      ...(fields ? (deepRedact(fields) as Record<string, unknown>) : {}),
-    };
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
+    const ts = new Date().toISOString();
+    const redactedFields = fields ? (deepRedact(fields) as Record<string, unknown>) : undefined;
+    if (format === 'pretty') {
+      const colorOpen = useColor ? LEVEL_COLOR[lvl] : '';
+      const colorClose = useColor ? ANSI.reset : '';
+      const lvlTag = `${colorOpen}${lvl.toUpperCase().padEnd(5)}${colorClose}`;
+      const dimTs = useColor ? `${ANSI.dim}${shortTime(ts)}${ANSI.reset}` : shortTime(ts);
+      // Surface agentId / phase / tool prominently when present.
+      const agentId = baseBindings.agentId ?? redactedFields?.agentId;
+      const phase = baseBindings.phase ?? redactedFields?.phase;
+      const tagBits: string[] = [];
+      if (phase) tagBits.push(String(phase));
+      if (agentId && agentId !== phase) tagBits.push(String(agentId));
+      const tag = tagBits.length > 0 ? `[${tagBits.join('/')}] ` : '';
+      const fieldsStr = redactedFields
+        ? formatFields(
+            // strip agentId/phase from the fields tail since we surfaced them in the tag
+            Object.fromEntries(
+              Object.entries(redactedFields).filter(([k]) => k !== 'agentId' && k !== 'phase'),
+            ),
+            useColor,
+          )
+        : '';
+      const line = `${dimTs} ${lvlTag} ${tag}${msg}${fieldsStr ? ` ${fieldsStr}` : ''}\n`;
+      process.stdout.write(line);
+    } else {
+      const payload = {
+        ts,
+        level: lvl,
+        ...baseBindings,
+        msg,
+        ...(redactedFields ?? {}),
+      };
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+    }
   }
 
   return {
@@ -121,7 +196,7 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
     warn: (m, f) => emit('warn', m, f),
     error: (m, f) => emit('error', m, f),
     child(bindings) {
-      return createLogger({ level, bindings: { ...baseBindings, ...bindings } });
+      return createLogger({ level, format, bindings: { ...baseBindings, ...bindings } });
     },
   };
 }

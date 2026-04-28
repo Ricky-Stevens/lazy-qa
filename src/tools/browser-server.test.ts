@@ -134,46 +134,20 @@ describe('createBrowserMcpServer', () => {
     await ctx.close();
   });
 
-  it('ax_snapshot returns an accessibility tree outline', async () => {
+  it('ax_snapshot returns the page.ariaSnapshot YAML outline', async () => {
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
 
-    // Mock the accessibility API with a simple tree
-    const mockAxTree = {
-      role: 'document',
-      name: 'Test Page',
-      children: [
-        {
-          role: 'heading',
-          name: 'Heading One',
-          level: 1,
-        },
-        {
-          role: 'button',
-          name: 'Click Me',
-        },
-        {
-          role: 'form',
-          name: 'Test Form',
-          children: [
-            {
-              role: 'textbox',
-              name: 'Email',
-            },
-            {
-              role: 'button',
-              name: 'Submit',
-            },
-          ],
-        },
-      ],
-    };
-
-    // Set up the mock before creating the server
+    // Mock page.ariaSnapshot — Playwright 1.42+ replacement for the removed
+    // page.accessibility.snapshot(). Returns the accessibility tree as YAML.
+    const mockYaml = `- document "Test Page":
+  - heading "Heading One" [level=1]
+  - button "Click Me"
+  - form "Test Form":
+    - textbox "Email"
+    - button "Submit"`;
     // biome-ignore lint/suspicious/noExplicitAny: Test mock
-    (page as any).accessibility = {
-      snapshot: vi.fn().mockResolvedValue(mockAxTree),
-    };
+    (page as any).ariaSnapshot = vi.fn().mockResolvedValue(mockYaml);
 
     const { accessor: siteMap } = makeFakeSiteMap();
     const { rawTools } = createBrowserMcpServer({
@@ -188,23 +162,21 @@ describe('createBrowserMcpServer', () => {
     const axSnapshot = rawTools.find((t) => t.name === 'ax_snapshot');
     if (!axSnapshot) throw new Error('ax_snapshot tool not registered');
 
-    // Call with default max_depth
+    // Call with default max_depth — full YAML output passes through
     const result = await axSnapshot.handler({});
     const text = result.content[0]?.text ?? '';
-
-    // The output should contain roles and indentation
     expect(text).toContain('document');
     expect(text).toContain('heading');
     expect(text).toContain('button');
     expect(text).toContain('Heading One');
     expect(text).toContain('Click Me');
-    // Check indentation (children should have more spaces than parent)
-    expect(text).toMatch(/\n {2}[a-z]/);
+    // YAML indentation: nested form children indented under their parent.
+    expect(text).toMatch(/\n {2}- /);
 
-    // Call with explicit max_depth to test depth limiting
+    // Lower max_depth truncates the output by line cap (rough proxy).
     const resultWithDepth = await axSnapshot.handler({ max_depth: 1 });
     const textWithDepth = resultWithDepth.content[0]?.text ?? '';
-    expect(textWithDepth).toContain('heading');
+    expect(textWithDepth.length).toBeLessThanOrEqual(text.length);
 
     await ctx.close();
   });

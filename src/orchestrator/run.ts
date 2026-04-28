@@ -33,7 +33,7 @@ import { loadSkills } from '../skills/loader.ts';
 import { SelectorCache } from '../tools/selector-cache.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
-import { EventWriter } from './events.ts';
+import { EventWriter, formatEventLine } from './events.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { resolveAgents } from './resolve.ts';
 import { spawnAgent } from './spawn-agent.ts';
@@ -89,10 +89,22 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   const runDir = path.resolve(outputDir, runId);
   await mkdir(runDir, { recursive: true });
 
-  // 3a. Event writer — append-only JSONL for the full run trace.
+  // 3a. Event writer — append-only JSONL for the full run trace. Optionally
+  // teed to stderr in human-readable form when LOG_FORMAT=pretty (or when
+  // stdout is a TTY). Tap writes to stderr so JSON consumers piping stdout
+  // see only the JSON log.
   const eventsPath = path.join(runDir, 'events.jsonl');
   const events = new EventWriter(eventsPath, runId);
   await events.open();
+  const wantPretty =
+    process.env.LOG_FORMAT === 'pretty' ||
+    (process.env.LOG_FORMAT !== 'json' && process.stdout.isTTY === true);
+  if (wantPretty) {
+    events.consoleTap = (e) => {
+      const line = formatEventLine(e);
+      if (line) process.stderr.write(`${line}\n`);
+    };
+  }
 
   // 5. Logger — hoisted above the try so the finally block can use it.
   const logger = opts.logger ?? createLogger({ runId });
@@ -293,6 +305,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
           abortSignal: runAbortController.signal,
           logger: logger.child({ agentId: 'supervisor' }),
           events,
+          authType: cfg.target.auth.type,
         }).catch((err) => {
           // Supervisor is best-effort — never fail the run if it errors.
           logger.error('supervisor.crashed', {

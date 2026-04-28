@@ -143,18 +143,33 @@ type PlaywrightRoute = {
 };
 
 /**
- * Check whether a URL's hostname matches the run's allowed-hosts list.
- * Allows exact-match hosts AND subdomains of allowed hosts (so an entry
- * `staging.example.com` permits `cdn.staging.example.com`). Returns false
- * for invalid URLs.
+ * Check whether a URL's host matches the run's allowed-hosts list.
+ * Match rules (in order):
+ *   1. exact `host:port` match against any allowed entry
+ *   2. exact `hostname` match against any allowed entry (port-stripped both sides)
+ *   3. subdomain match — `cdn.staging.example.com` matches `staging.example.com`
+ * Returns false for invalid URLs. Port-stripping mirrors the crawler's
+ * isAllowedHost so a config entry like `localhost:3000` permits the
+ * agent-tool navigate path even though `URL.hostname` drops the port.
  */
 export function isHostAllowed(url: string, allowedHosts: string[]): boolean {
+  let host: string;
+  let hostname: string;
   try {
-    const { hostname } = new URL(url);
-    return allowedHosts.some((h) => hostname === h || hostname.endsWith(`.${h}`));
+    const u = new URL(url);
+    host = u.host;
+    hostname = u.hostname;
   } catch {
     return false;
   }
+  for (const allowed of allowedHosts) {
+    if (host === allowed) return true;
+    if (hostname === allowed) return true;
+    const allowedHostname = allowed.split(':')[0] ?? allowed;
+    if (hostname === allowedHostname) return true;
+    if (hostname.endsWith(`.${allowedHostname}`)) return true;
+  }
+  return false;
 }
 
 export function createNetworkAllowlistRoute(allowedHosts: string[]) {

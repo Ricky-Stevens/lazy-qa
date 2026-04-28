@@ -176,12 +176,17 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
         })
       : await browser.newContext();
     const page = await context.newPage();
-    if (auth.storage_state_path) {
-      // Try to land on the target so the agent doesn't start at about:blank.
-      await page
-        .goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-        .catch(() => undefined);
-    }
+    // Always land on the target — the crawler reads page.url() to derive
+    // rootUrl, and the agent's first browser tool would otherwise have to
+    // burn a turn on the initial navigate. Best-effort: a goto failure is
+    // logged but does not block; the agent can retry.
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch((err) => {
+      logger.warn('login.goto.failed', {
+        agentId,
+        targetUrl,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
     logger.info('login.skip', { agentId, reason: 'auth.type=none' });
     return { browser, context, page, storageStatePath };
   }

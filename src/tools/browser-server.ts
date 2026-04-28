@@ -20,7 +20,7 @@ import type { Logger } from '../logging/logger.ts';
 import { deepRedact, redactForLlm } from '../logging/logger.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
 import {
-  count4xxIn,
+  count5xxIn,
   getEffectivePauseUntil,
   recordHttpStatus,
   setAgentPause,
@@ -36,7 +36,7 @@ import type { Skill } from '../skills/loader.ts';
 import type { SelectorCache } from './selector-cache.ts';
 
 /** Per-agent backoff thresholds (carried over from v1). */
-const BACKOFF_4XX_THRESHOLD = 5;
+const BACKOFF_5XX_THRESHOLD = 5;
 const BACKOFF_WINDOW_MS = 30_000;
 const BACKOFF_DURATION_MS = 10_000;
 const PAUSE_SLEEP_CAP_MS = 30_000;
@@ -462,14 +462,18 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       // backoff (this server).
       if (agentId) {
         recordHttpStatus(agentId, status);
-        if (status >= 400 && status < 500) {
-          const recent4xx = count4xxIn(agentId, BACKOFF_WINDOW_MS);
-          if (recent4xx >= BACKOFF_4XX_THRESHOLD) {
+        // 5xx storm = real backend brokenness. 4xx is honest signal during
+        // security probing (auth boundaries, IDOR), so we don't throttle on
+        // it — the supervisor's nudge tactic is the right escalation if a
+        // run gets stuck in 4xx-land.
+        if (status >= 500 && status < 600) {
+          const recent5xx = count5xxIn(agentId, BACKOFF_WINDOW_MS);
+          if (recent5xx >= BACKOFF_5XX_THRESHOLD) {
             const until = Date.now() + BACKOFF_DURATION_MS;
             setAgentPause(agentId, until);
-            logger.warn('browser.backoff.4xx', {
+            logger.warn('browser.backoff.5xx', {
               agentId,
-              recent4xx,
+              recent5xx,
               windowMs: BACKOFF_WINDOW_MS,
               pauseMs: BACKOFF_DURATION_MS,
             });
@@ -537,16 +541,21 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
 
     defTool(
       'ax_snapshot',
-      "Return the page's accessibility tree as a text outline. Faster and cheaper than full snapshot — use when you just need to know what's present, not when you need locator strings or form schemas.",
+      "Return the page's accessibility tree as a YAML outline. Faster and cheaper than full snapshot — use when you just need to know what's present, not when you need locator strings or form schemas.",
       { max_depth: z.number().int().min(1).max(20).optional() },
       async (args) => {
         const page = ensureListeners();
         const maxDepth = (args as { max_depth?: number }).max_depth ?? 8;
-        // biome-ignore lint/suspicious/noExplicitAny: Playwright Page.accessibility API
-        const snapshot = await (page as any).accessibility.snapshot({ interestingOnly: true });
-        if (!snapshot) return textResult('(no accessibility tree available)');
-        const text = renderAxTree(snapshot as AxNode, maxDepth);
-        return textResult(redactForLlm(text));
+        // page.accessibility.snapshot() was removed in Playwright 1.42; use
+        // page.ariaSnapshot() which returns a YAML representation of the AX
+        // tree. Truncate by line-count if max_depth is below the default
+        // (rough proxy — depth-aware trimming would need a YAML parse pass
+        // and isn't worth the complexity for a "what's on this page?" tool).
+        const yaml = await page.ariaSnapshot();
+        const lines = yaml.split('\n');
+        const cap = maxDepth >= 8 ? lines.length : maxDepth * 80;
+        const truncated = lines.slice(0, cap).join('\n');
+        return textResult(redactForLlm(truncated));
       },
     ),
 
@@ -751,7 +760,11 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         const page = ensureListeners();
         await awaitPauseIfNeeded();
         try {
-          const wrapped = `() => { try { return JSON.stringify((${expression})); } catch (e) { return String((${expression})); } }`;
+          // Async wrapper so the expression can use top-level `await` (e.g.
+          // `await fetch('/api/foo').then(r=>r.json())`). page.evaluate
+          // resolves the returned promise. We Promise.resolve() the inner
+          // expression so a non-promise value is also valid.
+          const wrapped = `async () => { try { return JSON.stringify(await Promise.resolve((${expression}))); } catch (e) { try { return String(await Promise.resolve((${expression}))); } catch (e2) { return 'evaluate threw: ' + (e2 && e2.message || String(e2)); } } }`;
           const result = await (page.evaluate as unknown as (fn: string) => Promise<string>)(
             wrapped,
           );
