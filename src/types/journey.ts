@@ -7,7 +7,9 @@ export type TerminationReason =
   | 'error'
   | 'timeout'
   | 'signal'
-  | 'max-turns';
+  | 'max-turns'
+  /** SDK-mode loop ended gracefully (SDK exhausted turns or got end_turn). */
+  | 'sdk-end';
 
 /**
  * Token usage for a journey.

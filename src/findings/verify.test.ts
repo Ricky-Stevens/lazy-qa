@@ -1,11 +1,12 @@
 /**
  * Tests for WP4.F — critic-with-browser verification.
  *
- * Mocks both the Anthropic SDK and the parsePage page-model extraction so
+ * Mocks both the LlmBackend and the parsePage page-model extraction so
  * tests don't need a real browser or API key. Each test asserts that a given
  * mocked LLM verdict is parsed correctly and surfaced via VerifyResult.
  */
 import { describe, expect, it, vi } from 'vitest';
+import type { LlmBackend, LlmCallResult } from '../llm/backend.ts';
 import type { Finding } from '../types/finding.ts';
 import { verifyFinding } from './verify.ts';
 
@@ -73,42 +74,46 @@ function makeStubLogger() {
   } as never;
 }
 
-function makeMessageResponse(verdict: string, detail = 'because the page looks fine'): object {
+function makeBackendResult(verdict: string, detail = 'because the page looks fine'): LlmCallResult {
   return {
-    id: 'msg_test',
-    type: 'message',
-    role: 'assistant',
     content: [
       {
         type: 'text',
         text: JSON.stringify({ verdict, detail }),
+        citations: [],
       },
     ],
-    model: 'claude-sonnet-4-6',
-    stop_reason: 'end_turn',
-    stop_sequence: null,
+    stopReason: 'end_turn',
     usage: {
-      input_tokens: 100,
-      output_tokens: 30,
-      cache_read_input_tokens: 0,
-      cache_creation_input_tokens: 0,
+      inputTokens: 100,
+      outputTokens: 30,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
     },
+  };
+}
+
+function makeStubBackend(result: LlmCallResult | Error): LlmBackend {
+  return {
+    kind: 'api',
+    call: vi.fn(async () => {
+      if (result instanceof Error) throw result;
+      return result;
+    }),
   };
 }
 
 describe('verifyFinding', () => {
   it('parses a confirmed_reproducible verdict', async () => {
-    const create = vi
-      .fn()
-      .mockResolvedValue(
-        makeMessageResponse('confirmed_reproducible', 'evidence on page matches the claim'),
-      );
+    const backend = makeStubBackend(
+      makeBackendResult('confirmed_reproducible', 'evidence on page matches the claim'),
+    );
     const result = await verifyFinding({
       finding: makeFinding(),
       page: makeStubPage(),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
@@ -119,17 +124,15 @@ describe('verifyFinding', () => {
   });
 
   it('parses a not_reproducible verdict', async () => {
-    const create = vi
-      .fn()
-      .mockResolvedValue(
-        makeMessageResponse('not_reproducible', 'live page does not show the claim'),
-      );
+    const backend = makeStubBackend(
+      makeBackendResult('not_reproducible', 'live page does not show the claim'),
+    );
     const result = await verifyFinding({
       finding: makeFinding(),
       page: makeStubPage(),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
@@ -137,13 +140,13 @@ describe('verifyFinding', () => {
   });
 
   it('falls back to intermittent when the LLM call throws', async () => {
-    const create = vi.fn().mockRejectedValue(new Error('rate limited'));
+    const backend = makeStubBackend(new Error('rate limited'));
     const result = await verifyFinding({
       finding: makeFinding(),
       page: makeStubPage(),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
@@ -153,22 +156,17 @@ describe('verifyFinding', () => {
   });
 
   it('falls back to intermittent on malformed JSON', async () => {
-    const create = vi.fn().mockResolvedValue({
-      id: 'msg_test',
-      type: 'message',
-      role: 'assistant',
-      content: [{ type: 'text', text: 'not json at all, sorry' }],
-      model: 'claude-sonnet-4-6',
-      stop_reason: 'end_turn',
-      stop_sequence: null,
-      usage: { input_tokens: 10, output_tokens: 10 },
+    const backend = makeStubBackend({
+      content: [{ type: 'text', text: 'not json at all, sorry', citations: [] }],
+      stopReason: 'end_turn',
+      usage: { inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
     });
     const result = await verifyFinding({
       finding: makeFinding(),
       page: makeStubPage(),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
@@ -176,18 +174,19 @@ describe('verifyFinding', () => {
   });
 
   it('still calls the LLM even when navigation fails (with nav error in summary)', async () => {
-    const create = vi.fn().mockResolvedValue(makeMessageResponse('not_reproducible', 'nav failed'));
+    const backend = makeStubBackend(makeBackendResult('not_reproducible', 'nav failed'));
     await verifyFinding({
       finding: makeFinding(),
       page: makeStubPage({ gotoThrows: true }),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
-    expect(create).toHaveBeenCalledTimes(1);
-    const userMessage = create.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    expect((backend.call as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    const callInput = (backend.call as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    const userMessage = callInput?.messages?.[0]?.content as string;
     expect(userMessage).toContain('navigation failed');
   });
 
@@ -197,9 +196,9 @@ describe('verifyFinding', () => {
     // body itself proves the bug (full Swagger spec exposed).
     const swaggerBody =
       '{"openapi":"3.0.0","info":{"title":"Juice Shop API"},"paths":{"/api/Users":{"get":{"summary":"list users"}}}}';
-    const create = vi
-      .fn()
-      .mockResolvedValue(makeMessageResponse('confirmed_reproducible', 'body shows full API spec'));
+    const backend = makeStubBackend(
+      makeBackendResult('confirmed_reproducible', 'body shows full API spec'),
+    );
     await verifyFinding({
       finding: makeFinding({
         title: '/swagger.json full API docs exposed',
@@ -208,12 +207,13 @@ describe('verifyFinding', () => {
       page: makeStubPage({ gotoStatus: 200, body: swaggerBody }),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
     });
-    expect(create).toHaveBeenCalledTimes(1);
-    const userMessage = create.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    expect((backend.call as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    const callInput = (backend.call as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    const userMessage = callInput?.messages?.[0]?.content as string;
     expect(userMessage).toContain('HTTP status: 200');
     expect(userMessage).toContain('RESPONSE BODY SAMPLE');
     expect(userMessage).toContain('Juice Shop API');
@@ -223,7 +223,7 @@ describe('verifyFinding', () => {
   });
 
   it('emits critic.verify.start and critic.verify.end events when an EventWriter is supplied', async () => {
-    const create = vi.fn().mockResolvedValue(makeMessageResponse('confirmed_reproducible'));
+    const backend = makeStubBackend(makeBackendResult('confirmed_reproducible'));
     const events = {
       write: vi.fn().mockResolvedValue(undefined),
       open: vi.fn().mockResolvedValue(undefined),
@@ -234,7 +234,7 @@ describe('verifyFinding', () => {
       page: makeStubPage(),
       rootUrl: 'https://app.test',
       allowedHosts: ['app.test'],
-      client: { messages: { create } as never },
+      backend,
       model: 'claude-sonnet-4-6',
       logger: makeStubLogger(),
       events,

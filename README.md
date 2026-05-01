@@ -15,6 +15,18 @@ bun run scan config/example.yaml
 
 **Runtime:** Bun 1.x (primary). Node 20+ also supported via `tsx`.
 
+### Local dev with the Claude Code subscription (no API credits)
+
+If you have a Claude Pro or Max plan you can run scans locally without consuming API credits. Set `LLM_AUTH=subscription` in `.env` and the `@anthropic-ai/claude-agent-sdk` falls back to the local `claude` CLI's stored OAuth token instead of `ANTHROPIC_API_KEY`. CI must stay on `LLM_AUTH=api` (or unset) and supply a real key — Anthropic does not permit redistributing claude.ai session auth.
+
+Subscription mode runs the persona loop, supervisor, and auth-agent end-to-end via the Claude Agent SDK (`loop-sdk.ts`, `supervisor-sdk.ts`, `auth-agent-sdk.ts`). The per-turn user message injection, summary memory, fuzzed-form tracking, finding cache, shared-knowledge broadcasts, supervisor interventions, and auth-agent login flow all behave the same as API mode. A few features are genuinely SDK-incompatible and stay deferred for subscription runs: manual sliding-window compaction with explicit cache-control breakpoints, the server-side MemoryTool20250818 beta, per-turn planner-vs-Haiku model routing, and per-message max_tokens cap. See the header comment in `src/orchestrator/loop-sdk.ts` for the full honest list. Findings will be similar in character to API-mode but not byte-identical for long-trajectory runs.
+
+```bash
+claude               # one-time, if you haven't already
+echo "LLM_AUTH=subscription" >> .env
+bun run scan config/example.yaml
+```
+
 When the run finishes you'll have:
 
 - `runs/<runId>/findings.json` — every finding the agents filed
@@ -317,7 +329,7 @@ See `skills/playbooks/` for 9 built-in examples. Reference the [Anthropic Agent 
 
 - **`type: form`** (default) — Playwright fills the form. Works for Auth0, generic SSO login pages, anything with username + password + submit. Set `success_url_pattern` or `wait_for_selector` if the post-submit heuristic doesn't fit.
 - **`type: none`** with `storage_state_path` — supply your own pre-built `storageState.json` for MFA / passkey / non-form flows. Generate it once interactively with `bunx playwright codegen`, then reuse.
-- **API key required** — set `ANTHROPIC_API_KEY` in your environment. The direct-API loop does not support subscription auth via the `claude` CLI. The supervisor and post-run reviewer also require the API key.
+- **LLM auth** — defaults to `LLM_AUTH=api` (set `ANTHROPIC_API_KEY`). For local dev on a Pro/Max plan, set `LLM_AUTH=subscription` and the SDK uses the local `claude` CLI's stored OAuth token instead. Persona loop, supervisor, post-run reviewer, and auth-agent all run end-to-end in either mode. **Footgun:** if both `ANTHROPIC_API_KEY` and `LLM_AUTH=subscription` are set, the SDK silently uses the API key — comment out the key when running on subscription. See "Local dev with the Claude Code subscription" above and `loop-sdk.ts` for the four genuine SDK incompatibilities (sliding-window compaction, explicit cache breakpoints, `MemoryTool20250818`, planner-vs-Haiku per-turn routing, per-message max_tokens cap).
 
 ## Safety
 

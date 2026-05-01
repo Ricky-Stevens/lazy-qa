@@ -43,7 +43,13 @@ function fmtForm(f: FormSpec, idx: number): string {
   for (const field of f.fields) {
     const reqTag = field.required ? '*' : '';
     const constraints: string[] = [];
-    if (field.constraints.maxLength) constraints.push(`max=${field.constraints.maxLength}`);
+    // Bug 2 fix: emit all numeric constraints so the agent can act on ranges.
+    if (field.constraints.min !== undefined) constraints.push(`min=${field.constraints.min}`);
+    if (field.constraints.max !== undefined) constraints.push(`max=${field.constraints.max}`);
+    if (field.constraints.minLength !== undefined)
+      constraints.push(`minLength=${field.constraints.minLength}`);
+    if (field.constraints.maxLength !== undefined)
+      constraints.push(`maxLength=${field.constraints.maxLength}`);
     if (field.constraints.pattern) constraints.push(`pattern`);
     if (field.constraints.options) constraints.push(`options=${field.constraints.options.length}`);
     const cStr = constraints.length > 0 ? ` (${constraints.join(',')})` : '';

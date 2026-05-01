@@ -19,9 +19,9 @@
  * layered on later without changing this module's public types.
  */
 
-import type Anthropic from '@anthropic-ai/sdk';
 import type { Page } from 'playwright';
 import { z } from 'zod';
+import type { LlmBackend } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import { computeCostUsd } from '../orchestrator/cost.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
@@ -51,8 +51,8 @@ export interface VerifyInput {
   rootUrl: string;
   /** Allowed-host filter. Passed in so the verifier doesn't re-derive policy. */
   allowedHosts: string[];
-  /** Anthropic SDK client. Injected for testability — tests pass a mock. */
-  client: Pick<Anthropic, 'messages'>;
+  /** LLM backend. Injected for testability — tests pass a mock. */
+  backend: LlmBackend;
   model: string;
   logger: Logger;
   events?: EventWriter;
@@ -286,7 +286,7 @@ function extractJsonObject(text: string): unknown {
  * brackets accurately.
  */
 export async function verifyFinding(input: VerifyInput): Promise<VerifyResult> {
-  const { finding, page, rootUrl, client, model, logger, events } = input;
+  const { finding, page, rootUrl, backend, model, logger, events } = input;
 
   await events?.write({
     type: 'critic.verify.start',
@@ -356,26 +356,28 @@ export async function verifyFinding(input: VerifyInput): Promise<VerifyResult> {
   let costUsd = 0;
 
   try {
-    const response = await client.messages.create({
+    const response = await backend.call({
       model,
-      max_tokens: 512,
-      system: VERIFIER_SYSTEM_PROMPT,
+      maxTokens: 512,
+      systemPrompt: VERIFIER_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userMessage }],
+      tools: [],
+      cacheSystem: true,
     });
     const usage = response.usage;
     try {
       costUsd = computeCostUsd(model, {
-        input: usage.input_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
-        cacheRead: usage.cache_read_input_tokens ?? 0,
-        cacheWrite: usage.cache_creation_input_tokens ?? 0,
+        input: usage.inputTokens,
+        output: usage.outputTokens,
+        cacheRead: usage.cacheReadTokens,
+        cacheWrite: usage.cacheWriteTokens,
       });
     } catch {
       // Unknown model — leave costUsd at 0 rather than fail verification.
     }
     const textBlock = response.content.find((b) => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') {
-      throw new Error(`verifier returned no text content (stop_reason=${response.stop_reason})`);
+      throw new Error(`verifier returned no text content (stopReason=${response.stopReason})`);
     }
     const parsed = VerifyResponseSchema.parse(extractJsonObject(textBlock.text));
     verdict = parsed.verdict;

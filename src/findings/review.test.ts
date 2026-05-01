@@ -1,41 +1,17 @@
 /**
  * Tests for WP3.C — batch mode selection logic in reviewRun.
  *
- * We do NOT call the real Anthropic API. All tests use stubbed clients or
- * test the exported helper logic directly via the reviewRun function with a
- * mocked client injected via vi.mock.
+ * We do NOT call the real Anthropic API. All tests use mock LlmBackend
+ * instances passed directly to reviewRun, matching the new backend-first API.
  */
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { LlmBackend, LlmCallResult } from '../llm/backend.ts';
 import type { Finding } from '../types/finding.ts';
 
-// ---------------------------------------------------------------------------
-// Mock the Anthropic SDK before importing review.ts so the module picks it up.
-// ---------------------------------------------------------------------------
-
-const mockInlineCreate = vi.fn();
-const mockBatchCreate = vi.fn();
-const mockBatchRetrieve = vi.fn();
-const mockBatchResults = vi.fn();
-
-vi.mock('@anthropic-ai/sdk', () => {
-  return {
-    default: vi.fn().mockImplementation(() => ({
-      messages: {
-        create: mockInlineCreate,
-        batches: {
-          create: mockBatchCreate,
-          retrieve: mockBatchRetrieve,
-          results: mockBatchResults,
-        },
-      },
-    })),
-  };
-});
-
-// Import after mocking.
+// Import after we've set up our mocks below.
 import { reviewRun } from './review.ts';
 
 // ---------------------------------------------------------------------------
@@ -59,31 +35,54 @@ function makeMinimalFinding(id: string): Finding {
   };
 }
 
-/** Minimal message response shape (matches Anthropic.Message). */
-function makeMessageResponse(): object {
+const REVIEW_JSON_TEXT = JSON.stringify({
+  reviews: [{ id: 'f1', classification: 'confirmed_bug', reasoning: 'Clear evidence.' }],
+  clusters: [],
+  overallNotes: 'Overall OK.',
+});
+
+/** Minimal LlmCallResult that reviewRun can parse. */
+function makeLlmCallResult(): LlmCallResult {
+  // Cast through unknown to satisfy the Anthropic ContentBlock shape in tests
+  // (which requires a `citations` field not needed by this stub).
+  const content = [{ type: 'text', text: REVIEW_JSON_TEXT }] as unknown as LlmCallResult['content'];
   return {
-    id: 'msg_test',
-    type: 'message',
-    role: 'assistant',
-    content: [
-      {
-        type: 'text',
-        text: JSON.stringify({
-          reviews: [{ id: 'f1', classification: 'confirmed_bug', reasoning: 'Clear evidence.' }],
-          clusters: [],
-          overallNotes: 'Overall OK.',
-        }),
-      },
-    ],
-    model: 'claude-sonnet-4-6',
-    stop_reason: 'end_turn',
-    stop_sequence: null,
+    content,
+    stopReason: 'end_turn',
     usage: {
-      input_tokens: 100,
-      output_tokens: 50,
-      cache_read_input_tokens: 0,
-      cache_creation_input_tokens: 0,
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
     },
+  };
+}
+
+/** Mock inline-only LlmBackend (kind='api' but no getRawClient — batch won't
+ *  be invoked for inline tests). */
+function makeInlineBackend(): LlmBackend & { call: ReturnType<typeof vi.fn> } {
+  // biome-ignore lint/suspicious/noExplicitAny: vi.fn return type simplification for test stub
+  const call = (vi.fn() as any).mockResolvedValue(makeLlmCallResult());
+  return { kind: 'api' as const, call };
+}
+
+/** Mock ApiLlmBackend for batch tests: kind='api', getRawClient() returns a
+ *  stub with messages.batches.{create,retrieve,results}. */
+function makeBatchBackend(batchStubs: {
+  create: ReturnType<typeof vi.fn>;
+  retrieve: ReturnType<typeof vi.fn>;
+  results: ReturnType<typeof vi.fn>;
+}) {
+  // biome-ignore lint/suspicious/noExplicitAny: vi.fn return type simplification for test stub
+  const call = vi.fn() as any;
+  return {
+    kind: 'api' as const,
+    call,
+    getRawClient: () => ({
+      messages: {
+        batches: batchStubs,
+      },
+    }),
   };
 }
 
@@ -126,35 +125,51 @@ describe('reviewRun — mode selection', () => {
   it('uses inline path when batchMode is "inline", regardless of payload size', async () => {
     const findings = [makeMinimalFinding('f1')];
     const runDir = await writeRunFixture(findings);
-
-    mockInlineCreate.mockResolvedValue(makeMessageResponse());
+    const backend = makeInlineBackend();
 
     await reviewRun({
       runDir,
-      apiKey: 'test-key',
+      backend,
       batchMode: 'inline',
       logger: makeLogger(),
     });
 
-    expect(mockInlineCreate).toHaveBeenCalledOnce();
-    expect(mockBatchCreate).not.toHaveBeenCalled();
+    expect(backend.call).toHaveBeenCalledOnce();
   });
 
   it('uses batch path when batchMode is "force_batch", regardless of payload size', async () => {
     const findings = [makeMinimalFinding('f1')];
     const runDir = await writeRunFixture(findings);
 
-    mockBatchCreate.mockResolvedValue({ id: 'batch_abc' });
-    mockBatchRetrieve.mockResolvedValue({ processing_status: 'ended' });
-    const mockResult = {
+    const batchCreate = vi.fn().mockResolvedValue({ id: 'batch_abc' });
+    const batchRetrieve = vi.fn().mockResolvedValue({ processing_status: 'ended' });
+    const batchResultItem = {
       custom_id: 'critic',
-      result: { type: 'succeeded', message: makeMessageResponse() },
+      result: {
+        type: 'succeeded',
+        message: {
+          content: [{ type: 'text', text: REVIEW_JSON_TEXT }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      },
     };
-    mockBatchResults.mockResolvedValue(
+    const batchResults = vi.fn().mockResolvedValue(
       (async function* () {
-        yield mockResult;
+        yield batchResultItem;
       })(),
     );
+
+    const backend = makeBatchBackend({
+      create: batchCreate,
+      retrieve: batchRetrieve,
+      results: batchResults,
+    });
 
     // Stub globalThis.setTimeout to resolve immediately so the 30s poll delay
     // doesn't block the test. We restore it in the finally block.
@@ -164,7 +179,8 @@ describe('reviewRun — mode selection', () => {
     try {
       await reviewRun({
         runDir,
-        apiKey: 'test-key',
+        // biome-ignore lint/suspicious/noExplicitAny: test stub satisfies the subset of ApiLlmBackend needed
+        backend: backend as any,
         batchMode: 'force_batch',
         logger: makeLogger(),
       });
@@ -172,26 +188,24 @@ describe('reviewRun — mode selection', () => {
       globalThis.setTimeout = realSetTimeout;
     }
 
-    // The batch path was entered: create was called, inline was not.
-    expect(mockBatchCreate).toHaveBeenCalledOnce();
-    expect(mockInlineCreate).not.toHaveBeenCalled();
+    // The batch path was entered: create was called, inline backend.call was not.
+    expect(batchCreate).toHaveBeenCalledOnce();
+    expect(backend.call).not.toHaveBeenCalled();
   });
 
   it('uses inline path when batchMode is "auto" and payload is small (< 16 000 chars)', async () => {
     // Single finding with a short description will produce a small payload.
     const findings = [makeMinimalFinding('f1')];
     const runDir = await writeRunFixture(findings);
-
-    mockInlineCreate.mockResolvedValue(makeMessageResponse());
+    const backend = makeInlineBackend();
 
     await reviewRun({
       runDir,
-      apiKey: 'test-key',
+      backend,
       batchMode: 'auto',
       logger: makeLogger(),
     });
 
-    expect(mockInlineCreate).toHaveBeenCalledOnce();
-    expect(mockBatchCreate).not.toHaveBeenCalled();
+    expect(backend.call).toHaveBeenCalledOnce();
   });
 });

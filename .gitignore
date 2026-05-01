@@ -1,5 +1,6 @@
 node_modules/
 runs/
+.worktrees/
 .env
 .env.*.local
 *.log

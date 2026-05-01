@@ -26,6 +26,7 @@ import {
 } from '../findings/persist.ts';
 import { writeReviewArtefacts } from '../findings/report.ts';
 import { reviewRun } from '../findings/review.ts';
+import { selectBackend } from '../llm/factory.ts';
 import type { Logger } from '../logging/logger.ts';
 import { createLogger } from '../logging/logger.ts';
 import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
@@ -74,14 +75,17 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   assertAllowedTarget(cfg.target.url, cfg.target.allowed_hosts);
   assertNonProdHost(cfg.target.url);
 
-  // 2. Resolve API key + agents. Direct-API loop requires a real API key (see
-  // spawn-agent docstring); subscription auth is unsupported.
+  // 2. Resolve auth. ANTHROPIC_API_KEY is required when LLM_AUTH=api (the default);
+  // optional when LLM_AUTH=subscription (the SDK falls back to the local
+  // `claude` CLI's cached OAuth token). selectBackend throws a useful error if
+  // we're in api mode without a key.
   const apiKey = resolveApiKey(cfg);
-  if (!apiKey) {
-    throw new Error(
-      'runScan requires ANTHROPIC_API_KEY. The direct-API loop does not support subscription auth via the `claude` CLI. Set ANTHROPIC_API_KEY in your environment.',
-    );
-  }
+  const llmAuth = process.env.LLM_AUTH;
+
+  // Build one shared backend for all LLM calls in this run (review,
+  // site-playbook, supervisor, auth-agent). The persona loop is dispatched
+  // separately based on backend.kind — see runScan body below.
+  const backend = selectBackend({ apiKey: apiKey ?? undefined, llmAuth });
 
   // Load the skills bundle once here — both resolveAgents (personas) and
   // spawnAgent (playbook tools) consume it.
@@ -153,7 +157,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       runDir,
       targetUrl: cfg.target.url,
       agentCount: agents.length,
-      auth: 'anthropic-api-key',
+      auth: backend.kind === 'sdk' ? 'claude-subscription' : 'anthropic-api-key',
       version: 'v2',
     });
 
@@ -195,7 +199,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         loginUrl: cfg.target.auth.login_url,
         credentials: firstAgent.credentials,
         allowedHosts: cfg.target.allowed_hosts,
-        apiKey,
+        backend,
         // Haiku is plenty for login-form filling and is the cheap path.
         model: 'claude-haiku-4-5-20251001',
         storageStatePath: authStatePath,
@@ -328,7 +332,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         rootUrl: cfg.target.url,
         sitemap: crawledMap,
         personas: personaBriefs,
-        apiKey,
+        backend,
         model: 'claude-sonnet-4-6',
         logger: logger.child({ phase: 'site-playbook' }),
         events,
@@ -391,7 +395,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         allowedHosts: cfg.target.allowed_hosts,
         auth: cfg.target.auth,
         agent,
-        apiKey,
+        backend,
         siteMap,
         logger,
         abortSignal: runAbortController.signal,
@@ -412,7 +416,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
 
     const supervisorPromise = supervisorEnabled
       ? runSupervisor({
-          apiKey,
+          backend,
           model: cfg.supervisor.model,
           maxMinutes: cfg.supervisor.max_minutes,
           maxUsd: cfg.supervisor.max_usd,
@@ -559,7 +563,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       try {
         const review = await reviewRun({
           runDir,
-          apiKey,
+          backend,
           model: cfg.review.model,
           batchMode: cfg.review.batch_mode,
           logger: logger.child({ tool: 'review' }),

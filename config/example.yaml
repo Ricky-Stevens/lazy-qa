@@ -92,8 +92,10 @@ memory:
   enabled: false
 
 agents:
-  # Built-in profiles: power-user, chaos-clicker, confused-newcomer,
-  # completionist, insider-attacker. Add your own under skills/personas/<slug>/.
+  # Built-in profiles: house, the-spanner, leeroy-jenkins, the-magpie, caine,
+  # bobby-tables. Add your own under skills/personas/<slug>/. Each persona owns
+  # a distinct bug-detection lens — see skills/personas/<slug>/SKILL.md for
+  # the mandate.
   #
   # Per-agent fields:
   #   model               override anthropic.default_model
@@ -111,7 +113,7 @@ agents:
   # credentials), so the actual Auth0/login form fills only once per run.
 
   - id: attacker
-    profile: insider-attacker
+    profile: bobby-tables
     model: claude-sonnet-4-6
     max_thinking_tokens: 2000
     credentials:
@@ -122,8 +124,8 @@ agents:
       max_turns: 250
       max_usd: 2.00
 
-  - id: power-user
-    profile: power-user
+  - id: house
+    profile: house
     model: claude-haiku-4-5-20251001
     max_thinking_tokens: 1024
     credentials:
@@ -134,8 +136,8 @@ agents:
       max_turns: 250
       max_usd: 0.80
 
-  - id: chaos
-    profile: chaos-clicker
+  - id: leeroy
+    profile: leeroy-jenkins
     model: claude-haiku-4-5-20251001
     max_thinking_tokens: 1024
     credentials:
@@ -146,29 +148,38 @@ agents:
       max_turns: 250
       max_usd: 0.60
 
-  - id: completionist
-    profile: completionist
-    model: claude-sonnet-4-6
-    max_thinking_tokens: 1500
+  - id: spanner
+    profile: the-spanner
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
     credentials:
       username_env: JUICE_SHOP_USER
       password_env: JUICE_SHOP_PASS
     budget:
-      max_minutes: 12
-      max_turns: 250
-      max_usd: 1.20
+      max_minutes: 10
+      max_turns: 200
+      max_usd: 0.60
 
-  # ─── Orphan example: confused-newcomer (uncomment to add) ───────────────
-  # First-time user who reads every label and panics at jargon. Catches UX
-  # confusion an experienced user wouldn't notice.
-  # - id: newcomer
-  #   profile: confused-newcomer
-  #   model: claude-haiku-4-5-20251001
-  #   max_thinking_tokens: 1024
-  #   credentials:
-  #     username_env: JUICE_SHOP_USER
-  #     password_env: JUICE_SHOP_PASS
-  #   budget:
-  #     max_minutes: 5
-  #     max_turns: 200
-  #     max_usd: 0.40
+  - id: magpie
+    profile: the-magpie
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
+    budget:
+      max_minutes: 10
+      max_turns: 200
+      max_usd: 1.00
+
+  - id: caine
+    profile: caine
+    model: claude-haiku-4-5-20251001
+    max_thinking_tokens: 1024
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
+    budget:
+      max_minutes: 10
+      max_turns: 200
+      max_usd: 0.80

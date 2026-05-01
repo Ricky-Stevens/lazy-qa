@@ -1,11 +1,11 @@
 /**
- * Launches a single agent's exploration session against the direct-API loop.
+ * Launches a single agent's exploration session.
  *
  * Orchestration model:
  *
- *   - Direct Anthropic SDK only — no Claude Code subprocess path. Subscription
- *     auth (`claude` CLI) is unsupported because the loop manages messages
- *     end-to-end. Spawn fails fast if no API key is available.
+ *   - Routes to either the direct-API loop (`runAgentLoop`) or the SDK loop
+ *     (`runAgentLoopSdk`) based on `backend.kind`. API mode uses ANTHROPIC_API_KEY;
+ *     subscription mode uses the local `claude` CLI's cached OAuth token.
  *   - No engagement gate — playbooks bundle the multi-action flows so we no
  *     longer need a per-route action-counter to keep agents engaged. See
  *     spec §8.4.
@@ -19,6 +19,9 @@ import { acquireSession } from '../auth/session-pool.ts';
 import type { AuthConfig } from '../config/types.ts';
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import { persistJourney } from '../findings/persist.ts';
+// biome-ignore lint/style/useImportType: ApiLlmBackend is used at runtime via getApiKey() — not type-only
+import { ApiLlmBackend } from '../llm/api-backend.ts';
+import type { LlmBackend } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { PlaybookContext } from '../playbooks/framework.ts';
 import type { Skill, SkillsBundle } from '../skills/loader.ts';
@@ -34,6 +37,7 @@ import type { Journey } from '../types/journey.ts';
 import type { EventWriter } from './events.ts';
 import type { FindingCache } from './finding-cache.ts';
 import { runAgentLoop } from './loop.ts';
+import { runAgentLoopSdk } from './loop-sdk.ts';
 import { registerAgent, setStatus, updateOnAction } from './registry.ts';
 import type { SharedKnowledge } from './shared-knowledge.ts';
 import { SummaryMemory } from './summary-memory.ts';
@@ -45,9 +49,9 @@ export interface SpawnAgentInput {
   allowedHosts: string[];
   auth: AuthConfig;
   agent: ResolvedAgent;
-  /** Anthropic API key — REQUIRED. Subscription auth is not supported
-   * on the direct-API loop because we manage messages ourselves. */
-  apiKey: string;
+  /** Resolved LLM backend for this run. api-mode uses the Anthropic SDK
+   *  directly; subscription-mode routes to runAgentLoopSdk. */
+  backend: LlmBackend;
   /** Shared sitemap accessor. Built by run before any agent spawns. */
   siteMap: SiteMapAccessor;
   logger: Logger;
@@ -122,7 +126,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     allowedHosts,
     auth,
     agent,
-    apiKey,
+    backend,
     logger,
     abortSignal,
     stealth,
@@ -292,25 +296,55 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
         excluded: filteredAttackerOnly,
       });
     }
-    await runAgentLoop({
-      agent,
-      targetUrl,
-      systemPrompt,
-      apiKey,
-      rawTools: [...harnessKit.rawTools, ...browserTools],
-      journey,
-      abortSignal: abortController.signal,
-      logger: childLogger,
-      siteMap: input.siteMap,
-      summaryMemory,
-      memoryEnabled,
-      memoryPath,
-      events,
-      findingCache: input.findingCache,
-      sharedKnowledge: input.sharedKnowledge,
-      sessionInfo: input.sessionInfo,
-      sitePlaybookText: input.sitePlaybookText,
-    });
+    // Discriminated dispatch: SDK loop for subscription auth, raw API loop for
+    // api-key auth. The else branch is api-mode (kind is 'api' | 'sdk').
+    if (backend.kind === 'sdk') {
+      await runAgentLoopSdk({
+        agent,
+        targetUrl,
+        systemPrompt,
+        // No apiKey — sub mode uses the SDK's stored auth.
+        // The LoopInput interface still requires `apiKey: string`. Pass an
+        // empty string here — the SDK loop never reads it.
+        apiKey: '',
+        rawTools: [...harnessKit.rawTools, ...browserTools],
+        journey,
+        abortSignal: abortController.signal,
+        logger: childLogger,
+        siteMap: input.siteMap,
+        summaryMemory,
+        memoryEnabled,
+        memoryPath,
+        events,
+        findingCache: input.findingCache,
+        sharedKnowledge: input.sharedKnowledge,
+        sessionInfo: input.sessionInfo,
+        sitePlaybookText: input.sitePlaybookText,
+      });
+    } else {
+      // API mode — preserved behaviour. Extract raw apiKey via getApiKey()
+      // (we no longer have apiKey in scope; loop.ts still expects it).
+      const apiBackend = backend as ApiLlmBackend;
+      await runAgentLoop({
+        agent,
+        targetUrl,
+        systemPrompt,
+        apiKey: apiBackend.getApiKey(),
+        rawTools: [...harnessKit.rawTools, ...browserTools],
+        journey,
+        abortSignal: abortController.signal,
+        logger: childLogger,
+        siteMap: input.siteMap,
+        summaryMemory,
+        memoryEnabled,
+        memoryPath,
+        events,
+        findingCache: input.findingCache,
+        sharedKnowledge: input.sharedKnowledge,
+        sessionInfo: input.sessionInfo,
+        sitePlaybookText: input.sitePlaybookText,
+      });
+    }
   } catch (err) {
     if (abortController.signal.aborted) {
       journey.terminationReason = abortSignal?.aborted ? 'signal' : 'timeout';

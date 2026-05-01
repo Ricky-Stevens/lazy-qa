@@ -21,8 +21,9 @@
  * Cost: ~$0.04-0.10 once per run (~3K input + ~2K output tokens on Sonnet).
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { SiteMap } from '../crawler/types.ts';
+import type { LlmBackend } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import { computeCostUsd } from './cost.ts';
 import type { EventWriter } from './events.ts';
@@ -36,7 +37,7 @@ export interface SitePlaybookInput {
    *  used as the dict key on the way back) and a one-line description that
    *  helps Sonnet tailor the per-persona plan. */
   personas: Array<{ name: string; description: string }>;
-  apiKey: string;
+  backend: LlmBackend;
   /** Sonnet — site analysis is reasoning-shaped, not mechanical. Hardcoded
    *  to claude-sonnet-4-6 by default in run.ts. */
   model: string;
@@ -45,6 +46,9 @@ export interface SitePlaybookInput {
   maxOutputTokens?: number;
   logger: Logger;
   events?: EventWriter;
+  /** Currently silently ignored by the LLM call — `LlmCallInput` does not yet
+   *  surface aborts. Kept on the interface so callers compile; remove or wire
+   *  through once the backend abstraction supports cancellation. */
   abortSignal?: AbortSignal;
 }
 
@@ -195,7 +199,7 @@ function validateAndNormalise(
 }
 
 export async function generateSitePlaybook(input: SitePlaybookInput): Promise<SitePlaybookResult> {
-  const { rootUrl, sitemap, personas, apiKey, model, logger, events, abortSignal } = input;
+  const { rootUrl, sitemap, personas, backend, model, logger, events } = input;
   const maxOutput = input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const startedAt = Date.now();
 
@@ -244,27 +248,25 @@ export async function generateSitePlaybook(input: SitePlaybookInput): Promise<Si
     };
   }
 
-  const client = new Anthropic({ apiKey });
   const systemPrompt = buildSystemPrompt(rootUrl, personas);
   const userPrompt = buildUserPrompt(rootUrl, sitemap);
 
   let costUsd = 0;
   try {
-    const response = await client.messages.create(
-      {
-        model,
-        max_tokens: maxOutput,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-      },
-      { signal: abortSignal },
-    );
+    const response = await backend.call({
+      model,
+      maxTokens: maxOutput,
+      systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+      tools: [],
+      cacheSystem: true,
+    });
 
     costUsd = computeCostUsd(model, {
-      input: response.usage.input_tokens,
-      output: response.usage.output_tokens,
-      cacheRead: response.usage.cache_read_input_tokens ?? 0,
-      cacheWrite: response.usage.cache_creation_input_tokens ?? 0,
+      input: response.usage.inputTokens,
+      output: response.usage.outputTokens,
+      cacheRead: response.usage.cacheReadTokens,
+      cacheWrite: response.usage.cacheWriteTokens,
     });
 
     const text = response.content

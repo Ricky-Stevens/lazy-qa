@@ -15,61 +15,67 @@ import { loadSkills } from './loader.ts';
 const SKILLS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../skills');
 
 describe('loadSkills', () => {
-  it('discovers exactly 5 personas', async () => {
+  it('discovers exactly 6 personas', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    expect(bundle.personas.size).toBe(5);
+    expect(bundle.personas.size).toBe(6);
   });
 
-  it('discovers exactly 9 playbooks', async () => {
+  it('discovers exactly 14 playbooks', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    expect(bundle.playbooks.size).toBe(9);
+    expect(bundle.playbooks.size).toBe(14);
   });
 
-  it('persona names match the 5 expected slugs', async () => {
+  it('persona names match the 6 expected slugs', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
     const names = Array.from(bundle.personas.keys()).sort();
     expect(names).toEqual([
-      'chaos-clicker',
-      'completionist',
-      'confused-newcomer',
-      'insider-attacker',
-      'power-user',
+      'bobby-tables',
+      'caine',
+      'house',
+      'leeroy-jenkins',
+      'the-magpie',
+      'the-spanner',
     ]);
   });
 
-  it('playbook names match the 9 expected names', async () => {
+  it('playbook names match the 14 expected names', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
     const names = Array.from(bundle.playbooks.keys()).sort();
     expect(names).toEqual([
       'ask_sitemap',
       'discover_route_affordances',
       'fill_and_verify',
+      'form_double_submit',
+      'form_fuzz_validation',
+      'form_persistence_roundtrip',
+      'form_required_field_check',
       'header_audit',
       'idor_probe',
       'route_404_probe',
       'sensitive_path_audit',
+      'table_sort_each_column',
       'walk_pagination',
       'walk_wizard',
     ]);
   });
 
-  it('power-user persona preserves frontmatter budget', async () => {
+  it('house persona preserves frontmatter budget', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    const persona = bundle.personas.get('power-user');
+    const persona = bundle.personas.get('house');
     expect(persona).toBeDefined();
     expect(persona?.defaultBudget).toEqual({
-      max_turns: 200,
-      max_usd: 1,
+      max_turns: 250,
+      max_usd: 1.5,
       max_minutes: 5,
     });
   });
 
-  it('insider-attacker persona has a non-empty body (includes Scope + Personality sections)', async () => {
+  it('bobby-tables persona has a non-empty body (includes the Mindset section)', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    const persona = bundle.personas.get('insider-attacker');
+    const persona = bundle.personas.get('bobby-tables');
     expect(persona).toBeDefined();
-    expect(persona?.body).toContain('# Scope');
-    expect(persona?.body).toContain('# Personality');
+    expect(persona?.body).toContain('# Mindset');
+    expect(persona?.body.length ?? 0).toBeGreaterThan(500);
   });
 
   it('fill_and_verify playbook has an inputShape with formId field', async () => {

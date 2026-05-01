@@ -1,8 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { BrowserContext } from 'playwright';
 import { z } from 'zod';
+import type { ApiLlmBackend } from '../llm/api-backend.ts';
+import type { LlmBackend, LlmCallResult } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
@@ -163,14 +165,13 @@ function applyVerifyVerdict(
 async function runVerifications(
   candidates: Array<{ finding: Finding; review: ReviewItem }>,
   ctx: VerifyContext,
-  apiKey: string,
+  backend: LlmBackend,
   logger: Logger,
   events: EventWriter | undefined,
 ): Promise<Map<string, VerifyResult>> {
   const results = new Map<string, VerifyResult>();
   if (candidates.length === 0) return results;
   const concurrency = Math.max(1, Math.floor(ctx.concurrency ?? 3));
-  const client = new Anthropic({ apiKey });
   const queue = [...candidates];
   const inFlight = new Set<Promise<void>>();
 
@@ -182,7 +183,7 @@ async function runVerifications(
         page: tab,
         rootUrl: ctx.rootUrl,
         allowedHosts: ctx.allowedHosts,
-        client,
+        backend,
         model: ctx.model,
         logger,
         events,
@@ -240,7 +241,9 @@ export interface VerifyContext {
 
 export interface ReviewInput {
   runDir: string;
-  apiKey: string;
+  /** LLM backend. Construct via `selectBackend({ apiKey, llmAuth })` in the
+   *  caller (run.ts / bin/regress-review.ts). */
+  backend: LlmBackend;
   model?: string;
   /** Controls dispatch mode. Defaults to 'auto'. */
   batchMode?: 'auto' | 'inline' | 'force_batch';
@@ -362,35 +365,30 @@ function extractJsonObject(text: string): unknown {
   return JSON.parse(body);
 }
 
-/** Inline (synchronous) path — single messages.create call. */
+/** Inline (synchronous) path — delegates to the backend abstraction. */
 async function runCriticInline(
-  client: Anthropic,
+  backend: LlmBackend,
   model: string,
   payload: string,
-): Promise<Anthropic.Message> {
-  return client.messages.create({
+): Promise<LlmCallResult> {
+  return backend.call({
     model,
-    max_tokens: 8192,
-    system: [
-      {
-        type: 'text',
-        text: SYSTEM_PROMPT,
-        // Cache the system prompt for 1h — the SYSTEM_PROMPT is static across
-        // all review calls in a session, so this is safe and cuts per-call cost.
-        cache_control: { type: 'ephemeral', ttl: '1h' },
-      },
-    ],
+    maxTokens: 8192,
+    systemPrompt: SYSTEM_PROMPT,
     messages: [{ role: 'user', content: payload }],
+    tools: [],
+    cacheSystem: true, // The system prompt is large + static across calls — caching is the point
   });
 }
 
-/** Batch API path — submits a 1-request batch, polls until done, returns the message. */
+/** Batch API path — submits a 1-request batch, polls until done, returns a
+ *  normalised LlmCallResult. API-only; callers must check backend.kind first. */
 async function runCriticBatch(
   client: Anthropic,
   model: string,
   payload: string,
   logger: Logger,
-): Promise<Anthropic.Message> {
+): Promise<LlmCallResult> {
   const batch = await client.messages.batches.create({
     requests: [
       {
@@ -420,7 +418,17 @@ async function runCriticBatch(
       for await (const result of await results) {
         if (result.custom_id === 'critic') {
           if (result.result.type === 'succeeded') {
-            return result.result.message;
+            const m = result.result.message;
+            return {
+              content: m.content,
+              stopReason: m.stop_reason ?? null,
+              usage: {
+                inputTokens: m.usage.input_tokens ?? 0,
+                outputTokens: m.usage.output_tokens ?? 0,
+                cacheReadTokens: m.usage.cache_read_input_tokens ?? 0,
+                cacheWriteTokens: m.usage.cache_creation_input_tokens ?? 0,
+              },
+            };
           }
           throw new Error(`Critic batch failed: ${JSON.stringify(result.result)}`);
         }
@@ -433,7 +441,7 @@ async function runCriticBatch(
 }
 
 export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
-  const { runDir, apiKey, logger, events } = input;
+  const { runDir, backend, logger, events } = input;
   const model = input.model ?? 'claude-sonnet-4-6';
   const batchMode = input.batchMode ?? 'auto';
 
@@ -479,22 +487,28 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   });
 
   const reviewStartedAt = Date.now();
-  const client = new Anthropic({ apiKey });
 
   const inputCharsApprox = payload.length;
   const useBatch =
-    batchMode === 'force_batch' || (batchMode === 'auto' && inputCharsApprox > 16_000);
-  const response = useBatch
-    ? await runCriticBatch(client, model, payload, logger)
-    : await runCriticInline(client, model, payload);
+    backend.kind === 'api' &&
+    (batchMode === 'force_batch' || (batchMode === 'auto' && inputCharsApprox > 16_000));
+
+  if (batchMode === 'force_batch' && backend.kind !== 'api') {
+    logger.warn('review.batch.unsupported', {
+      reason: 'subscription mode does not support the Batch API; falling back to inline',
+    });
+  }
+
+  const response: LlmCallResult = useBatch
+    ? await runCriticBatch((backend as ApiLlmBackend).getRawClient(), model, payload, logger)
+    : await runCriticInline(backend, model, payload);
 
   // Aggregate token usage and cost for telemetry.
-  const usage = response.usage;
   const tokenUsage = {
-    input: usage.input_tokens ?? 0,
-    output: usage.output_tokens ?? 0,
-    cacheRead: usage.cache_read_input_tokens ?? 0,
-    cacheWrite: usage.cache_creation_input_tokens ?? 0,
+    input: response.usage.inputTokens,
+    output: response.usage.outputTokens,
+    cacheRead: response.usage.cacheReadTokens,
+    cacheWrite: response.usage.cacheWriteTokens,
   };
   let costUsd = 0;
   try {
@@ -514,7 +528,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   // Pull the assistant's first text block. The prompt instructs JSON-only.
   const textBlock = response.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
-    throw new Error(`Reviewer returned no text content (stop_reason=${response.stop_reason})`);
+    throw new Error(`Reviewer returned no text content (stopReason=${response.stopReason})`);
   }
 
   let parsedRaw: unknown;
@@ -592,7 +606,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
       const verifyResults = await runVerifications(
         candidates,
         input.verify,
-        apiKey,
+        backend,
         logger,
         events,
       );

@@ -291,9 +291,9 @@ export const fillAndVerify: Playbook<FillAndVerifyInput> = {
  */
 
 /** Built-in fuzz vectors. Each vector applied to every text-like field in
- *  the form. Keep the list short — total submits = vectors × runs across
+ *  the form. Keep the list short — total submits = vectors x runs across
  *  multiple agent invocations adds up fast. */
-const FUZZ_VECTORS: Array<{ id: string; value: string; expectError: boolean }> = [
+export const FUZZ_VECTORS: Array<{ id: string; value: string; expectError: boolean }> = [
   { id: 'empty', value: '', expectError: true },
   { id: 'whitespace', value: '   ', expectError: true },
   { id: 'long', value: 'A'.repeat(5000), expectError: true },
@@ -302,9 +302,114 @@ const FUZZ_VECTORS: Array<{ id: string; value: string; expectError: boolean }> =
   { id: 'sqli-or', value: "' OR 1=1--", expectError: false },
   { id: 'sqli-drop', value: "'; DROP TABLE users; --", expectError: false },
   { id: 'newline-injection', value: 'hello\r\nBcc: attacker@evil.test\r\n', expectError: false },
-  { id: 'null-byte', value: 'hello world', expectError: false },
+  // Bug 1 fix: was 'hello world' (plain text) — must be an actual NUL byte injection probe.
+  { id: 'null-byte', value: 'hello\x00world', expectError: false },
   { id: 'unicode-rtl', value: '‮test', expectError: false },
+  // Bug 6: Unicode coverage — zero-width chars (rendering/display bugs), emoji
+  // (UI layout), control chars (validation bypass), combining chars (length tricks).
+  { id: 'unicode-zero-width', value: 'foo​bar‌baz', expectError: false },
+  { id: 'unicode-emoji', value: '🔥💯👀 test 😀', expectError: false },
+  { id: 'unicode-control', value: 'foo\x01\x02\x03bar', expectError: false },
+  { id: 'unicode-combining', value: 'ẫ̄̅', expectError: false },
+  // Bug 7: Happy-path probe — the form should ACCEPT valid plain text. If it
+  // rejects this, the validation is over-aggressive (false-positive bug).
+  // Keep last so adversarial vectors don't pollute field state before this runs.
+  { id: 'valid', value: 'QA Test User', expectError: false },
 ];
+
+/** Build field-type-aware extra vectors for a specific field. These are applied
+ *  in addition to the generic FUZZ_VECTORS, not instead of them. */
+export function fieldTypeVectors(
+  field: FormFieldSpec,
+): Array<{ id: string; value: string; expectError: boolean }> {
+  const vectors: Array<{ id: string; value: string; expectError: boolean }> = [];
+  const labelLower = field.label.toLowerCase();
+  const type = field.type;
+
+  // Email fields — format violation probes + happy-path.
+  if (type === 'email' || /email|e-mail/i.test(labelLower)) {
+    vectors.push(
+      { id: 'email-no-at', value: 'not-an-email', expectError: true },
+      { id: 'email-no-domain', value: 'foo@', expectError: true },
+      { id: 'email-no-local', value: '@bar.com', expectError: true },
+      { id: 'email-space', value: 'foo bar@example.com', expectError: true },
+      { id: 'email-valid', value: 'qa-test@example.com', expectError: false },
+    );
+  }
+
+  // Number fields — boundary and non-numeric probes.
+  if (type === 'number') {
+    const min = field.constraints.min;
+    const max = field.constraints.max;
+    vectors.push({ id: 'number-nonnumeric', value: 'abc', expectError: true });
+    if (min !== undefined && max !== undefined) {
+      vectors.push(
+        { id: 'number-below-min', value: String(min - 1), expectError: true },
+        { id: 'number-above-max', value: String(max + 1), expectError: true },
+        { id: 'number-zero', value: '0', expectError: false },
+        { id: 'number-very-negative', value: '-999999999', expectError: true },
+        { id: 'number-at-min', value: String(min), expectError: false },
+        { id: 'number-at-max', value: String(max), expectError: false },
+      );
+    } else {
+      vectors.push(
+        { id: 'number-negative-one', value: '-1', expectError: false },
+        { id: 'number-zero', value: '0', expectError: false },
+        { id: 'number-large', value: '999999999', expectError: false },
+      );
+    }
+  }
+
+  // Tel/phone fields.
+  if (type === 'tel' || /phone|mobile|tel/i.test(labelLower)) {
+    vectors.push(
+      { id: 'tel-alpha', value: 'abc', expectError: true },
+      { id: 'tel-short', value: '123', expectError: true },
+      { id: 'tel-incomplete', value: '+44', expectError: true },
+    );
+  }
+
+  // Date fields — boundary and invalid-month probes.
+  if (type === 'date') {
+    vectors.push(
+      { id: 'date-min-boundary', value: '0001-01-01', expectError: true },
+      { id: 'date-max-boundary', value: '9999-12-31', expectError: true },
+      { id: 'date-invalid-month', value: '2024-13-01', expectError: true },
+    );
+  }
+
+  // Text fields — maxLength boundary probes.
+  const maxLen = field.constraints.maxLength;
+  if (
+    maxLen !== undefined &&
+    (type === 'textbox' ||
+      type === 'text' ||
+      type === 'textarea' ||
+      type === 'searchbox' ||
+      type === 'password')
+  ) {
+    vectors.push(
+      { id: 'text-maxlen-exceed', value: 'A'.repeat(maxLen + 1), expectError: true },
+      { id: 'text-maxlen-exact', value: 'A'.repeat(maxLen), expectError: false },
+    );
+  }
+
+  // Text fields — minLength boundary probes.
+  const minLen = field.constraints.minLength;
+  if (
+    minLen !== undefined &&
+    minLen > 0 &&
+    (type === 'textbox' ||
+      type === 'text' ||
+      type === 'textarea' ||
+      type === 'searchbox' ||
+      type === 'password')
+  ) {
+    vectors.push({ id: 'text-minlen-below', value: 'A'.repeat(minLen - 1), expectError: true });
+  }
+
+  return vectors;
+}
 
 /** Returns a sensible "filler" value for non-text fields (checkbox, radio,
  *  select, etc.) so we can exercise the rest of the form during fuzzing. */
@@ -370,7 +475,7 @@ interface VectorResult {
 export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
   name: 'form_fuzz_validation',
   description:
-    'Fuzz-test a form by submitting it with malformed inputs (empty, very long, XSS, SQLi, control chars, etc.). For each vector, detects: 5xx server errors, stack-trace leaks in the response body, silent acceptance of invalid input (missing validation), and the well-handled case (form shows an error). Returns `suspicious` when ANY vector exposes a defect; `ok` when every vector is gracefully validated. Inputs: `formId` (required, from snapshot), `vectors` (optional list of vector IDs to limit to: empty, whitespace, long, xss-classic, xss-img, sqli-or, sqli-drop, newline-injection, null-byte, unicode-rtl).',
+    'Fuzz-test a form by submitting it with malformed inputs (empty, very long, XSS, SQLi, control chars, etc.) plus field-type-aware boundary probes (email format, number min/max, tel format, date boundaries, maxLength/minLength). For each vector, detects: 5xx server errors, stack-trace leaks in the response body, silent acceptance of invalid input (missing validation), and the well-handled case (form shows an error). Returns `suspicious` when ANY vector exposes a defect; `ok` when every vector is gracefully validated.',
   categories: ['form', 'security'],
   estimatedDurationMs: 30_000,
   inputShape: formFuzzValidationShape,
@@ -568,6 +673,130 @@ export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
       ctx.page.off('response', responseHandler);
     }
 
+    // Also run field-type-aware vectors for each fuzzable field (Bug 5).
+    // These run after generic vectors so they don't interfere with earlier runs.
+    try {
+      const model = await ctx.pageModel();
+      const form = model.forms.find((f) => f.id === input.formId);
+      if (form) {
+        for (const field of form.fields.filter(isFuzzableField)) {
+          const extraVectors = fieldTypeVectors(field);
+          for (const vector of extraVectors) {
+            responseLog.length = 0;
+            const urlBefore = ctx.page.url();
+
+            // Re-fetch form each iteration.
+            const freshModel = await ctx.pageModel();
+            const freshForm = freshModel.forms.find((f) => f.id === input.formId);
+            if (!freshForm) break;
+
+            let fillsAttempted = 0;
+            let fillsSucceeded = 0;
+            // Fill only the target field with the typed vector; fill others with fillers.
+            for (const f of freshForm.fields) {
+              if (!isFuzzableField(f)) {
+                const filler = fillerValueForField(f);
+                if (filler !== null) {
+                  fillsAttempted += 1;
+                  const r = await fillField(ctx.page, freshForm, f.label, filler);
+                  if (r.ok) fillsSucceeded += 1;
+                }
+                continue;
+              }
+              fillsAttempted += 1;
+              const targetValue =
+                f.label.toLowerCase() === field.label.toLowerCase() ? vector.value : '';
+              const r = await fillField(ctx.page, freshForm, f.label, targetValue);
+              if (r.ok) fillsSucceeded += 1;
+            }
+
+            const submitSelector =
+              freshForm.submit?.locator ??
+              `${freshForm.formLocator} button[type="submit"], ${freshForm.formLocator} input[type="submit"]`;
+            let submitOk = true;
+            let submitError: string | undefined;
+            try {
+              await ctx.page.locator(submitSelector).first().click({ timeout: SUBMIT_TIMEOUT_MS });
+            } catch (err) {
+              submitOk = false;
+              submitError = err instanceof Error ? err.message : String(err);
+            }
+            await ctx.page
+              .waitForLoadState('networkidle', { timeout: 2_500 })
+              .catch(() => undefined);
+            await ctx.page.waitForTimeout(200);
+
+            const urlAfter = ctx.page.url();
+            const errorVisible = await detectErrorShown(ctx.page);
+            const toastVisible = await detectSuccessToast(ctx.page);
+
+            let worstStatus: number | undefined;
+            let stackTraceLeak = false;
+            for (const r of responseLog) {
+              if (worstStatus === undefined || r.status > worstStatus) worstStatus = r.status;
+              if (r.bodySample && STACK_TRACE_RE.test(r.bodySample)) stackTraceLeak = true;
+            }
+
+            let verdict: VectorResult['verdict'] = 'inconclusive';
+            let detail = '';
+            if (!submitOk) {
+              verdict = 'submit-failed';
+              detail = submitError ?? 'submit threw';
+            } else if (stackTraceLeak) {
+              verdict = 'stack-trace-leak';
+              detail = `${responseLog.length} 4xx/5xx response(s); body contains stack trace`;
+            } else if (worstStatus !== undefined && worstStatus >= 500) {
+              verdict = 'server-error';
+              detail = `5xx response on submit (status=${worstStatus})`;
+            } else if (
+              vector.expectError &&
+              !errorVisible &&
+              !toastVisible &&
+              urlAfter === urlBefore
+            ) {
+              verdict = 'silently-accepted';
+              detail = 'invalid input submitted with no error indicator and no nav change';
+            } else if (vector.expectError && errorVisible) {
+              verdict = 'validated';
+              detail = 'form correctly showed error indicator';
+            } else if (!vector.expectError && toastVisible) {
+              verdict = 'silently-accepted';
+              detail = 'typed-vector input accepted as success';
+            } else if (!vector.expectError && !errorVisible && urlAfter !== urlBefore) {
+              verdict = 'silently-accepted';
+              detail = `typed-vector input accepted; URL changed to ${urlAfter}`;
+            } else {
+              verdict = 'inconclusive';
+              detail = `errorVisible=${errorVisible} toast=${toastVisible} urlChanged=${urlAfter !== urlBefore}`;
+            }
+
+            results.push({
+              vector: `${field.label}:${vector.id}`,
+              fillsAttempted,
+              fillsSucceeded,
+              submitOk,
+              ...(submitError !== undefined && { submitError }),
+              urlBefore,
+              urlAfter,
+              ...(worstStatus !== undefined && { worstResponseStatus: worstStatus }),
+              stackTraceDetected: stackTraceLeak,
+              errorIndicatorVisible: errorVisible,
+              successToastVisible: toastVisible,
+              verdict,
+              detail,
+            });
+            steps.push({
+              label: `vector=${field.label}:${vector.id} → ${verdict}`,
+              ok: verdict === 'validated' || verdict === 'inconclusive',
+              detail,
+            });
+          }
+        }
+      }
+    } finally {
+      ctx.page.off('response', responseHandler);
+    }
+
     evidence.results = results;
     evidence.summaryByVerdict = results.reduce<Record<string, number>>((acc, r) => {
       acc[r.verdict] = (acc[r.verdict] ?? 0) + 1;
@@ -633,6 +862,43 @@ export interface FormRequiredFieldCheckInput {
   formId: string;
 }
 
+/**
+ * Check whether a field has a visible per-field error indicator nearby.
+ * Looks for: aria-invalid on the input, aria-describedby pointing to an
+ * element with error text, or a sibling/parent element with an error class.
+ */
+async function fieldHasErrorIndicator(page: Page, field: FormFieldSpec): Promise<boolean> {
+  try {
+    const locator = page.locator(field.locator).first();
+    // 1. aria-invalid on the field itself.
+    const ariaInvalid = await locator.getAttribute('aria-invalid').catch(() => null);
+    if (ariaInvalid === 'true') return true;
+
+    // 2. aria-describedby pointing to a visible error element.
+    const describedBy = await locator.getAttribute('aria-describedby').catch(() => null);
+    if (describedBy) {
+      for (const id of describedBy.split(/\s+/)) {
+        // Escape id for use in a CSS selector (replace special chars with escaped hex).
+        const escapedId = id.replace(/([!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+        const el = page.locator(`#${escapedId}`).first();
+        const visible = await el.isVisible().catch(() => false);
+        if (visible) return true;
+      }
+    }
+
+    // 3. Sibling or parent element with an error class/role near the field.
+    const parentError = await page
+      .locator(`${field.locator} ~ [class*="error" i], ${field.locator} ~ [role="alert"]`)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (parentError) return true;
+  } catch {
+    // DOM query failed; treat as unknown (no indicator found).
+  }
+  return false;
+}
+
 export const formRequiredFieldCheck: Playbook<FormRequiredFieldCheckInput> = {
   name: 'form_required_field_check',
   description:
@@ -655,36 +921,52 @@ export const formRequiredFieldCheck: Playbook<FormRequiredFieldCheckInput> = {
       );
     }
 
-    // Determine "required" fields. PageModel doesn't currently mark required
-    // fields explicitly — fall back to assuming text/email/password fields
-    // labelled with anything other than "optional" are required. Caller can
-    // override with input.requiredFields in a future iteration.
+    // Bug 3 fix: use field.required (HTML required attribute / aria-required) as
+    // the PRIMARY signal. Fall back to label heuristics only when field.required
+    // is false but the label still suggests required (label/HTML mismatch finding).
+    const labelMismatches: string[] = [];
     const candidateRequired = form.fields.filter((f) => {
       const t = f.type;
-      const label = f.label.toLowerCase();
-      const looksOptional = label.includes('optional') || label.includes('(optional)');
-      return (
-        !looksOptional &&
-        (t === 'textbox' ||
-          t === 'searchbox' ||
-          t === 'password' ||
-          t === 'email' ||
-          t === 'textarea')
-      );
+      const isTextLike =
+        t === 'textbox' ||
+        t === 'text' ||
+        t === 'searchbox' ||
+        t === 'password' ||
+        t === 'email' ||
+        t === 'textarea';
+      if (!isTextLike) return false;
+
+      if (f.required) return true;
+
+      // Secondary: HTML says not required but label implies it is.
+      // Flag as a label/HTML mismatch rather than silently including.
+      const labelLower = f.label.toLowerCase();
+      const labelImpliesRequired =
+        labelLower.includes('required') ||
+        labelLower.includes('*') ||
+        (!labelLower.includes('optional') && !labelLower.includes('(optional)'));
+      // We do NOT include these — they would be false positives. Record mismatch.
+      if (!f.required && labelImpliesRequired) {
+        labelMismatches.push(f.label);
+      }
+      return false;
     });
     evidence.candidateRequiredCount = candidateRequired.length;
     evidence.candidateRequiredLabels = candidateRequired.map((f) => f.label);
+    if (labelMismatches.length > 0) {
+      evidence.labelHtmlMismatch = labelMismatches;
+    }
 
     if (candidateRequired.length === 0) {
       return ok(
         formRequiredFieldCheck.name,
-        `Form '${input.formId}' has no candidate required text fields.`,
+        `Form '${input.formId}' has no HTML-required text fields.${labelMismatches.length > 0 ? ` Note: ${labelMismatches.length} field(s) have label/HTML mismatch (label implies required but HTML attribute missing): ${labelMismatches.join(', ')}` : ''}`,
         evidence,
         steps,
       );
     }
 
-    // Clear every text-like field so the form is effectively empty.
+    // Clear every required text-like field so the form is effectively empty.
     for (const f of candidateRequired) {
       try {
         await ctx.page.locator(f.locator).first().fill('');
@@ -721,17 +1003,29 @@ export const formRequiredFieldCheck: Playbook<FormRequiredFieldCheckInput> = {
     evidence.errorVisible = errorVisible;
     evidence.toastVisible = toastVisible;
 
-    // The good case: form blocked the empty submit (no nav, no toast, error visible).
-    if (errorVisible && !toastVisible && urlAfter === urlBefore) {
-      return ok(
-        formRequiredFieldCheck.name,
-        `Form '${input.formId}' correctly rejected empty submit (error indicator visible). Required-field validation appears intact.`,
-        evidence,
-        steps,
-      );
+    // Bug 4 fix: per-field error mapping. Walk each required field and check
+    // whether it has an error indicator. This distinguishes:
+    //   ok         — every required field has an indicator
+    //   suspicious — some fields have indicators, some don't
+    //   failed     — form accepted the empty submit with no errors at all
+    const perFieldErrors: Array<{ field: string; hasError: boolean }> = [];
+    if (!toastVisible && urlAfter === urlBefore) {
+      for (const f of candidateRequired) {
+        const hasError = await fieldHasErrorIndicator(ctx.page, f);
+        perFieldErrors.push({ field: f.label, hasError });
+        steps.push({
+          label: `per-field error check: '${f.label}'`,
+          ok: hasError,
+          detail: hasError ? 'error indicator present' : 'no error indicator',
+        });
+      }
     }
+    evidence.perFieldErrors = perFieldErrors;
 
-    // The bad cases:
+    const fieldsWithError = perFieldErrors.filter((r) => r.hasError).length;
+    const fieldsWithoutError = perFieldErrors.filter((r) => !r.hasError).length;
+
+    // Verdict with per-field detail.
     if (toastVisible || urlAfter !== urlBefore) {
       return suspicious(
         formRequiredFieldCheck.name,
@@ -745,6 +1039,49 @@ export const formRequiredFieldCheck: Playbook<FormRequiredFieldCheckInput> = {
       return suspicious(
         formRequiredFieldCheck.name,
         `Form '${input.formId}' submit returned silently (no error, no toast, no nav). Validation appears broken — file a finding.`,
+        evidence,
+        steps,
+      );
+    }
+
+    // Per-field analysis available.
+    if (perFieldErrors.length > 0) {
+      if (fieldsWithoutError > 0 && fieldsWithError > 0) {
+        return suspicious(
+          formRequiredFieldCheck.name,
+          `Form '${input.formId}' shows errors for ${fieldsWithError}/${candidateRequired.length} required field(s) but silently swallows ${fieldsWithoutError} (fields without indicator: ${perFieldErrors
+            .filter((r) => !r.hasError)
+            .map((r) => r.field)
+            .join(', ')}). Partial validation — file a finding.`,
+          evidence,
+          steps,
+        );
+      }
+      if (fieldsWithoutError === candidateRequired.length) {
+        // All fields lack per-field indicators — might be a single top-level
+        // error which we already detected via errorVisible. Not a hard bug but
+        // worth noting.
+        return ok(
+          formRequiredFieldCheck.name,
+          `Form '${input.formId}' rejected empty submit (error indicator visible) but no per-field indicators found — uses a single top-level error message. Required-field validation present but not field-granular.`,
+          evidence,
+          steps,
+        );
+      }
+      // All required fields have per-field indicators: ideal.
+      return ok(
+        formRequiredFieldCheck.name,
+        `Form '${input.formId}' correctly rejected empty submit with per-field error indicators on all ${candidateRequired.length} required field(s).`,
+        evidence,
+        steps,
+      );
+    }
+
+    // Fallback: high-level check only (couldn't probe per-field, e.g. submit threw).
+    if (errorVisible && !toastVisible && urlAfter === urlBefore) {
+      return ok(
+        formRequiredFieldCheck.name,
+        `Form '${input.formId}' correctly rejected empty submit (error indicator visible). Required-field validation appears intact.`,
         evidence,
         steps,
       );

@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { writeReviewArtefacts } from '../src/findings/report.ts';
 import { reviewRun } from '../src/findings/review.ts';
+import { selectBackend } from '../src/llm/factory.ts';
 import { createLogger } from '../src/logging/logger.ts';
 
 const args = process.argv.slice(2);
@@ -14,8 +15,9 @@ Re-reviews a past scan: reads findings.json + journeys/*.meta.json from runDir,
 calls a critic LLM to triage each finding, writes review.md and review.json
 into the same dir.
 
-Requires ANTHROPIC_API_KEY in the environment (this path uses the direct
-Anthropic SDK, not the Claude Code subprocess).
+Auth: respects LLM_AUTH (api|subscription). Default 'api' requires
+ANTHROPIC_API_KEY; 'subscription' uses the local 'claude' CLI's stored auth
+(Pro/Max plan, dev machines only).
 
   --model          Override reviewer model (default: claude-sonnet-4-6).
   --inline-critic  Force synchronous messages.create instead of Batch API
@@ -45,9 +47,14 @@ for (let i = 1; i < args.length; i++) {
 }
 
 const apiKey = process.env.ANTHROPIC_API_KEY;
-if (!apiKey || apiKey.trim() === '') {
+const llmAuth = process.env.LLM_AUTH;
+
+let backend: ReturnType<typeof selectBackend>;
+try {
+  backend = selectBackend({ apiKey, llmAuth });
+} catch (err) {
   process.stderr.write(
-    'ANTHROPIC_API_KEY is required for the reviewer. Set it in .env (the reviewer uses the direct Anthropic SDK).\n',
+    `Cannot initialise LLM backend: ${err instanceof Error ? err.message : String(err)}\n`,
   );
   process.exit(1);
 }
@@ -58,7 +65,7 @@ const logger = createLogger({ bindings: { tool: 'regress-review' } });
 try {
   const review = await reviewRun({
     runDir,
-    apiKey,
+    backend,
     model,
     batchMode,
     logger,
