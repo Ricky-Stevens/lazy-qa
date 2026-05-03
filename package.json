@@ -30,10 +30,10 @@
     "vitest": "2.1.9"
   },
   "scripts": {
-    "scan": "tsx --env-file-if-exists=.env bin/regress.ts",
-    "review": "tsx --env-file-if-exists=.env bin/regress-review.ts",
-    "replay": "tsx --env-file-if-exists=.env bin/regress-replay.ts",
-    "eval": "tsx --env-file-if-exists=.env bin/regress-eval.ts",
+    "scan": "bun bin/regress.ts",
+    "review": "bun bin/regress-review.ts",
+    "replay": "bun bin/regress-replay.ts",
+    "eval": "bun bin/regress-eval.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

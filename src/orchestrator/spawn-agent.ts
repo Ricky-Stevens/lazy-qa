@@ -240,10 +240,41 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the
   // external signal forwarded from run.
+  //
+  // Two layers of timeout protection:
+  //   (a) `timeoutHandle` fires `abort()` at max_minutes — the SDK is
+  //       supposed to react by SIGTERMing its child, breaking the for-await
+  //       in runAgentLoopSdk, and unwinding to the finally block.
+  //   (b) `hardDeadlineMs` is a longer fuse that REJECTS the entire loop
+  //       call. We've observed the SDK hang in `waitForExit` after the
+  //       child exits but before the iterator emits `done` (see Phase-6 mid
+  //       run #1). Without this, spawnAgent never returns and the parent
+  //       Promise.allSettled blocks forever — even though the agent is
+  //       functionally done. The race lets spawnAgent return, run.ts emits
+  //       agent.end, and the SDK's leaked iterator gets GC'd at process exit.
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => abortController.abort(), budget.max_minutes * 60_000);
   const onExternalAbort = () => abortController.abort();
   abortSignal?.addEventListener('abort', onExternalAbort, { once: true });
+
+  const HARD_DEADLINE_GRACE_MS = 30_000;
+  let hardDeadlineHandle: ReturnType<typeof setTimeout> | undefined;
+  function withHardDeadline<T>(p: Promise<T>): Promise<T> {
+    const limitMs = budget.max_minutes * 60_000 + HARD_DEADLINE_GRACE_MS;
+    const deadline = new Promise<T>((_, reject) => {
+      hardDeadlineHandle = setTimeout(() => {
+        // Fire abort first so the SDK at least gets the signal — it might
+        // unwind cleanly between the abort and the reject below.
+        abortController.abort();
+        reject(
+          new Error(
+            `agent loop hard-deadline exceeded after ${(limitMs / 1000).toFixed(0)}s`,
+          ),
+        );
+      }, limitMs);
+    });
+    return Promise.race([p, deadline]);
+  }
 
   // 5. System prompt — persona-driven, time-saturating. The prompt is
   // optimized for direct-API mode because we no longer need the engagement-gate caveat
@@ -299,71 +330,95 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     // Discriminated dispatch: SDK loop for subscription auth, raw API loop for
     // api-key auth. The else branch is api-mode (kind is 'api' | 'sdk').
     if (backend.kind === 'sdk') {
-      await runAgentLoopSdk({
-        agent,
-        targetUrl,
-        systemPrompt,
-        // No apiKey — sub mode uses the SDK's stored auth.
-        // The LoopInput interface still requires `apiKey: string`. Pass an
-        // empty string here — the SDK loop never reads it.
-        apiKey: '',
-        rawTools: [...harnessKit.rawTools, ...browserTools],
-        journey,
-        abortSignal: abortController.signal,
-        logger: childLogger,
-        siteMap: input.siteMap,
-        summaryMemory,
-        memoryEnabled,
-        memoryPath,
-        events,
-        findingCache: input.findingCache,
-        sharedKnowledge: input.sharedKnowledge,
-        sessionInfo: input.sessionInfo,
-        sitePlaybookText: input.sitePlaybookText,
-      });
+      await withHardDeadline(
+        runAgentLoopSdk({
+          agent,
+          targetUrl,
+          systemPrompt,
+          // No apiKey — sub mode uses the SDK's stored auth.
+          // The LoopInput interface still requires `apiKey: string`. Pass an
+          // empty string here — the SDK loop never reads it.
+          apiKey: '',
+          rawTools: [...harnessKit.rawTools, ...browserTools],
+          journey,
+          abortSignal: abortController.signal,
+          logger: childLogger,
+          siteMap: input.siteMap,
+          summaryMemory,
+          memoryEnabled,
+          memoryPath,
+          events,
+          findingCache: input.findingCache,
+          sharedKnowledge: input.sharedKnowledge,
+          sessionInfo: input.sessionInfo,
+          sitePlaybookText: input.sitePlaybookText,
+        }),
+      );
     } else {
       // API mode — preserved behaviour. Extract raw apiKey via getApiKey()
       // (we no longer have apiKey in scope; loop.ts still expects it).
       const apiBackend = backend as ApiLlmBackend;
-      await runAgentLoop({
-        agent,
-        targetUrl,
-        systemPrompt,
-        apiKey: apiBackend.getApiKey(),
-        rawTools: [...harnessKit.rawTools, ...browserTools],
-        journey,
-        abortSignal: abortController.signal,
-        logger: childLogger,
-        siteMap: input.siteMap,
-        summaryMemory,
-        memoryEnabled,
-        memoryPath,
-        events,
-        findingCache: input.findingCache,
-        sharedKnowledge: input.sharedKnowledge,
-        sessionInfo: input.sessionInfo,
-        sitePlaybookText: input.sitePlaybookText,
-      });
+      await withHardDeadline(
+        runAgentLoop({
+          agent,
+          targetUrl,
+          systemPrompt,
+          apiKey: apiBackend.getApiKey(),
+          rawTools: [...harnessKit.rawTools, ...browserTools],
+          journey,
+          abortSignal: abortController.signal,
+          logger: childLogger,
+          siteMap: input.siteMap,
+          summaryMemory,
+          memoryEnabled,
+          memoryPath,
+          events,
+          findingCache: input.findingCache,
+          sharedKnowledge: input.sharedKnowledge,
+          sessionInfo: input.sessionInfo,
+          sitePlaybookText: input.sitePlaybookText,
+        }),
+      );
     }
   } catch (err) {
-    if (abortController.signal.aborted) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (/hard-deadline exceeded/.test(errMsg)) {
+      journey.terminationReason = 'timeout';
+      childLogger.warn('agent.hard-deadline', { agentId: agent.id });
+    } else if (abortController.signal.aborted) {
       journey.terminationReason = abortSignal?.aborted ? 'signal' : 'timeout';
     } else {
       journey.terminationReason = 'error';
-      childLogger.error('agent.error', {
-        agentId: agent.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      childLogger.error('agent.error', { agentId: agent.id, error: errMsg });
     }
   } finally {
     clearTimeout(timeoutHandle);
+    if (hardDeadlineHandle) clearTimeout(hardDeadlineHandle);
     abortSignal?.removeEventListener('abort', onExternalAbort);
     if (releaseSession) {
-      await releaseSession().catch((closeErr) => {
-        childLogger.warn('session.release.failed', {
-          error: closeErr instanceof Error ? closeErr.message : String(closeErr),
-        });
+      // Race release against a 10s timeout — Playwright's browser.close()
+      // has been observed to hang when the chromium process exited
+      // ungracefully (last persona to release on a shared session). The
+      // browser is gone either way; we just need to free our reference and
+      // move on so the parent event loop can exit.
+      const release = releaseSession;
+      const releaseTimeout = new Promise<void>((resolve) => {
+        const t = setTimeout(() => {
+          childLogger.warn('session.release.timeout', { agentId: agent.id });
+          resolve();
+        }, 10_000);
+        if (typeof t === 'object' && t !== null && 'unref' in t) {
+          (t as { unref: () => void }).unref();
+        }
       });
+      await Promise.race([
+        release().catch((closeErr) => {
+          childLogger.warn('session.release.failed', {
+            error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+          });
+        }),
+        releaseTimeout,
+      ]);
     }
     journey.endedAt ??= new Date().toISOString();
     journey.terminationReason ??= 'max-turns';

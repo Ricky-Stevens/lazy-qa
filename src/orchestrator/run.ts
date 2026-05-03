@@ -382,37 +382,54 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // credential as verified).
     const sharedKnowledge = new SharedKnowledge();
 
-    // 10. Launch agents in parallel. The supervisor runs concurrently and
-    // finishes when every agent terminates.
+    // 10. Launch agents in parallel, but stagger the spawn fan-out. Each
+    // spawnAgent() spins up an SDK query() which spawns a heavyweight
+    // claude SEA child and a bidirectional MCP transport with 30+ tool
+    // registrations. Firing all of them at the same instant produced a
+    // multi-GB allocation spike in the parent that pushed V8 over its
+    // default ~4 GB old-space cap (the harness runs under bun normally,
+    // but the headroom is still finite). A 2 s delay between spawns lets
+    // each one reach steady state before the next allocates its transport
+    // — the agents still run concurrently after start. The supervisor
+    // continues to launch right alongside them.
     const runStartedAt = new Date().toISOString();
 
     const supervisorEnabled = cfg.supervisor.enabled;
-    const explorerPromises = agents.map((agent) =>
-      spawnAgent({
-        runId,
-        runDir,
-        targetUrl: cfg.target.url,
-        allowedHosts: cfg.target.allowed_hosts,
-        auth: cfg.target.auth,
-        agent,
-        backend,
-        siteMap,
-        logger,
-        abortSignal: runAbortController.signal,
-        stealth: cfg.target.stealth,
-        memoryEnabled,
-        memoryPath,
-        skillsBundle,
-        events,
-        selectorCache,
-        findingCache,
-        sharedKnowledge,
-        sessionInfo,
-        sitePlaybookText: sitePlaybook?.perPersona[agent.profileName],
-        siteSummary: sitePlaybook?.siteSummary,
-        siteShape: sitePlaybook?.siteShape,
-      }),
-    );
+    const SPAWN_STAGGER_MS = 2_000;
+    const explorerPromises: ReturnType<typeof spawnAgent>[] = [];
+    for (let i = 0; i < agents.length; i++) {
+      const agent = agents[i];
+      if (!agent) continue;
+      explorerPromises.push(
+        spawnAgent({
+          runId,
+          runDir,
+          targetUrl: cfg.target.url,
+          allowedHosts: cfg.target.allowed_hosts,
+          auth: cfg.target.auth,
+          agent,
+          backend,
+          siteMap,
+          logger,
+          abortSignal: runAbortController.signal,
+          stealth: cfg.target.stealth,
+          memoryEnabled,
+          memoryPath,
+          skillsBundle,
+          events,
+          selectorCache,
+          findingCache,
+          sharedKnowledge,
+          sessionInfo,
+          sitePlaybookText: sitePlaybook?.perPersona[agent.profileName],
+          siteSummary: sitePlaybook?.siteSummary,
+          siteShape: sitePlaybook?.siteShape,
+        }),
+      );
+      if (i < agents.length - 1) {
+        await new Promise((r) => setTimeout(r, SPAWN_STAGGER_MS));
+      }
+    }
 
     const supervisorPromise = supervisorEnabled
       ? runSupervisor({

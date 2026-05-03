@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { LlmBackend, LlmCallInput, LlmCallResult } from './backend.ts';
+import { resolveClaudeBinaryPath } from './sdk-binary.ts';
 
 /**
  * SDK-backed one-shot caller. Uses `@anthropic-ai/claude-agent-sdk`'s `query()`
@@ -38,6 +39,14 @@ export class SdkLlmBackend implements LlmBackend {
         model: input.model,
         systemPrompt: input.systemPrompt,
         maxTurns: 1,
+        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+        // Isolation: no built-in tools (this is a text-in / text-out caller)
+        // and no host CLAUDE.md / settings.json sources — the SDK otherwise
+        // injects the user's global Claude Code instructions into the system
+        // prompt, which both bleeds unrelated guidance into the response and
+        // burns the single available turn on filesystem actions.
+        tools: [],
+        settingSources: [],
         ...(typeof input.thinkingBudgetTokens === 'number' && input.thinkingBudgetTokens > 0
           ? { maxThinkingTokens: input.thinkingBudgetTokens }
           : {}),

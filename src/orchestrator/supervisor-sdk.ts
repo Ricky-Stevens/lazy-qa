@@ -21,6 +21,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { recoverAllSessions } from '../auth/session-pool.ts';
+import { resolveClaudeBinaryPath } from '../llm/sdk-binary.ts';
 import { computeCostUsd } from './cost.ts';
 import {
   count4xxIn,
@@ -321,11 +322,32 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
   //   2. Short continuation messages ("Continue.") until termination conditions
   //      are hit. If we stopped yielding, the SDK would exit after the first
   //      round-trip — this keeps the multi-turn loop alive.
+  //
+  // Lockstep gate: see loop-sdk.ts for the full explanation. Same race here —
+  // the SDK pulls from this generator as fast as we yield, and `turn` only
+  // advances when the consumer below sees an assistant message. Without this
+  // gate the supervisor floods claude with hundreds of thousands of "Continue."
+  // messages before the first response comes back.
+  let turnGateResolve: (() => void) | null = null;
+  let turnGatePromise: Promise<void> = Promise.resolve();
+  function armTurnGate(): void {
+    turnGatePromise = new Promise<void>((r) => {
+      turnGateResolve = r;
+    });
+  }
+  function releaseTurnGate(): void {
+    if (turnGateResolve) {
+      const r = turnGateResolve;
+      turnGateResolve = null;
+      r();
+    }
+  }
   async function* prompts(): AsyncGenerator<{
     type: 'user';
     message: { role: 'user'; content: string };
     parent_tool_use_id: null;
   }> {
+    armTurnGate();
     yield {
       type: 'user',
       message: {
@@ -335,6 +357,7 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
       },
       parent_tool_use_id: null,
     };
+    await turnGatePromise;
     while (
       !selfEnded &&
       !input.abortSignal.aborted &&
@@ -342,6 +365,7 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
       costUsd < input.maxUsd &&
       Date.now() - startedAt < input.maxMinutes * 60_000
     ) {
+      armTurnGate();
       yield {
         type: 'user',
         message: {
@@ -350,9 +374,13 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         },
         parent_tool_use_id: null,
       };
+      await turnGatePromise;
     }
   }
 
+  // Dedupe assistant messages — the SDK emits each completed assistant message
+  // twice in stream-json mode. See loop-sdk.ts for the same fix + observation.
+  const seenAssistantIds = new Set<string>();
   try {
     for await (const message of query({
       prompt: prompts(),
@@ -360,6 +388,12 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         model: input.model,
         systemPrompt,
         maxTurns: input.maxTurns,
+        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+        // Supervisor's tool surface is the supervisor MCP server only.
+        // Disable built-in Claude Code tools (host filesystem/shell access)
+        // and the user's global CLAUDE.md / settings.json from the prompt.
+        tools: [],
+        settingSources: [],
         mcpServers: { supervisor: supervisorServer },
         abortController: controller,
       },
@@ -368,6 +402,7 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         // SDKAssistantMessage narrows here; widen the inner BetaMessage's usage
         // fields to optional because the SDK can omit them on partial streams.
         const m = message.message as {
+          id?: string;
           content: Array<{ type: string; text?: string; name?: string }>;
           stop_reason?: string | null;
           usage?: {
@@ -377,6 +412,13 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
             cache_creation_input_tokens?: number;
           };
         };
+
+        // First emission already released the gate. Do not re-release on
+        // the duplicate — see loop-sdk.ts for why.
+        if (m.id && seenAssistantIds.has(m.id)) {
+          continue;
+        }
+        if (m.id) seenAssistantIds.add(m.id);
 
         turn += 1;
 
@@ -398,9 +440,14 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
           endedReason = 'all-finished';
           break;
         }
+
+        // Unblock the prompts() generator so it can yield "Continue."
+        releaseTurnGate();
       }
 
       if (message.type === 'result') {
+        // Unblock any pending gate so the generator exits cleanly.
+        releaseTurnGate();
         break;
       }
     }
@@ -413,8 +460,10 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    releaseTurnGate();
   } finally {
     input.abortSignal.removeEventListener('abort', onAbort);
+    releaseTurnGate();
   }
 
   // Resolve final endedReason, honouring priority order (same as supervisor.ts).

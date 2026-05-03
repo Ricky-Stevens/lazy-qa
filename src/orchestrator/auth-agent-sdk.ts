@@ -25,6 +25,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import { dismissPersistentBanners, launchBrowser } from '../auth/login.ts';
+import { resolveClaudeBinaryPath } from '../llm/sdk-binary.ts';
 import type { Logger } from '../logging/logger.ts';
 import { isHostAllowed } from '../safety/guards.ts';
 import {
@@ -111,9 +112,32 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
 
   // 6. Per-turn snapshot injection via async generator.
   //    The SDK iterates this, pulling a new user message before each assistant turn.
+  //
+  //    Lockstep gate: see loop-sdk.ts for the full explanation. The SDK's
+  //    `streamInput` consumes this generator with a plain `for await`, pumping
+  //    yields directly to claude's stdin. Without an explicit per-turn gate,
+  //    the loop conditions (terminalSignal, turn) only re-evaluate via the
+  //    SEPARATE consumer below — so we'd flood claude with snapshot-bearing
+  //    messages between yields. Block the next yield until the consumer has
+  //    processed an assistant message (or signalled termination).
+  let turnGateResolve: (() => void) | null = null;
+  let turnGatePromise: Promise<void> = Promise.resolve();
+  function armTurnGate(): void {
+    turnGatePromise = new Promise<void>((r) => {
+      turnGateResolve = r;
+    });
+  }
+  function releaseTurnGate(): void {
+    if (turnGateResolve) {
+      const r = turnGateResolve;
+      turnGateResolve = null;
+      r();
+    }
+  }
   async function* prompts() {
     // First turn — include the URL context.
     const initialSnap = await safeSnapshot(page);
+    armTurnGate();
     yield {
       type: 'user' as const,
       message: {
@@ -122,6 +146,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
       },
       parent_tool_use_id: null,
     };
+    await turnGatePromise;
     // Subsequent turns — yield a fresh snapshot between each assistant reply.
     // Stop yielding when terminal (tool called success/failed), aborted, or
     // max turns reached. The SDK will also stop iterating once it decides the
@@ -129,6 +154,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     // here is belt-and-braces.
     while (!terminalSignal && !input.abortSignal?.aborted && turn < maxTurns) {
       const snap = await safeSnapshot(page);
+      armTurnGate();
       yield {
         type: 'user' as const,
         message: {
@@ -137,9 +163,13 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
         },
         parent_tool_use_id: null,
       };
+      await turnGatePromise;
     }
   }
 
+  // Dedupe assistant messages — SDK emits each one twice in stream-json mode.
+  // See loop-sdk.ts for the same fix + observation.
+  const seenAssistantIds = new Set<string>();
   try {
     for await (const message of query({
       prompt: prompts(),
@@ -147,6 +177,12 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
         model: input.model,
         systemPrompt: AUTH_AGENT_SYSTEM_PROMPT(input.credentials),
         maxTurns: maxTurns,
+        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+        // Auth-agent's only tool surface is the auth MCP server. Disable the
+        // SDK's built-in Claude Code tools (host filesystem/shell access) and
+        // the user's global CLAUDE.md / settings.json from the system prompt.
+        tools: [],
+        settingSources: [],
         mcpServers: { auth: authServer },
         abortController: controller,
       },
@@ -155,6 +191,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
         // SDKAssistantMessage narrows here; widen the inner BetaMessage's usage
         // fields to optional because the SDK can omit them on partial streams.
         const m = message.message as {
+          id?: string;
           content: Array<{ type: string; text?: string; name?: string }>;
           stop_reason?: string | null;
           usage?: {
@@ -164,6 +201,13 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
             cache_creation_input_tokens?: number;
           };
         };
+
+        // First emission already released the gate. Do not re-release on
+        // the duplicate — see loop-sdk.ts for why.
+        if (m.id && seenAssistantIds.has(m.id)) {
+          continue;
+        }
+        if (m.id) seenAssistantIds.add(m.id);
 
         turn += 1;
         lastFinalUrl = page.url();
@@ -182,10 +226,15 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
             // captured in turns/log for observability.
           }
         }
+
+        // Unblock the prompts() generator so the next snapshot+Continue can yield.
+        releaseTurnGate();
       }
 
       if (message.type === 'result') {
-        // The SDK has terminated the conversation. Break out cleanly.
+        // The SDK has terminated the conversation. Release any pending gate
+        // so the generator exits cleanly, then break.
+        releaseTurnGate();
         break;
       }
     }
@@ -202,10 +251,12 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
           ? 'auth-agent aborted'
           : `query error: ${err instanceof Error ? err.message : String(err)}`;
     }
+    releaseTurnGate();
   } finally {
     if (input.abortSignal) {
       input.abortSignal.removeEventListener('abort', onAbort);
     }
+    releaseTurnGate();
     void startedAt;
   }
 

@@ -31,6 +31,7 @@
  */
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
+import { resolveClaudeBinaryPath } from '../llm/sdk-binary.ts';
 import { redactForLlm } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import { ATTACKER_PROFILES, BROWSER_TOOL_NAMES } from '../tools/browser-server.ts';
@@ -219,7 +220,30 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   //
   // We also emit `agent.turn.start` here (just before yielding) so the event
   // stream stays coherent with the turn-by-turn structure of the API loop.
+  //
+  // Lockstep gate: the SDK's `Query.streamInput` consumes this generator with a
+  // plain `for await`, pulling and forwarding each yielded message to claude's
+  // stdin as fast as we yield. If we yield without waiting for the previous
+  // turn's assistant response, claude receives a flood of duplicate user
+  // messages (the loop conditions only re-evaluate against `journey.turns`,
+  // which is incremented by the SEPARATE consumer below — so until that fires,
+  // every condition stays true). `turnGatePromise` blocks the next yield until
+  // the consumer signals an assistant message arrived (or the loop terminated).
   const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
+  let turnGateResolve: (() => void) | null = null;
+  let turnGatePromise: Promise<void> = Promise.resolve();
+  function armTurnGate(): void {
+    turnGatePromise = new Promise<void>((r) => {
+      turnGateResolve = r;
+    });
+  }
+  function releaseTurnGate(): void {
+    if (turnGateResolve) {
+      const r = turnGateResolve;
+      turnGateResolve = null;
+      r();
+    }
+  }
   async function* prompts(): AsyncGenerator<{
     type: 'user';
     message: { role: 'user'; content: string };
@@ -281,14 +305,25 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         modelUsed: agent.model,
       });
 
+      armTurnGate();
       yield {
         type: 'user' as const,
         message: { role: 'user' as const, content: userContent },
         parent_tool_use_id: null,
       };
+      // Wait for an assistant message (or termination) before yielding the
+      // next user turn. Without this gate we'd flood claude's stdin.
+      await turnGatePromise;
     }
   }
 
+  // Dedupe assistant messages: the SDK emits each completed assistant message
+  // twice in stream-json mode (verified in the smoke run — pairs of identical
+  // tokenUsage / content arrived ms apart). Without dedup `journey.turns` and
+  // `journey.costUsd` are doubled, which fires per-agent budget caps at half
+  // the configured budget. Dedupe by `message.id` (the upstream Anthropic
+  // BetaMessage id, stable across the duplicate emissions).
+  const seenAssistantIds = new Set<string>();
   try {
     for await (const message of query({
       prompt: prompts(),
@@ -296,6 +331,13 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         model: agent.model,
         systemPrompt: input.systemPrompt,
         maxTurns: agent.budget.max_turns,
+        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+        // Persona's tool surface is exactly the three MCP servers below.
+        // Disable the SDK's built-in Claude Code tools (Bash/Read/Edit/etc.)
+        // — they would give the agent unrestricted host access — and don't
+        // load user/project CLAUDE.md into the agent's system prompt.
+        tools: [],
+        settingSources: [],
         mcpServers: {
           harness: harnessServer,
           browser: browserServer,
@@ -313,6 +355,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         // optional usage fields the SDK types declare as required-numbers (the
         // SDK can omit them mid-stream for partial messages).
         const m = message.message as {
+          id?: string;
           content: Array<{ type: string; text?: string; name?: string }>;
           stop_reason?: string | null;
           usage?: {
@@ -322,6 +365,17 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
             cache_creation_input_tokens?: number;
           };
         };
+
+        // Dedup before any state updates. Do NOT release the gate on a
+        // duplicate — the first emission already released it and woke the
+        // generator, which armed a NEW gate for the next turn. Releasing
+        // again here would unblock that next gate prematurely, causing the
+        // generator to yield an extra user message we never asked for.
+        if (m.id && seenAssistantIds.has(m.id)) {
+          continue;
+        }
+        if (m.id) seenAssistantIds.add(m.id);
+
         const turnUsage = m.usage
           ? {
               input: m.usage.input_tokens ?? 0,
@@ -359,6 +413,9 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
           costUsdDelta,
           stopReason: m.stop_reason ?? 'unknown',
         });
+
+        // Unblock the prompts() generator so it can yield the next turn.
+        releaseTurnGate();
       }
 
       if (message.type === 'result') {
@@ -374,19 +431,32 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
             journey.terminationReason = 'sdk-end';
           }
         }
+        // Unblock the gate so prompts() can re-evaluate its loop conditions
+        // (which now see terminationReason set) and exit cleanly.
+        releaseTurnGate();
       }
     }
   } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
     if (controller.signal.aborted || abortSignal.aborted) {
       journey.terminationReason = 'signal';
+    } else if (/Reached maximum number of turns/i.test(errMsg)) {
+      // The SDK throws a "Claude Code returned an error result" with this
+      // exact message when its --max-turns cap fires. That's the configured
+      // budget terminating cleanly, not an actual failure — classify as
+      // max-turns so the run summary is accurate.
+      journey.terminationReason = 'max-turns';
     } else {
       journey.terminationReason = 'error';
-      logger.error('loop-sdk.error', {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      logger.error('loop-sdk.error', { error: errMsg });
     }
+    // Defensive: if the consumer loop threw mid-turn the gate may still be
+    // armed and prompts() would deadlock awaiting it. Release so the generator
+    // can observe terminationReason and exit cleanly during cleanup.
+    releaseTurnGate();
   } finally {
     abortSignal.removeEventListener('abort', onAbort);
+    releaseTurnGate();
   }
 
   // Belt-and-braces — if no termination reason was set (e.g. the loop just
