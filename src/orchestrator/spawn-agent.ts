@@ -257,12 +257,17 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   const onExternalAbort = () => abortController.abort();
   abortSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
-  const HARD_DEADLINE_GRACE_MS = 30_000;
+  const HARD_DEADLINE_GRACE_MS = 60_000;
   let hardDeadlineHandle: ReturnType<typeof setTimeout> | undefined;
   function withHardDeadline<T>(p: Promise<T>): Promise<T> {
     const limitMs = budget.max_minutes * 60_000 + HARD_DEADLINE_GRACE_MS;
     const deadline = new Promise<T>((_, reject) => {
       hardDeadlineHandle = setTimeout(() => {
+        // Log loudly so we can see in real-time whether this fired.
+        childLogger.warn('agent.hard-deadline.fired', {
+          agentId: agent.id,
+          limitMs,
+        });
         // Fire abort first so the SDK at least gets the signal — it might
         // unwind cleanly between the abort and the reject below.
         abortController.abort();
@@ -310,7 +315,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
   });
 
   try {
-    childLogger.info('agent.loop.mode', { mode: 'direct-api' });
+    childLogger.info('agent.loop.mode', { mode: backend.kind === 'sdk' ? 'sdk' : 'api' });
     // Per-persona tool filtering. Browser primitives marked `attackerOnly`
     // (evaluate, storage_inspect, fetch_resource, request_with_session,
     // decode_jwt) are exposed only to attacker-flavoured personas. Functional

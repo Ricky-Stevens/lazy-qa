@@ -452,10 +452,28 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         })
       : Promise.resolve(null);
 
+    // Belt-and-braces wall-clock cap. Fire abort after the deadline so
+    // still-running agents get signalled, then let allSettled collect
+    // results — preserves the settled status of agents that already
+    // finished instead of overriding everything with a blanket rejection.
+    const longestAgentBudgetMs =
+      Math.max(...agents.map((a) => a.budget.max_minutes), cfg.supervisor.max_minutes) * 60_000;
+    const OUTER_WAIT_DEADLINE_MS = longestAgentBudgetMs * 2 + 5 * 60_000;
+    const outerDeadlineHandle = setTimeout(() => {
+      logger.error('explorer.allSettled.deadline.fired', {
+        deadlineMs: OUTER_WAIT_DEADLINE_MS,
+      });
+      runAbortController.abort();
+    }, OUTER_WAIT_DEADLINE_MS);
+    if (typeof outerDeadlineHandle === 'object' && outerDeadlineHandle !== null && 'unref' in outerDeadlineHandle) {
+      (outerDeadlineHandle as { unref: () => void }).unref();
+    }
+
     const [explorerResults] = await Promise.all([
-      Promise.allSettled(explorerPromises),
+      Promise.allSettled(explorerPromises) as Promise<PromiseSettledResult<{ journey: Journey }>[]>,
       supervisorPromise,
     ]);
+    clearTimeout(outerDeadlineHandle);
 
     // 10. Collect journeys; build placeholders for rejected agents so the
     // manifest is always complete.

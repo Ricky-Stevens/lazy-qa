@@ -95,11 +95,18 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     },
   });
 
+  const AUTH_SERVER_NAME = 'auth';
   const authServer = createSdkMcpServer({
-    name: 'auth',
+    name: AUTH_SERVER_NAME,
     version: '1.0.0',
     tools: authTools,
   });
+
+  // Pre-approve all auth tools so the SDK auto-executes them without prompting
+  // — same rationale as loop-sdk.ts.
+  const authAllowedTools = authTools.map(
+    (t) => `mcp__${AUTH_SERVER_NAME}__${(t as { name: string }).name}`,
+  );
 
   // 5. AbortController bridging — same pattern as loop-sdk.ts.
   const controller = new AbortController();
@@ -120,11 +127,19 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
   //    SEPARATE consumer below — so we'd flood claude with snapshot-bearing
   //    messages between yields. Block the next yield until the consumer has
   //    processed an assistant message (or signalled termination).
+  const TURN_GATE_TIMEOUT_MS = 120_000;
   let turnGateResolve: (() => void) | null = null;
   let turnGatePromise: Promise<void> = Promise.resolve();
   function armTurnGate(): void {
     turnGatePromise = new Promise<void>((r) => {
       turnGateResolve = r;
+      setTimeout(() => {
+        if (turnGateResolve === r) {
+          input.logger.warn('auth-agent-sdk.turnGate.timeout');
+          r();
+          turnGateResolve = null;
+        }
+      }, TURN_GATE_TIMEOUT_MS).unref();
     });
   }
   function releaseTurnGate(): void {
@@ -183,7 +198,8 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
         // the user's global CLAUDE.md / settings.json from the system prompt.
         tools: [],
         settingSources: [],
-        mcpServers: { auth: authServer },
+        mcpServers: { [AUTH_SERVER_NAME]: authServer },
+        allowedTools: authAllowedTools,
         abortController: controller,
       },
     })) {

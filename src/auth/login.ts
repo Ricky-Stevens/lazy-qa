@@ -104,8 +104,16 @@ export async function launchBrowser(
   stealth: boolean,
   options: Parameters<typeof playwrightChromium.launch>[0],
 ): Promise<Browser> {
+  const stabilityArgs = [
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+  ];
+  const mergedOptions = {
+    ...options,
+    args: [...(options?.args ?? []), ...stabilityArgs],
+  };
   if (!stealth) {
-    return playwrightChromium.launch(options);
+    return playwrightChromium.launch(mergedOptions);
   }
   // Dynamic import — only loaded when stealth is on, keeps default install lean.
   // Type as unknown to avoid requiring cloakbrowser at compile time (optional peer dep).
@@ -167,7 +175,14 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
   // ── auth.type === 'none' ──────────────────────────────────────────────────
   if (auth.type === 'none') {
-    const browser = await launchChrome();
+    logger.info('login.none.launching', { agentId });
+    // No login needed — use bundled chromium directly. Google Chrome stable
+    // (channel: 'chrome') has singleton process conflicts on some platforms
+    // (WSL2) when the previous browser instance hasn't fully cleaned up. The
+    // channel: 'chrome' path is only needed for SSO/Auth0 storage-state
+    // compatibility, which is irrelevant with auth.type=none.
+    const browser = await launchBrowser(stealth, { headless });
+    logger.info('login.none.launched', { agentId });
     const context = auth.storage_state_path
       ? await browser.newContext({
           storageState: path.isAbsolute(auth.storage_state_path)

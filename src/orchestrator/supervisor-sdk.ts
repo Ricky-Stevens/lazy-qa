@@ -301,11 +301,18 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
     endSessionTool,
   ];
 
+  const SUPERVISOR_SERVER_NAME = 'supervisor';
   const supervisorServer = createSdkMcpServer({
-    name: 'supervisor',
+    name: SUPERVISOR_SERVER_NAME,
     version: '1.0.0',
     tools: allTools,
   });
+
+  // Pre-approve all supervisor tools so the SDK auto-executes them without
+  // prompting — same rationale as loop-sdk.ts.
+  const supervisorAllowedTools = allTools.map(
+    (t) => `mcp__${SUPERVISOR_SERVER_NAME}__${(t as { name: string }).name}`,
+  );
 
   // AbortController bridging — same pattern as loop-sdk.ts and auth-agent-sdk.ts.
   const controller = new AbortController();
@@ -328,11 +335,19 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
   // advances when the consumer below sees an assistant message. Without this
   // gate the supervisor floods claude with hundreds of thousands of "Continue."
   // messages before the first response comes back.
+  const TURN_GATE_TIMEOUT_MS = 120_000;
   let turnGateResolve: (() => void) | null = null;
   let turnGatePromise: Promise<void> = Promise.resolve();
   function armTurnGate(): void {
     turnGatePromise = new Promise<void>((r) => {
       turnGateResolve = r;
+      setTimeout(() => {
+        if (turnGateResolve === r) {
+          input.logger.warn('supervisor-sdk.turnGate.timeout');
+          r();
+          turnGateResolve = null;
+        }
+      }, TURN_GATE_TIMEOUT_MS).unref();
     });
   }
   function releaseTurnGate(): void {
@@ -394,7 +409,8 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         // and the user's global CLAUDE.md / settings.json from the prompt.
         tools: [],
         settingSources: [],
-        mcpServers: { supervisor: supervisorServer },
+        mcpServers: { [SUPERVISOR_SERVER_NAME]: supervisorServer },
+        allowedTools: supervisorAllowedTools,
         abortController: controller,
       },
     })) {

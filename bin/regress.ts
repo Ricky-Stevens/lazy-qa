@@ -20,6 +20,19 @@ See config/example.yaml for the schema.
 
 const { runScan } = await import('../src/orchestrator/run.ts');
 
+// Global wall-clock backstop. If runScan hangs at any tear-down stage past
+// this — SDK transport leak, leaked timer, blocked Playwright client — we
+// force-exit with a non-zero code so CI / wrappers can notice. The natural
+// path is process.exit(0) below, which fires as soon as runScan returns.
+const GLOBAL_BACKSTOP_MS = 60 * 60 * 1000; // 1 h
+const backstop = setTimeout(() => {
+  process.stderr.write(
+    `[regress] global backstop fired after ${GLOBAL_BACKSTOP_MS / 1000}s — forcing exit\n`,
+  );
+  process.exit(124);
+}, GLOBAL_BACKSTOP_MS);
+backstop.unref();
+
 try {
   const result = await runScan({ configPath });
   process.stdout.write(

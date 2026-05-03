@@ -123,9 +123,18 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         if (typeof formId === 'string' && formId.length > 0) fuzzedFormIds.add(formId);
       }
 
+      const TOOL_TIMEOUT_MS = 60_000;
       let result: { content: { type: 'text'; text: string }[] };
       try {
-        result = await rt.handler(args);
+        result = await Promise.race([
+          rt.handler(args),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`tool ${rt.name} timed out after ${TOOL_TIMEOUT_MS / 1000}s (browser may have crashed)`)),
+              TOOL_TIMEOUT_MS,
+            ),
+          ),
+        ]);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         await events?.write({
@@ -189,20 +198,40 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     wrapTool(rt, `${PLAYBOOK_TOOL_PREFIX}${rt.name}`),
   );
 
+  const HARNESS_SERVER_NAME = 'harness';
+  const BROWSER_SERVER_NAME = 'browser';
+  const PLAYBOOKS_SERVER_NAME = 'playbooks';
+
   const harnessServer = createSdkMcpServer({
-    name: 'harness',
+    name: HARNESS_SERVER_NAME,
     version: '1.0.0',
     tools: harnessSdkTools,
   });
   const browserServer = createSdkMcpServer({
-    name: 'browser',
+    name: BROWSER_SERVER_NAME,
     version: '1.0.0',
     tools: browserSdkTools,
   });
   const playbooksServer = createSdkMcpServer({
-    name: 'playbooks',
+    name: PLAYBOOKS_SERVER_NAME,
     version: '1.0.0',
     tools: playbooksSdkTools,
+  });
+
+  // Build the allowedTools list so the SDK auto-approves our MCP tools without
+  // prompting for permission. In default permissionMode the subprocess asks for
+  // interactive approval before executing any tool — since we run non-
+  // interactively (stream-json), unapproved tools silently fail. Listing every
+  // tool here as pre-approved fixes this.
+  const allowedTools = [
+    ...harnessRawTools.map((rt) => `mcp__${HARNESS_SERVER_NAME}__${rt.name}`),
+    ...browserRawTools.map((rt) => `mcp__${BROWSER_SERVER_NAME}__${rt.name}`),
+    ...playbooksRawTools.map((rt) => `mcp__${PLAYBOOKS_SERVER_NAME}__${rt.name}`),
+  ];
+
+  logger.debug('loop-sdk.allowedTools', {
+    count: allowedTools.length,
+    tools: allowedTools,
   });
 
   // Bridge AbortSignal through to the SDK's abortController.
@@ -230,11 +259,22 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   // every condition stays true). `turnGatePromise` blocks the next yield until
   // the consumer signals an assistant message arrived (or the loop terminated).
   const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
+  const TURN_GATE_TIMEOUT_MS = 120_000;
   let turnGateResolve: (() => void) | null = null;
   let turnGatePromise: Promise<void> = Promise.resolve();
   function armTurnGate(): void {
     turnGatePromise = new Promise<void>((r) => {
       turnGateResolve = r;
+      // Safety: if the consumer never releases (subprocess died, async
+      // iterator hung), auto-release after TURN_GATE_TIMEOUT_MS so the
+      // generator can re-evaluate its loop conditions and exit.
+      setTimeout(() => {
+        if (turnGateResolve === r) {
+          logger.warn('loop-sdk.turnGate.timeout', { agentId: agent.id });
+          r();
+          turnGateResolve = null;
+        }
+      }, TURN_GATE_TIMEOUT_MS).unref();
     });
   }
   function releaseTurnGate(): void {
@@ -339,10 +379,11 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         tools: [],
         settingSources: [],
         mcpServers: {
-          harness: harnessServer,
-          browser: browserServer,
-          playbooks: playbooksServer,
+          [HARNESS_SERVER_NAME]: harnessServer,
+          [BROWSER_SERVER_NAME]: browserServer,
+          [PLAYBOOKS_SERVER_NAME]: playbooksServer,
         },
+        allowedTools,
         abortController: controller,
         ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
           ? { maxThinkingTokens: agent.maxThinkingTokens }

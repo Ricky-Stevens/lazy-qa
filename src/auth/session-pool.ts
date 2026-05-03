@@ -46,11 +46,14 @@ function sessionKey(input: {
   targetUrl: string;
   credentials: { username: string; password: string } | null;
   authType: 'form' | 'none';
+  isolateSession?: boolean;
+  agentId?: string;
 }): string {
   const cred = input.credentials
     ? `${input.credentials.username}::${input.credentials.password}`
     : '__none__';
-  return `${input.targetUrl}::${input.authType}::${cred}`;
+  const base = `${input.targetUrl}::${input.authType}::${cred}`;
+  return input.isolateSession && input.agentId ? `${base}::${input.agentId}` : base;
 }
 
 export interface AcquireInput {
@@ -62,6 +65,7 @@ export interface AcquireInput {
   agentId: string;
   logger: Logger;
   stealth: boolean;
+  isolateSession?: boolean;
 }
 
 export interface AcquireResult {
@@ -91,6 +95,8 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
     targetUrl: input.targetUrl,
     credentials: input.credentials,
     authType: input.auth.type,
+    isolateSession: input.isolateSession,
+    agentId: input.agentId,
   });
 
   const prevMutex = sessionMutexes.get(key) ?? Promise.resolve();
@@ -118,6 +124,13 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
           agentId: input.agentId,
           logger: input.logger,
           stealth: input.stealth,
+        });
+        result.browser.on('disconnected', () => {
+          input.logger.error('browser.disconnected', {
+            key,
+            refCount: 'unknown',
+            stack: new Error('browser disconnected').stack,
+          });
         });
         return {
           browser: result.browser,
@@ -169,6 +182,7 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
       session.refCount -= 1;
       if (session.refCount <= 0) {
         sessions.delete(key);
+        sessionMutexes.delete(key);
         await session.browser.close().catch(() => undefined);
         input.logger.info('session.closed', { key });
       }

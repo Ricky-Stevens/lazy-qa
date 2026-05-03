@@ -33,52 +33,54 @@ export class SdkLlmBackend implements LlmBackend {
       cacheWriteTokens: 0,
     };
 
-    for await (const message of query({
-      prompt: promptText,
-      options: {
-        model: input.model,
-        systemPrompt: input.systemPrompt,
-        maxTurns: 1,
-        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
-        // Isolation: no built-in tools (this is a text-in / text-out caller)
-        // and no host CLAUDE.md / settings.json sources — the SDK otherwise
-        // injects the user's global Claude Code instructions into the system
-        // prompt, which both bleeds unrelated guidance into the response and
-        // burns the single available turn on filesystem actions.
-        tools: [],
-        settingSources: [],
-        ...(typeof input.thinkingBudgetTokens === 'number' && input.thinkingBudgetTokens > 0
-          ? { maxThinkingTokens: input.thinkingBudgetTokens }
-          : {}),
-      },
-    })) {
-      if (message.type === 'assistant') {
-        // SDKAssistantMessage narrows here; widen the inner BetaMessage's
-        // shape to use Anthropic's public ContentBlock and optional usage.
-        const m = message.message as {
-          content: Anthropic.ContentBlock[];
-          stop_reason?: string | null;
-          usage?: {
-            input_tokens?: number;
-            output_tokens?: number;
-            cache_read_input_tokens?: number;
-            cache_creation_input_tokens?: number;
+    const ONE_SHOT_TIMEOUT_MS = 120_000;
+    const timeoutCtrl = new AbortController();
+    const timeoutHandle = setTimeout(() => timeoutCtrl.abort(), ONE_SHOT_TIMEOUT_MS);
+
+    try {
+      for await (const message of query({
+        prompt: promptText,
+        options: {
+          model: input.model,
+          systemPrompt: input.systemPrompt,
+          maxTurns: 1,
+          pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+          tools: [],
+          settingSources: [],
+          abortController: timeoutCtrl,
+          ...(typeof input.thinkingBudgetTokens === 'number' && input.thinkingBudgetTokens > 0
+            ? { maxThinkingTokens: input.thinkingBudgetTokens }
+            : {}),
+        },
+      })) {
+        if (message.type === 'assistant') {
+          const m = message.message as {
+            content: Anthropic.ContentBlock[];
+            stop_reason?: string | null;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+            };
           };
-        };
-        assistantContent = m.content;
-        stopReason = m.stop_reason ?? null;
-        if (m.usage) {
-          usage = {
-            inputTokens: m.usage.input_tokens ?? 0,
-            outputTokens: m.usage.output_tokens ?? 0,
-            cacheReadTokens: m.usage.cache_read_input_tokens ?? 0,
-            cacheWriteTokens: m.usage.cache_creation_input_tokens ?? 0,
-          };
+          assistantContent = m.content;
+          stopReason = m.stop_reason ?? null;
+          if (m.usage) {
+            usage = {
+              inputTokens: m.usage.input_tokens ?? 0,
+              outputTokens: m.usage.output_tokens ?? 0,
+              cacheReadTokens: m.usage.cache_read_input_tokens ?? 0,
+              cacheWriteTokens: m.usage.cache_creation_input_tokens ?? 0,
+            };
+          }
+        }
+        if (message.type === 'result') {
+          break;
         }
       }
-      // 'result' messages may carry a final usage roll-up; we already captured
-      // per-turn usage from the 'assistant' message above. Loop-mode (Task 7)
-      // will need to handle multi-turn aggregation differently.
+    } finally {
+      clearTimeout(timeoutHandle);
     }
 
     return {

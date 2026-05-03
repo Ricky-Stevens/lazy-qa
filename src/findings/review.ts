@@ -175,27 +175,34 @@ async function runVerifications(
   const queue = [...candidates];
   const inFlight = new Set<Promise<void>>();
 
+  const VERIFY_PER_FINDING_TIMEOUT_MS = 90_000;
   const runOne = async (cand: { finding: Finding; review: ReviewItem }): Promise<void> => {
     const tab = await ctx.context.newPage();
     try {
-      const result = await verifyFinding({
-        finding: cand.finding,
-        page: tab,
-        rootUrl: ctx.rootUrl,
-        allowedHosts: ctx.allowedHosts,
-        backend,
-        model: ctx.model,
-        logger,
-        events,
-      });
+      const result = await Promise.race([
+        verifyFinding({
+          finding: cand.finding,
+          page: tab,
+          rootUrl: ctx.rootUrl,
+          allowedHosts: ctx.allowedHosts,
+          backend,
+          model: ctx.model,
+          logger,
+          events,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`verify timeout after ${VERIFY_PER_FINDING_TIMEOUT_MS / 1000}s`)),
+            VERIFY_PER_FINDING_TIMEOUT_MS,
+          ),
+        ),
+      ]);
       results.set(cand.finding.id, result);
     } catch (err) {
       logger.warn('verify.unhandled', {
         findingId: cand.finding.id,
         error: err instanceof Error ? err.message : String(err),
       });
-      // Fall back to intermittent so a verifier crash doesn't accidentally
-      // clear a real finding.
       results.set(cand.finding.id, {
         findingId: cand.finding.id,
         verdict: 'intermittent',
