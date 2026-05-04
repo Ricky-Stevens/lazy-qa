@@ -81,7 +81,7 @@ async function fillField(
   }
 }
 
-async function detectSuccessToast(page: Page): Promise<boolean> {
+async function detectSuccessToast(page: Page, skipIfErrorVisible = false): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < TOAST_OBSERVE_WINDOW_MS) {
     const matches = await page
@@ -91,6 +91,7 @@ async function detectSuccessToast(page: Page): Promise<boolean> {
       .count()
       .catch(() => 0);
     if (matches > 0) return true;
+    if (skipIfErrorVisible && (await detectErrorShown(page))) return false;
     await page.waitForTimeout(150);
   }
   return false;
@@ -237,9 +238,7 @@ export const fillAndVerify: Playbook<FillAndVerifyInput> = {
       );
     }
 
-    await ctx.page.waitForLoadState('networkidle', { timeout: SUBMIT_TIMEOUT_MS }).catch(() => {
-      steps.push({ label: 'wait for networkidle', ok: false, detail: 'timeout (continuing)' });
-    });
+    await ctx.page.waitForTimeout(500);
 
     const urlAfter = ctx.page.url();
     evidence.urlAfter = urlAfter;
@@ -593,13 +592,15 @@ export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
           submitOk = false;
           submitError = err instanceof Error ? err.message : String(err);
         }
-        // Wait briefly for response/render.
-        await ctx.page.waitForLoadState('networkidle', { timeout: 2_500 }).catch(() => undefined);
-        await ctx.page.waitForTimeout(200);
+        // Settle pause for SPA re-render. networkidle never resolves on apps
+        // with WebSocket connections (Juice Shop, any socket.io app), burning
+        // the full 2.5s timeout per vector. A fixed 500ms is enough for
+        // Angular/React to digest the submit and render validation errors.
+        await ctx.page.waitForTimeout(500);
 
         const urlAfter = ctx.page.url();
         const errorVisible = await detectErrorShown(ctx.page);
-        const toastVisible = await detectSuccessToast(ctx.page);
+        const toastVisible = await detectSuccessToast(ctx.page, true);
 
         // Highest server-error status seen on any captured response.
         let worstStatus: number | undefined;
@@ -721,14 +722,11 @@ export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
               submitOk = false;
               submitError = err instanceof Error ? err.message : String(err);
             }
-            await ctx.page
-              .waitForLoadState('networkidle', { timeout: 2_500 })
-              .catch(() => undefined);
-            await ctx.page.waitForTimeout(200);
+            await ctx.page.waitForTimeout(500);
 
             const urlAfter = ctx.page.url();
             const errorVisible = await detectErrorShown(ctx.page);
-            const toastVisible = await detectSuccessToast(ctx.page);
+            const toastVisible = await detectSuccessToast(ctx.page, true);
 
             let worstStatus: number | undefined;
             let stackTraceLeak = false;
@@ -990,12 +988,11 @@ export const formRequiredFieldCheck: Playbook<FormRequiredFieldCheckInput> = {
         detail: err instanceof Error ? err.message : String(err),
       });
     }
-    await ctx.page.waitForLoadState('networkidle', { timeout: 2_000 }).catch(() => undefined);
-    await ctx.page.waitForTimeout(250);
+    await ctx.page.waitForTimeout(500);
 
     const urlAfter = ctx.page.url();
     const errorVisible = await detectErrorShown(ctx.page);
-    const toastVisible = await detectSuccessToast(ctx.page);
+    const toastVisible = await detectSuccessToast(ctx.page, true);
 
     evidence.submitOk = submitOk;
     evidence.urlBefore = urlBefore;
@@ -1156,11 +1153,8 @@ export const formPersistenceRoundtrip: Playbook<FormPersistenceRoundtripInput> =
         steps,
       );
     }
-    await ctx.page
-      .waitForLoadState('networkidle', { timeout: SUBMIT_TIMEOUT_MS })
-      .catch(() => undefined);
-    await ctx.page.waitForTimeout(200);
-    const toastVisible = await detectSuccessToast(ctx.page);
+    await ctx.page.waitForTimeout(500);
+    const toastVisible = await detectSuccessToast(ctx.page, true);
     evidence.submitToast = toastVisible;
     steps.push({ label: 'submit complete', ok: true, detail: `toast=${toastVisible}` });
 
@@ -1168,9 +1162,9 @@ export const formPersistenceRoundtrip: Playbook<FormPersistenceRoundtripInput> =
     const away = input.awayUrl ?? new URL(urlBefore).origin;
     try {
       await ctx.page.goto(away, { waitUntil: 'domcontentloaded', timeout: 5_000 });
-      await ctx.page.waitForTimeout(250);
+      await ctx.page.waitForTimeout(500);
       await ctx.page.goto(urlBefore, { waitUntil: 'domcontentloaded', timeout: 5_000 });
-      await ctx.page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => undefined);
+      await ctx.page.waitForTimeout(500);
     } catch (err) {
       return fail(
         formPersistenceRoundtrip.name,
@@ -1295,14 +1289,11 @@ export const formDoubleSubmit: Playbook<FormDoubleSubmitInput> = {
     if (r2 === 'ok') successCounts.ok += 1;
     else if (r2.startsWith('error:')) successCounts.errored += 1;
 
-    await ctx.page
-      .waitForLoadState('networkidle', { timeout: SUBMIT_TIMEOUT_MS })
-      .catch(() => undefined);
-    await ctx.page.waitForTimeout(300);
+    await ctx.page.waitForTimeout(500);
 
     const urlAfter = ctx.page.url();
     const errorVisible = await detectErrorShown(ctx.page);
-    const toastVisible = await detectSuccessToast(ctx.page);
+    const toastVisible = await detectSuccessToast(ctx.page, true);
 
     evidence.click1 = r1;
     evidence.click2 = r2;

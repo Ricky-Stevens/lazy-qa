@@ -46,10 +46,19 @@ export interface SitePlaybookInput {
   maxOutputTokens?: number;
   logger: Logger;
   events?: EventWriter;
+  /** When true, the LLM also recommends which personas to spawn (auto mode).
+   *  The roster is returned in `recommendedRoster`. */
+  autoMode?: boolean;
   /** Currently silently ignored by the LLM call — `LlmCallInput` does not yet
    *  surface aborts. Kept on the interface so callers compile; remove or wire
    *  through once the backend abstraction supports cancellation. */
   abortSignal?: AbortSignal;
+}
+
+export interface RosterRecommendation {
+  persona: string;
+  priority: number;
+  reason: string;
 }
 
 export interface SitePlaybookResult {
@@ -65,6 +74,8 @@ export interface SitePlaybookResult {
   costUsd: number;
   /** Failure reason if ok=false. */
   detail?: string;
+  /** Agent roster recommendation (auto mode only). */
+  recommendedRoster?: RosterRecommendation[];
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
@@ -112,17 +123,14 @@ function representativeAffordances(sitemap: SiteMap, max = 40): string {
   return out.join('\n');
 }
 
-function buildSystemPrompt(rootUrl: string, personas: SitePlaybookInput['personas']): string {
+function buildSystemPrompt(
+  rootUrl: string,
+  personas: SitePlaybookInput['personas'],
+  autoMode: boolean,
+): string {
   const personaList = personas.map((p) => `  - ${p.name}: ${p.description}`).join('\n');
-  return [
-    'You are analysing a web application sitemap to brief other AI agents on what to do here.',
-    `The target is ${rootUrl}. Agents start ALREADY AUTHENTICATED — they inherit a logged-in session.`,
-    '',
-    'Your job: produce a JSON object describing the site and giving each persona a concrete, route-grade plan.',
-    '',
-    'Personas to brief:',
-    personaList,
-    '',
+
+  const schemaLines = [
     'OUTPUT — a single JSON object, no prose before or after. Schema:',
     '{',
     '  "siteShape": "ecommerce" | "admin-crud" | "content" | "social" | "api-gateway" | "marketing" | "mixed" | "unknown",',
@@ -130,15 +138,52 @@ function buildSystemPrompt(rootUrl: string, personas: SitePlaybookInput['persona
     '  "perPersona": {',
     '    "<persona-name>": "100-200 words. CONCRETE flow tailored to THIS site. Reference actual route URLs from the sitemap. Use bullets if you like."',
     '  }',
-    '}',
-    '',
-    'RULES:',
+  ];
+
+  if (autoMode) {
+    schemaLines.push(
+      '  "recommendedRoster": [',
+      '    { "persona": "<persona-name>", "priority": 1, "reason": "one sentence why this persona has work here" }',
+      '  ]',
+    );
+  }
+  schemaLines.push('}');
+
+  const rules = [
     "- Reference real route URLs verbatim (e.g. `/#/basket`, `/#/order-history`). Don't invent paths that aren't in the sitemap.",
     '- If a flow does not apply (e.g. checkout on a content site), do NOT fabricate it. Tell the persona what to do instead.',
     '- Each plan must give the persona at least one HIGH-VALUE concrete action sequence (e.g. "Search → click product → Add to Basket → /#/basket → Checkout"). The persona will follow it, not interpret it.',
     "- The attacker's plan should suggest attack vectors implied by the visible surface (search forms → injection, admin panels → IDOR/privilege, JWT tokens → role manipulation, file routes → path traversal). Stay within the configured target — never propose off-host probes.",
     '- 100-200 words per persona. Concrete is better than long.',
     '- Output JSON only. No markdown fences. No commentary.',
+  ];
+
+  if (autoMode) {
+    rules.push(
+      '',
+      'ROSTER SELECTION (recommendedRoster):',
+      '- Only include personas that have meaningful work on THIS site. If there are no tables, skip table-focused personas. If there are no forms, skip form-focused personas.',
+      '- priority: 1 = must-have (critical coverage gap without), 2 = high-value (significant testing surface), 3 = nice-to-have (some value but could be skipped under budget pressure).',
+      '- You MUST include a perPersona entry for every persona you recommend in the roster.',
+      '- Do NOT recommend a persona unless you can write a concrete 100+ word plan for it.',
+    );
+  }
+
+  return [
+    'You are analysing a web application sitemap to brief other AI agents on what to do here.',
+    `The target is ${rootUrl}. Agents start ALREADY AUTHENTICATED — they inherit a logged-in session.`,
+    '',
+    autoMode
+      ? 'Your job: (1) describe the site, (2) recommend which personas to spawn, and (3) give each recommended persona a concrete, route-grade plan.'
+      : 'Your job: produce a JSON object describing the site and giving each persona a concrete, route-grade plan.',
+    '',
+    autoMode ? 'Available personas (recommend only those with work to do):' : 'Personas to brief:',
+    personaList,
+    '',
+    ...schemaLines,
+    '',
+    'RULES:',
+    ...rules,
   ].join('\n');
 }
 
@@ -173,10 +218,12 @@ function extractJson(text: string): unknown {
 function validateAndNormalise(
   raw: unknown,
   personas: SitePlaybookInput['personas'],
+  autoMode: boolean,
 ): {
   siteShape: string;
   siteSummary: string;
   perPersona: Record<string, string>;
+  recommendedRoster?: RosterRecommendation[];
 } {
   if (!raw || typeof raw !== 'object') {
     throw new Error('response is not an object');
@@ -189,18 +236,33 @@ function validateAndNormalise(
       : '(no summary)';
   const rawPerPersona = (obj.perPersona ?? {}) as Record<string, unknown>;
   const perPersona: Record<string, string> = {};
+  const personaNames = new Set(personas.map((p) => p.name));
   for (const p of personas) {
     const v = rawPerPersona[p.name];
     if (typeof v === 'string' && v.trim().length > 0) {
       perPersona[p.name] = v.trim();
     }
   }
-  return { siteShape, siteSummary, perPersona };
+
+  let recommendedRoster: RosterRecommendation[] | undefined;
+  if (autoMode && Array.isArray(obj.recommendedRoster)) {
+    recommendedRoster = [];
+    for (const entry of obj.recommendedRoster) {
+      if (!entry || typeof entry !== 'object') continue;
+      const e = entry as Record<string, unknown>;
+      const persona = typeof e.persona === 'string' ? e.persona : '';
+      if (!personaNames.has(persona)) continue;
+      const priority = typeof e.priority === 'number' ? e.priority : 2;
+      const reason = typeof e.reason === 'string' ? e.reason : '';
+      recommendedRoster.push({ persona, priority, reason });
+    }
+  }
+
+  return { siteShape, siteSummary, perPersona, recommendedRoster };
 }
 
 export async function generateSitePlaybook(input: SitePlaybookInput): Promise<SitePlaybookResult> {
   const { rootUrl, sitemap, personas, backend, model, logger, events } = input;
-  const maxOutput = input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const startedAt = Date.now();
 
   logger.info('site-playbook.start', {
@@ -248,7 +310,10 @@ export async function generateSitePlaybook(input: SitePlaybookInput): Promise<Si
     };
   }
 
-  const systemPrompt = buildSystemPrompt(rootUrl, personas);
+  const autoMode = input.autoMode ?? false;
+  // Auto mode outputs the roster recommendation + more personas → more tokens.
+  const maxOutput = input.maxOutputTokens ?? (autoMode ? 6144 : DEFAULT_MAX_OUTPUT_TOKENS);
+  const systemPrompt = buildSystemPrompt(rootUrl, personas, autoMode);
   const userPrompt = buildUserPrompt(rootUrl, sitemap);
 
   let costUsd = 0;
@@ -283,7 +348,11 @@ export async function generateSitePlaybook(input: SitePlaybookInput): Promise<Si
       );
     }
 
-    const { siteShape, siteSummary, perPersona } = validateAndNormalise(parsed, personas);
+    const { siteShape, siteSummary, perPersona, recommendedRoster } = validateAndNormalise(
+      parsed,
+      personas,
+      autoMode,
+    );
     const missing = personas.map((p) => p.name).filter((n) => !(n in perPersona));
 
     logger.info('site-playbook.complete', {
@@ -309,6 +378,7 @@ export async function generateSitePlaybook(input: SitePlaybookInput): Promise<Si
       perPersona,
       costUsd,
       detail: missing.length > 0 ? `missing personas: ${missing.join(', ')}` : undefined,
+      recommendedRoster,
     };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);

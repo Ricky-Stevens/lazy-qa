@@ -21,6 +21,15 @@ import { captureScreenshot } from './screenshot.ts';
 const FINDINGS_RATE_LIMIT = 8;
 const FINDINGS_RATE_WINDOW_MS = 60_000;
 
+/**
+ * CTF / gamification noise filter. OWASP testbeds (Juice Shop, WebGoat, DVWA)
+ * emit "challenge solved!" banners that agents misreport as bugs. These are
+ * never legitimate QA findings — the pattern is always "X challenge
+ * solved/triggered/completed by Y". Matches against title + description.
+ */
+const CTF_NOISE_RE =
+  /\bchallenge\b.{0,40}\b(solved|triggered|completed|unlocked|cleared)\b|\b(solved|triggered|completed|unlocked|cleared)\b.{0,40}\bchallenge\b/i;
+
 export interface HarnessServerInput {
   journey: Journey;
   logger: Logger;
@@ -147,6 +156,22 @@ export function createHarnessMcpServer(
                 {
                   type: 'text',
                   text: `THROTTLED: you've filed ${recentCount} findings in the last ${Math.round(FINDINGS_RATE_WINDOW_MS / 1000)}s. The harness is dropping further reports for now. The post-run reviewer deduplicates aggressively, so the findings already on file cover the same root cause. Stop filing variants of the same bug — switch to a different module/feature. If a NEW kind of bug appears later you may file again once the rate window clears.`,
+                },
+              ],
+            };
+          }
+          // CTF gamification noise filter. OWASP testbeds show "challenge
+          // solved!" banners that agents misreport as bugs.
+          if (CTF_NOISE_RE.test(args.title) || CTF_NOISE_RE.test(args.description)) {
+            logger.info('finding.ctf-noise.dropped', {
+              agentId: journey.agentId,
+              title: args.title,
+            });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `NOT A BUG: The "challenge solved" notification you observed is the app's built-in gamification system acknowledging your action, not a defect. Ignore all challenge/score banners — they are intentional. Continue testing the actual functionality.`,
                 },
               ],
             };
@@ -407,6 +432,56 @@ export function createHarnessMcpServer(
             ),
         },
         async (args) => {
+          // Verify the claimed hard-floor condition before accepting.
+          // Agents frequently lie about the reason to quit early.
+          if (getPage) {
+            try {
+              const page = getPage();
+              const url = page.url();
+
+              if (args.reason === 'auth_wall') {
+                const loginPatterns =
+                  /\/(login|signin|sign-in|u\/login|sso|auth|oauth|#\/login)\b/i;
+                if (!loginPatterns.test(url)) {
+                  logger.warn('end_session.rejected', {
+                    reason: args.reason,
+                    url,
+                    detail: args.detail,
+                  });
+                  return {
+                    content: [
+                      {
+                        type: 'text',
+                        text: `REJECTED: Current URL (${url}) is not a login page. You are NOT auth-walled. Continue testing — navigate to a new route, fill a form, or run a playbook.`,
+                      },
+                    ],
+                  };
+                }
+              }
+
+              if (args.reason === 'site_unreachable' || args.reason === 'browser_dead') {
+                // If we can read the URL and it's not about:blank, the browser is alive
+                if (url && url !== 'about:blank') {
+                  logger.warn('end_session.rejected', {
+                    reason: args.reason,
+                    url,
+                    detail: args.detail,
+                  });
+                  return {
+                    content: [
+                      {
+                        type: 'text',
+                        text: `REJECTED: Browser is alive (current URL: ${url}). The site is reachable. Continue testing — navigate to a new route, fill a form, or run a playbook.`,
+                      },
+                    ],
+                  };
+                }
+              }
+            } catch {
+              // getPage() threw or page is dead — condition is genuine
+            }
+          }
+
           journey.terminationReason = 'end_session';
           journey.endedAt = new Date().toISOString();
           logger.info('session.end', {

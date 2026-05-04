@@ -266,6 +266,22 @@ export type Event =
       costUsd: number;
       durationMs: number;
       detail?: string;
+    }
+  | {
+      type: 'rebalancer.tick';
+      ts: string;
+      seq: number;
+      runId: string;
+      terminated: string[];
+      boosted: Record<string, number>;
+      activeAgents: number;
+      healthScores?: Array<{
+        agentId: string;
+        score: number;
+        findings: number;
+        turns: number;
+        spent: number;
+      }>;
     };
 
 /**

@@ -113,7 +113,14 @@ export async function launchBrowser(
     args: [...(options?.args ?? []), ...stabilityArgs],
   };
   if (!stealth) {
-    return playwrightChromium.launch(mergedOptions);
+    // Prefer Chrome stable when installed — it tracks upstream patches
+    // faster than the bundled Chrome for Testing binary, and is more
+    // stable under multi-tab load on WSL2. Falls back to the bundled
+    // binary for systems without Chrome stable (CI, containers, etc.).
+    return playwrightChromium.launch({ ...mergedOptions, channel: 'chrome' }).catch(() => {
+      process.stderr.write('[playwright] Chrome stable unavailable, falling back to bundled Chromium\n');
+      return playwrightChromium.launch(mergedOptions);
+    });
   }
   // Dynamic import — only loaded when stealth is on, keeps default install lean.
   // Type as unknown to avoid requiring cloakbrowser at compile time (optional peer dep).
@@ -156,31 +163,9 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
   const headless = process.env.PLAYWRIGHT_HEADLESS !== 'false';
 
-  // Match Playwright MCP's default — Google Chrome stable. Falls back to bundled
-  // Chromium for users without Chrome installed; storageState handoff is
-  // unreliable across browser binaries for some SSO flows. When stealth is
-  // enabled, launchBrowser routes to CloakBrowser's stealth binary instead.
-  async function launchChrome(): Promise<Browser> {
-    return launchBrowser(stealth, { headless, channel: 'chrome' }).catch(async (err) => {
-      logger.warn('login.chrome.fallback', {
-        agentId,
-        reason: err instanceof Error ? err.message : String(err),
-        hint: stealth
-          ? 'Run `bun add cloakbrowser` and check that CloakBrowser is properly installed'
-          : 'Run `bunx playwright install chrome` for best Auth0/SSO compatibility',
-      });
-      return launchBrowser(stealth, { headless });
-    });
-  }
-
   // ── auth.type === 'none' ──────────────────────────────────────────────────
   if (auth.type === 'none') {
     logger.info('login.none.launching', { agentId });
-    // No login needed — use bundled chromium directly. Google Chrome stable
-    // (channel: 'chrome') has singleton process conflicts on some platforms
-    // (WSL2) when the previous browser instance hasn't fully cleaned up. The
-    // channel: 'chrome' path is only needed for SSO/Auth0 storage-state
-    // compatibility, which is irrelevant with auth.type=none.
     const browser = await launchBrowser(stealth, { headless });
     logger.info('login.none.launched', { agentId });
     const context = auth.storage_state_path
@@ -232,7 +217,7 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
   if (authStateExists) {
     logger.info('login.storageState.use', { agentId, authStatePath });
-    const browser = await launchChrome();
+    const browser = await launchBrowser(stealth, { headless });
     try {
       const context = await browser.newContext({ storageState: authStatePath });
       // Match the post-login allowlist behaviour the form-fill path sets up.
@@ -275,7 +260,7 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
 
   logger.info('login.start', { agentId, loginUrl, via: 'form-fill-fallback' });
 
-  const browser = await launchChrome();
+  const browser = await launchBrowser(stealth, { headless });
   try {
     const context = await browser.newContext();
     // Network allowlist enforced for the credential-fill phase only — without

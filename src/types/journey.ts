@@ -9,7 +9,10 @@ export type TerminationReason =
   | 'signal'
   | 'max-turns'
   /** SDK-mode loop ended gracefully (SDK exhausted turns or got end_turn). */
-  | 'sdk-end';
+  | 'sdk-end'
+  /** Terminated early by the rebalancer — unproductive agent whose budget
+   *  was redistributed to higher-performing agents. */
+  | 'rebalanced';
 
 /**
  * Token usage for a journey.

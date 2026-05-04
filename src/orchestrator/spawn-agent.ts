@@ -98,6 +98,10 @@ export interface SpawnAgentInput {
   /** Site-shape tag (ecommerce / admin-crud / content / mixed / unknown).
    *  Rendered with sitePlaybookText. */
   siteShape?: string;
+  /** Live journey map shared with the rebalancer. When provided, the journey
+   *  is registered immediately on creation so the rebalancer can read it
+   *  while the agent is still running. */
+  journeyMap?: Map<string, Journey>;
 }
 
 export interface SpawnAgentResult {
@@ -153,6 +157,8 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     costUsd: 0,
     terminationReason: undefined,
   };
+
+  input.journeyMap?.set(agent.id, journey);
 
   // 2. Acquire an authenticated tab. Multiple agents in the same credential
   // group share a single browser process — saves the 5-8s login on every

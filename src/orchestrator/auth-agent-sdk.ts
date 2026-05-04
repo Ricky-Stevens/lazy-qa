@@ -198,6 +198,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
         // the user's global CLAUDE.md / settings.json from the system prompt.
         tools: [],
         settingSources: [],
+        permissionMode: 'dontAsk',
         mcpServers: { [AUTH_SERVER_NAME]: authServer },
         allowedTools: authAllowedTools,
         abortController: controller,

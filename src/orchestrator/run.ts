@@ -11,9 +11,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { acquireSession } from '../auth/session-pool.ts';
-import { loadConfig, resolveApiKey } from '../config/load.ts';
+import { loadConfig, resolveApiKey, resolveTargetCredentials } from '../config/load.ts';
 import { crawlSite } from '../crawler/crawl.ts';
-import { extractLinks } from '../crawler/extract-links.ts';
 import { SiteMapImpl } from '../crawler/sitemap.ts';
 import type { SiteMap } from '../crawler/types.ts';
 import { type PlaybookOutcomeRecord, writeCoverageReport } from '../findings/coverage.ts';
@@ -39,7 +38,8 @@ import { runAuthAgent } from './auth-agent.ts';
 import { EventWriter, formatEventLine } from './events.ts';
 import { FindingCache } from './finding-cache.ts';
 import { resolveMemoryPath } from './memory.ts';
-import { resolveAgents } from './resolve.ts';
+import { startRebalancer } from './rebalancer.ts';
+import { resolveAgents, resolveAutoAgents } from './resolve.ts';
 import { SharedKnowledge } from './shared-knowledge.ts';
 import { generateSitePlaybook, type SitePlaybookResult } from './site-playbook.ts';
 import { spawnAgent } from './spawn-agent.ts';
@@ -59,12 +59,6 @@ export interface RunResult {
   totalCostUsd: number;
   siteMap: SiteMap;
 }
-
-/** Crawler defaults. Mirrors spec §7.1 — the user can override via plugin
- *  configuration once `regress.config.ts` lands. */
-const CRAWL_MAX_DEPTH = 2;
-const CRAWL_MAX_ROUTES = 60;
-const CRAWL_MAX_WALL_CLOCK_MS = 30_000;
 
 export async function runScan(opts: RunOptions): Promise<RunResult> {
   // 1. Config + safety guards. Order matters: trusted-hosts first, then
@@ -90,7 +84,12 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   // Load the skills bundle once here — both resolveAgents (personas) and
   // spawnAgent (playbook tools) consume it.
   const skillsBundle = await loadSkills();
-  const agents = await resolveAgents(cfg, skillsBundle);
+  const isAutoMode = cfg.agents === 'auto';
+  // In manual mode, resolve agents up front. In auto mode, agents are resolved
+  // after crawl + site-playbook (the LLM recommends which personas to spawn).
+  let agents: Awaited<ReturnType<typeof resolveAgents>> = isAutoMode
+    ? []
+    : await resolveAgents(cfg, skillsBundle);
 
   // 3. Run ID + output directory.
   const runId = randomUUID();
@@ -140,7 +139,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     }
 
     // 6. Early pre-run manifest stub — useful when the run crashes before
-    // completing.
+    // completing. In auto mode, agentIds is empty until site-playbook resolves.
     await writeRunManifest(runDir, {
       runId,
       startedAt: new Date().toISOString(),
@@ -156,16 +155,15 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       runId,
       runDir,
       targetUrl: cfg.target.url,
-      agentCount: agents.length,
+      agentCount: isAutoMode ? 'auto' : agents.length,
       auth: backend.kind === 'sdk' ? 'claude-subscription' : 'anthropic-api-key',
       version: 'v2',
     });
 
-    // Emit run.start event — before any agents or crawl so it's always first.
     await events.write({
       type: 'run.start',
       targetUrl: cfg.target.url,
-      agentIds: agents.map((a) => a.id),
+      agentIds: isAutoMode ? ['auto'] : agents.map((a) => a.id),
     });
 
     // 7. Shared abort controller — SIGINT/SIGTERM aborts every agent + the
@@ -181,8 +179,13 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     process.once('SIGINT', () => handleSignal('SIGINT'));
     process.once('SIGTERM', () => handleSignal('SIGTERM'));
 
-    const firstAgent = agents[0];
-    if (!firstAgent) {
+    // In auto mode, credentials come from target.auth.credentials.
+    // In manual mode, use the first agent's credentials.
+    const runCredentials = isAutoMode
+      ? resolveTargetCredentials(cfg)
+      : (agents[0]?.credentials ?? resolveTargetCredentials(cfg));
+
+    if (!isAutoMode && agents.length === 0) {
       throw new Error('runScan: no agents resolved from config');
     }
 
@@ -192,15 +195,14 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // storageState is written to runs/<runId>/auth-state.json; the crawler
     // and every agent session below loads it and inherits the auth.
     let sessionInfo: { username: string; role?: string } | undefined;
-    if (cfg.target.auth.type === 'form' && firstAgent.credentials) {
+    if (cfg.target.auth.type === 'form' && runCredentials) {
       const authStatePath = path.join(runDir, 'auth-state.json');
       const authResult = await runAuthAgent({
         targetUrl: cfg.target.url,
         loginUrl: cfg.target.auth.login_url,
-        credentials: firstAgent.credentials,
+        credentials: runCredentials,
         allowedHosts: cfg.target.allowed_hosts,
         backend,
-        // Haiku is plenty for login-form filling and is the cheap path.
         model: 'claude-haiku-4-5-20251001',
         storageStatePath: authStatePath,
         logger: logger.child({ phase: 'auth-agent' }),
@@ -209,9 +211,6 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         abortSignal: runAbortController.signal,
       });
       if (!authResult.ok) {
-        // Non-fatal: log and continue. Agents will still try to log in via
-        // their own session-pool path (which falls back to selector form-fill
-        // if auth-state.json is absent).
         logger.warn('auth-agent.unsuccessful', {
           detail: authResult.detail,
           turns: authResult.turns,
@@ -222,58 +221,38 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       }
     }
 
-    // 8. Pre-run crawl. Open a temporary tab on the shared session — first
-    // call here triggers login (or loads auth-state.json), every subsequent
-    // agent's acquireSession() shares the same authed context. Persist the
-    // sitemap to disk before spawning agents so the run is debuggable from
-    // the moment crawling finishes.
+    // 8. Pre-run crawl. Crawlee launches its own browser and handles
+    // concurrency, link discovery, and SPA navigation natively. Auth is
+    // inherited via the storageState file saved by the auth-agent.
 
     const crawlerLogger = logger.child({ phase: 'crawl' });
     let siteMap: SiteMapImpl;
     let crawledMap: SiteMap;
     const crawlStartedAt = Date.now();
-    let crawlerSession: Awaited<ReturnType<typeof acquireSession>> | null = null;
+    const authStatePath = path.join(runDir, 'auth-state.json');
+
     try {
-      crawlerSession = await acquireSession({
-        targetUrl: cfg.target.url,
-        auth: cfg.target.auth,
+      crawledMap = await crawlSite({
+        rootUrl: cfg.target.url,
+        maxRoutes: cfg.crawler.max_routes,
+        maxWallClockMs: cfg.crawler.max_wall_clock_s * 1_000,
         allowedHosts: cfg.target.allowed_hosts,
-        credentials: firstAgent.credentials,
-        runDir,
-        agentId: 'crawler',
-        logger: crawlerLogger,
-        stealth: cfg.target.stealth,
-      });
-      crawledMap = await crawlSite(crawlerSession.page, {
-        maxDepth: CRAWL_MAX_DEPTH,
-        maxRoutes: CRAWL_MAX_ROUTES,
-        maxWallClockMs: CRAWL_MAX_WALL_CLOCK_MS,
-        allowedHosts: cfg.target.allowed_hosts,
-        linkExtractor: extractLinks,
+        storageStatePath: cfg.target.auth.type === 'form' ? authStatePath : undefined,
         logger: crawlerLogger,
         parallelism: cfg.crawler.parallelism,
+        stealth: cfg.target.stealth,
         events,
       });
     } catch (err) {
       crawlerLogger.error('crawl.failed', {
         error: err instanceof Error ? err.message : String(err),
       });
-      // Build an empty sitemap so agents still run; coverage will show 0
-      // crawler-discovered routes, which is itself a useful signal.
       crawledMap = {
         startedAt: new Date(crawlStartedAt).toISOString(),
         rootUrl: cfg.target.url,
         routes: {},
         pageModels: {},
       };
-    } finally {
-      if (crawlerSession) {
-        await crawlerSession.release().catch((closeErr) => {
-          crawlerLogger.warn('crawl.session.release.failed', {
-            error: closeErr instanceof Error ? closeErr.message : String(closeErr),
-          });
-        });
-      }
     }
 
     // Persist the crawler output before agents start. Agents will mutate the
@@ -306,27 +285,34 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // site-specific intent (what to do here), which fixes the regression
     // where personas navigated without ever completing a flow.
     //
+    // In auto mode, the site-playbook ALSO recommends which personas to spawn.
+    // After the playbook returns, resolveAutoAgents builds the agent roster.
+    //
     // Best-effort: failure is non-fatal. Agents fall back to persona-only
-    // prompts. The result is persisted to runs/<runId>/site-playbook.json
-    // so the operator can inspect what was generated, but the run does NOT
-    // wait for human approval — it proceeds immediately.
+    // prompts (manual mode) or default roster (auto mode).
     let sitePlaybook: SitePlaybookResult | null = null;
     try {
-      // Site-playbook is for HONEST personas only. The attacker has its own
-      // OWASP-driven methodology in its persona body and should be free to
-      // attack whatever it likes — not constrained to the visible site shape.
-      // Filtering here also saves Sonnet output tokens (no attacker brief
-      // generated that we'd then discard).
-      const personaBriefs = Array.from(
-        new Map(
-          agents
-            .filter((a) => !ATTACKER_PROFILES.has(a.profileName))
-            .map((a) => {
-              const persona = skillsBundle.personas.get(a.profileName);
-              return [a.profileName, persona?.description ?? a.profileName];
-            }),
-        ).entries(),
-      ).map(([name, description]) => ({ name, description }));
+      let personaBriefs: Array<{ name: string; description: string }>;
+
+      if (isAutoMode) {
+        // Auto mode: pass ALL personas so the LLM can recommend the best set.
+        personaBriefs = Array.from(skillsBundle.personas.values()).map((p) => ({
+          name: p.name,
+          description: p.description,
+        }));
+      } else {
+        // Manual mode: only brief honest (non-attacker) personas.
+        personaBriefs = Array.from(
+          new Map(
+            agents
+              .filter((a) => !ATTACKER_PROFILES.has(a.profileName))
+              .map((a) => {
+                const persona = skillsBundle.personas.get(a.profileName);
+                return [a.profileName, persona?.description ?? a.profileName];
+              }),
+          ).entries(),
+        ).map(([name, description]) => ({ name, description }));
+      }
 
       sitePlaybook = await generateSitePlaybook({
         rootUrl: cfg.target.url,
@@ -336,6 +322,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         model: 'claude-sonnet-4-6',
         logger: logger.child({ phase: 'site-playbook' }),
         events,
+        autoMode: isAutoMode,
         abortSignal: runAbortController.signal,
       });
 
@@ -344,11 +331,42 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         JSON.stringify(sitePlaybook, null, 2),
         'utf8',
       );
+
+      // Auto mode: resolve agents from the LLM's roster recommendation.
+      if (isAutoMode && sitePlaybook.recommendedRoster?.length) {
+        agents = resolveAutoAgents(sitePlaybook.recommendedRoster, cfg, skillsBundle);
+        logger.info('auto-agents.resolved', {
+          count: agents.length,
+          roster: agents.map((a) => `${a.id}(${a.model}, $${a.budget.max_usd})`),
+        });
+      }
     } catch (err) {
-      // Non-fatal — log and continue without a playbook.
       logger.warn('site-playbook.crashed', {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Auto mode fallback: if site-playbook failed or returned no roster,
+    // spawn a default set: zero-cool + the first 4 honest personas.
+    if (isAutoMode && agents.length === 0) {
+      logger.warn('auto-agents.fallback', { reason: 'no roster from site-playbook' });
+      const defaultPersonas = ['zero-cool', 'house', 'leeroy-jenkins', 'the-magpie', 'caine'];
+      if (cfg.target.auth.type === 'form') {
+        defaultPersonas.unshift('bobby-tables');
+      }
+      const fallbackRoster = defaultPersonas
+        .filter((name) => skillsBundle.personas.has(name))
+        .map((persona) => ({ persona, priority: 2, reason: 'fallback default' }));
+      agents = resolveAutoAgents(fallbackRoster, cfg, skillsBundle);
+      logger.info('auto-agents.resolved', {
+        count: agents.length,
+        roster: agents.map((a) => `${a.id}(${a.model}, $${a.budget.max_usd})`),
+        fallback: true,
+      });
+    }
+
+    if (agents.length === 0) {
+      throw new Error('runScan: no agents resolved — check config or site-playbook output');
     }
 
     // 9. Resolve and initialise the per-target memory directory. Created once
@@ -397,6 +415,8 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     const supervisorEnabled = cfg.supervisor.enabled;
     const SPAWN_STAGGER_MS = 2_000;
     const explorerPromises: ReturnType<typeof spawnAgent>[] = [];
+    const liveJourneys = new Map<string, import('../types/journey.ts').Journey>();
+
     for (let i = 0; i < agents.length; i++) {
       const agent = agents[i];
       if (!agent) continue;
@@ -424,12 +444,59 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
           sitePlaybookText: sitePlaybook?.perPersona[agent.profileName],
           siteSummary: sitePlaybook?.siteSummary,
           siteShape: sitePlaybook?.siteShape,
+          journeyMap: liveJourneys,
         }),
       );
       if (i < agents.length - 1) {
         await new Promise((r) => setTimeout(r, SPAWN_STAGGER_MS));
       }
     }
+
+    // 10a. Adaptive agent pool manager — scores agent health every 45s,
+    // terminates unproductive agents, spawns replacement personas from the
+    // unused pool, and boosts productive agents' budgets.
+    const replacementPromises: ReturnType<typeof spawnAgent>[] = [];
+    const stopRebalancer = startRebalancer({
+      agents,
+      journeys: liveJourneys,
+      siteMap,
+      skillsBundle,
+      defaultModel: cfg.anthropic.default_model,
+      authType: cfg.target.auth.type,
+      credentials: runCredentials,
+      spawnReplacement: (newAgent) => {
+        replacementPromises.push(
+          spawnAgent({
+            runId,
+            runDir,
+            targetUrl: cfg.target.url,
+            allowedHosts: cfg.target.allowed_hosts,
+            auth: cfg.target.auth,
+            agent: newAgent,
+            backend,
+            siteMap,
+            logger,
+            abortSignal: runAbortController.signal,
+            stealth: cfg.target.stealth,
+            memoryEnabled,
+            memoryPath,
+            skillsBundle,
+            events,
+            selectorCache,
+            findingCache,
+            sharedKnowledge,
+            sessionInfo,
+            sitePlaybookText: sitePlaybook?.perPersona[newAgent.profileName],
+            siteSummary: sitePlaybook?.siteSummary,
+            siteShape: sitePlaybook?.siteShape,
+            journeyMap: liveJourneys,
+          }),
+        );
+      },
+      logger: logger.child({ phase: 'rebalancer' }),
+      events,
+      abortSignal: runAbortController.signal,
+    });
 
     const supervisorPromise = supervisorEnabled
       ? runSupervisor({
@@ -473,12 +540,21 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       Promise.allSettled(explorerPromises) as Promise<PromiseSettledResult<{ journey: Journey }>[]>,
       supervisorPromise,
     ]);
-    clearTimeout(outerDeadlineHandle);
 
-    // 10. Collect journeys; build placeholders for rejected agents so the
-    // manifest is always complete.
+    // Await any replacement agents spawned by the rebalancer.
+    let replacementResults: PromiseSettledResult<{ journey: Journey }>[] = [];
+    if (replacementPromises.length > 0) {
+      replacementResults = await Promise.allSettled(replacementPromises) as
+        PromiseSettledResult<{ journey: Journey }>[];
+    }
+
+    clearTimeout(outerDeadlineHandle);
+    stopRebalancer();
+
+    // 10. Collect journeys from original + replacement agents.
     const journeys: Journey[] = [];
-    for (const [i, result] of explorerResults.entries()) {
+    const allResults = [...explorerResults, ...replacementResults];
+    for (const [i, result] of allResults.entries()) {
       const agent = agents[i];
       if (!agent) continue;
       if (result.status === 'fulfilled') {
@@ -531,6 +607,12 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     await persistFindings(runDir, allFindings);
     await writeRunManifest(runDir, manifest);
     await writeSummaryMarkdown(runDir, journeys, allFindings);
+    // Write the final sitemap (includes agent-discovered routes).
+    await writeFile(
+      path.join(runDir, 'sitemap-final.json'),
+      JSON.stringify(siteMap.serialize(), null, 2),
+      'utf8',
+    );
 
     // 13. Coverage report. Reads playbook.outcome events from the run's
     // events.jsonl trace — every runPlaybook call emits one.

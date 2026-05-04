@@ -1087,10 +1087,9 @@ function computeTextHash(text: string): string {
 function deriveRoute(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
-    // Preserve SPA hash-routes — `#/login`, `#/search`, etc. — so each
-    // hash-routed page has its own sitemap identity.
     const isSpaHash = /^#!?\//.test(u.hash);
-    return `${u.origin}${u.pathname}${isSpaHash ? u.hash : ''}`;
+    if (isSpaHash) return `${u.origin}/${u.hash}`;
+    return `${u.origin}${u.pathname}`;
   } catch {
     return rawUrl;
   }

@@ -47,6 +47,7 @@ export class SdkLlmBackend implements LlmBackend {
           pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
           tools: [],
           settingSources: [],
+          permissionMode: 'dontAsk',
           abortController: timeoutCtrl,
           ...(typeof input.thinkingBudgetTokens === 'number' && input.thinkingBudgetTokens > 0
             ? { maxThinkingTokens: input.thinkingBudgetTokens }

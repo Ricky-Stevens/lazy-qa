@@ -7,10 +7,11 @@ import type { Budget } from '../config/types.ts';
 export interface ResolvedAgent {
   // Unique agent identifier
   id: string;
-  // Profile name (slug like "power-user", or "custom" if override)
+  // Profile name (slug like "power-user", "bobby-tables"). Matches the
+  // persona's SKILL.md name. Used to gate tool access (ATTACKER_PROFILES)
+  // and site-playbook exclusion.
   profileName: string;
-  // Resolved personality text (from profile or override_personality). The persona
-  // IS the goal — there is no separate workflow or task description.
+  // Resolved personality text from the persona's SKILL.md body.
   personality: string;
   // Model to use (e.g. "claude-sonnet-4-6")
   model: string;

@@ -94,3 +94,30 @@ export function resolveAgentCredentials(
 
   return { username, password };
 }
+
+/**
+ * Resolve credentials from target.auth.credentials (used by auto mode and
+ * as fallback for manual agents). Returns null when no credentials configured.
+ */
+export function resolveTargetCredentials(
+  cfg: Config,
+): { username: string; password: string } | null {
+  const creds = cfg.target.auth.credentials;
+  if (!creds) return null;
+
+  const username = process.env[creds.username_env];
+  if (!username || username.trim() === '') {
+    throw new Error(
+      `Missing env var: ${creds.username_env} (referenced by target.auth.credentials.username_env)`,
+    );
+  }
+
+  const password = process.env[creds.password_env];
+  if (!password || password.trim() === '') {
+    throw new Error(
+      `Missing env var: ${creds.password_env} (referenced by target.auth.credentials.password_env)`,
+    );
+  }
+
+  return { username, password };
+}

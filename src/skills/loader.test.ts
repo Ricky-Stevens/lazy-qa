@@ -15,9 +15,9 @@ import { loadSkills } from './loader.ts';
 const SKILLS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../skills');
 
 describe('loadSkills', () => {
-  it('discovers exactly 6 personas', async () => {
+  it('discovers exactly 7 personas', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    expect(bundle.personas.size).toBe(6);
+    expect(bundle.personas.size).toBe(7);
   });
 
   it('discovers exactly 14 playbooks', async () => {
@@ -25,7 +25,7 @@ describe('loadSkills', () => {
     expect(bundle.playbooks.size).toBe(14);
   });
 
-  it('persona names match the 6 expected slugs', async () => {
+  it('persona names match the 7 expected slugs', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
     const names = Array.from(bundle.personas.keys()).sort();
     expect(names).toEqual([
@@ -35,6 +35,7 @@ describe('loadSkills', () => {
       'leeroy-jenkins',
       'the-magpie',
       'the-spanner',
+      'zero-cool',
     ]);
   });
 

@@ -102,9 +102,6 @@ export const AgentConfigSchema = z.object({
   planner_model: ModelSchema.optional(),
   // Optional: partial budget override
   budget: BudgetSchema.partial().optional(),
-  // Optional: override profile's personality text inline. The persona IS the
-  // goal — there is no separate workflow/task to override.
-  override_personality: z.string().optional(),
 });
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 
@@ -137,6 +134,9 @@ export const AuthConfigSchema = z
     wait_for_selector: z.string().optional(),
     // Pre-built storage state file (only used with type='none' — e.g. for SSO portals)
     storage_state_path: z.string().optional(),
+    // Shared credentials for all agents. Used by agents: 'auto' mode and as
+    // default for manual agents that omit per-agent credentials.
+    credentials: CredentialsSchema.optional(),
   })
   .default({
     type: 'form',
@@ -304,17 +304,71 @@ export const SelectorCacheConfigSchema = z
   .default({ enabled: true });
 export type SelectorCacheConfig = z.infer<typeof SelectorCacheConfigSchema>;
 
+// Auto agent selection tuning. Only used when agents: 'auto'.
+export const AgentSelectionSchema = z
+  .object({
+    /** Model for attacker personas (complex reasoning). Default: claude-sonnet-4-6. */
+    attacker_model: ModelSchema.default('claude-sonnet-4-6'),
+    /** Model for QA personas (mechanical playbook execution). Default: anthropic.default_model. */
+    qa_model: ModelSchema.optional(),
+    /** Maximum agents to spawn. Default 7. */
+    max_agents: z.number().int().min(1).max(10).default(7),
+    /** Thinking token budget for attacker agents. */
+    attacker_thinking_tokens: z
+      .number()
+      .int()
+      .min(0)
+      .max(20000)
+      .refine((n) => n === 0 || n >= 1024, {
+        message: 'Must be 0 (disabled) or at least 1024.',
+      })
+      .default(2000),
+    /** Thinking token budget for QA agents. */
+    qa_thinking_tokens: z
+      .number()
+      .int()
+      .min(0)
+      .max(20000)
+      .refine((n) => n === 0 || n >= 1024, {
+        message: 'Must be 0 (disabled) or at least 1024.',
+      })
+      .default(1024),
+  })
+  .default({
+    attacker_model: 'claude-sonnet-4-6',
+    max_agents: 7,
+    attacker_thinking_tokens: 2000,
+    qa_thinking_tokens: 1024,
+  });
+export type AgentSelection = z.infer<typeof AgentSelectionSchema>;
+
 export const CrawlerConfigSchema = z
   .object({
     /** Number of concurrent tabs the pre-run crawler may open. Default 3.
      *  Tests should leave at default 1 if they rely on `page.route()` mocks
      *  attached to the input page (those don't apply to new context tabs). */
     parallelism: z.number().int().min(1).max(8).default(3),
+    /** Maximum BFS depth from the root URL. Higher = more routes discovered
+     *  but longer crawl. SPAs with deep nav (account → settings → subpage)
+     *  benefit from 4+. Default 2. */
+    max_depth: z.number().int().min(1).max(10).default(2),
+    /** Maximum distinct routes to visit. Default 60. */
+    max_routes: z.number().int().min(1).max(500).default(60),
+    /** Wall-clock timeout in seconds. Default 60. Scale up for deep crawls
+     *  on large sites. */
+    max_wall_clock_s: z.number().int().min(10).max(300).default(60),
   })
-  .default({ parallelism: 3 });
+  .default({ parallelism: 3, max_depth: 2, max_routes: 60, max_wall_clock_s: 60 });
 export type CrawlerConfig = z.infer<typeof CrawlerConfigSchema>;
 
 // Top-level configuration schema
+const ManualAgentsSchema = z
+  .array(AgentConfigSchema)
+  .min(1)
+  .refine((arr) => new Set(arr.map((a) => a.id)).size === arr.length, {
+    message: 'agent ids must be unique',
+  });
+
 export const ConfigSchema = z
   .object({
     target: TargetConfigSchema,
@@ -325,19 +379,32 @@ export const ConfigSchema = z
     memory: MemoryConfigSchema,
     selector_cache: SelectorCacheConfigSchema,
     crawler: CrawlerConfigSchema,
-    agents: z
-      .array(AgentConfigSchema)
-      .min(1)
-      .refine((arr) => new Set(arr.map((a) => a.id)).size === arr.length, {
-        message: 'agent ids must be unique',
-      }),
+    // 'auto' = harness selects agents based on crawl results.
+    // Array = manual agent configuration (backward-compatible).
+    agents: z.union([z.literal('auto'), ManualAgentsSchema]),
+    // Tuning for auto mode. Ignored when agents is an array.
+    agent_selection: AgentSelectionSchema,
   })
   .refine(
-    (cfg) =>
-      cfg.target.auth.type !== 'form' || cfg.agents.every((a) => a.credentials !== undefined),
+    (cfg) => {
+      if (cfg.agents === 'auto') {
+        // In auto mode, credentials must be on target.auth when auth.type=form.
+        return cfg.target.auth.type !== 'form' || cfg.target.auth.credentials !== undefined;
+      }
+      // Manual mode: every agent must have credentials when auth.type=form,
+      // either per-agent or inherited from target.auth.credentials.
+      return (
+        cfg.target.auth.type !== 'form' ||
+        cfg.agents.every(
+          (a) => a.credentials !== undefined || cfg.target.auth.credentials !== undefined,
+        )
+      );
+    },
     {
       message:
-        "target.auth.type is 'form' — every agent must declare credentials (username_env + password_env).",
+        "target.auth.type is 'form' — credentials are required. " +
+        'In auto mode, set target.auth.credentials. ' +
+        'In manual mode, set per-agent credentials or target.auth.credentials as fallback.',
     },
   );
 export type Config = z.infer<typeof ConfigSchema>;

@@ -20,7 +20,7 @@
 import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
-import type { PlaybookOutcome } from '../playbooks/outcome.ts';
+import type { PlaybookOutcome, PlaybookStep } from '../playbooks/outcome.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
 import type { EventWriter } from './events.ts';
@@ -436,28 +436,130 @@ export function renderAffordanceHints(siteMap: SiteMapAccessor): string[] {
 }
 
 /** Try to parse a playbook outcome from a tool-result text. Returns null if
- *  the text doesn't look like a serialised PlaybookOutcome. */
+ *  the text doesn't look like a serialised PlaybookOutcome.
+ *
+ *  Supports two formats:
+ *  1. JSON — a `{...}` blob anywhere in the text with `playbookName`, `status`,
+ *     `summary` keys.
+ *  2. YAML-like key: value lines emitted by `serializeOutcome()` in
+ *     browser-server.ts — `playbook:`, `status:`, `summary:`, optionally
+ *     `evidence:`, `durationMs:`, `steps:`, etc.
+ */
 export function tryParsePlaybookOutcome(text: string): PlaybookOutcome | null {
   // Empty or trivially short results aren't outcomes.
   if (!text || text.length < 20) return null;
-  // Find the first JSON object in the text — playbook handlers may prefix
-  // a one-line summary line then a JSON blob, or be pure JSON.
+
+  // --- Attempt 1: JSON blob ---
   const jsonStart = text.indexOf('{');
-  if (jsonStart < 0) return null;
-  const jsonCandidate = text.slice(jsonStart);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonCandidate);
-  } catch {
-    return null;
+  if (jsonStart >= 0) {
+    const jsonCandidate = text.slice(jsonStart);
+    try {
+      const parsed: unknown = JSON.parse(jsonCandidate);
+      if (parsed && typeof parsed === 'object') {
+        const o = parsed as Record<string, unknown>;
+        if (
+          typeof o.playbookName === 'string' &&
+          typeof o.status === 'string' &&
+          (o.status === 'ok' || o.status === 'failed' || o.status === 'suspicious') &&
+          typeof o.summary === 'string'
+        ) {
+          return o as unknown as PlaybookOutcome;
+        }
+      }
+    } catch {
+      // Not valid JSON — fall through to YAML-like parsing.
+    }
   }
-  if (!parsed || typeof parsed !== 'object') return null;
-  const o = parsed as Record<string, unknown>;
-  if (typeof o.playbookName !== 'string') return null;
-  if (typeof o.status !== 'string') return null;
-  if (o.status !== 'ok' && o.status !== 'failed' && o.status !== 'suspicious') return null;
-  if (typeof o.summary !== 'string') return null;
-  return o as unknown as PlaybookOutcome;
+
+  // --- Attempt 2: YAML-like key: value lines (serializeOutcome format) ---
+  return tryParseYamlLikeOutcome(text);
+}
+
+const VALID_STATUSES = new Set(['ok', 'failed', 'suspicious']);
+
+/** Parse the compact `key: value` text format emitted by `serializeOutcome`.
+ *  Returns null if the required fields (`playbook`, `status`, `summary`) are
+ *  missing or invalid. */
+function tryParseYamlLikeOutcome(text: string): PlaybookOutcome | null {
+  const lines = text.split('\n');
+
+  let playbookName: string | undefined;
+  let status: 'ok' | 'failed' | 'suspicious' | undefined;
+  let summary: string | undefined;
+  let evidence: Record<string, unknown> = {};
+  let durationMs = 0;
+  const steps: PlaybookStep[] = [];
+  let inSteps = false;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    // Sub-step lines when inside the `steps:` block.
+    if (inSteps) {
+      // Step lines look like:  - [ok] Label — detail
+      const stepMatch = line.match(/^-\s+\[(ok|FAIL)]\s+(.+)$/);
+      if (stepMatch) {
+        const ok = stepMatch[1] === 'ok';
+        const rest = stepMatch[2]!;
+        const dashIdx = rest.indexOf(' — ');
+        if (dashIdx >= 0) {
+          steps.push({ label: rest.slice(0, dashIdx), ok, detail: rest.slice(dashIdx + 3) });
+        } else {
+          steps.push({ label: rest, ok });
+        }
+        continue;
+      }
+      // Any non-step line exits the steps block.
+      inSteps = false;
+    }
+
+    // Top-level key: value
+    const colonIdx = line.indexOf(':');
+    if (colonIdx < 0) continue;
+    const key = line.slice(0, colonIdx).trim();
+    const value = line.slice(colonIdx + 1).trim();
+
+    switch (key) {
+      case 'playbook':
+        playbookName = value;
+        break;
+      case 'status':
+        if (VALID_STATUSES.has(value)) status = value as typeof status;
+        break;
+      case 'summary':
+        summary = value;
+        break;
+      case 'evidence':
+        try {
+          evidence = JSON.parse(value) as Record<string, unknown>;
+        } catch {
+          // evidence value isn't valid JSON — store raw string under a key.
+          evidence = { raw: value };
+        }
+        break;
+      case 'durationMs':
+        durationMs = Number(value) || 0;
+        break;
+      case 'steps':
+        inSteps = true;
+        break;
+      // network anomalies / console errors / screenshot — informational only,
+      // not needed for the PlaybookOutcome object consumed downstream.
+    }
+  }
+
+  if (!playbookName || !status || !summary) return null;
+
+  return {
+    playbookName,
+    status,
+    summary,
+    evidence,
+    signals: { networkAnomalies: [], consoleErrors: [] },
+    steps,
+    durationMs,
+  };
 }
 
 /** Extract a target id from the playbook tool input. Most playbooks pass it

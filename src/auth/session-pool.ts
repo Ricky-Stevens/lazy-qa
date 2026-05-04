@@ -56,6 +56,17 @@ function sessionKey(input: {
   return input.isolateSession && input.agentId ? `${base}::${input.agentId}` : base;
 }
 
+/** Log-safe version of the session key with credentials redacted. */
+function redactedKey(key: string): string {
+  // Key format: url::authType::username::password[::agentId]
+  // Redact the password segment (4th ::‑delimited field).
+  const parts = key.split('::');
+  if (parts.length >= 4 && parts[3] !== '__none__') {
+    parts[3] = '***';
+  }
+  return parts.join('::');
+}
+
 export interface AcquireInput {
   targetUrl: string;
   auth: AuthConfig;
@@ -127,7 +138,7 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
         });
         result.browser.on('disconnected', () => {
           input.logger.error('browser.disconnected', {
-            key,
+            key: redactedKey(key),
             refCount: 'unknown',
             stack: new Error('browser disconnected').stack,
           });
@@ -184,7 +195,7 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
         sessions.delete(key);
         sessionMutexes.delete(key);
         await session.browser.close().catch(() => undefined);
-        input.logger.info('session.closed', { key });
+        input.logger.info('session.closed', { key: redactedKey(key) });
       }
     },
   };

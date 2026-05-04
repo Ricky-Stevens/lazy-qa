@@ -123,7 +123,8 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         if (typeof formId === 'string' && formId.length > 0) fuzzedFormIds.add(formId);
       }
 
-      const TOOL_TIMEOUT_MS = 60_000;
+      const isPlaybook = eventName.startsWith(PLAYBOOK_TOOL_PREFIX);
+      const TOOL_TIMEOUT_MS = isPlaybook ? 180_000 : 60_000;
       let result: { content: { type: 'text'; text: string }[] };
       try {
         result = await Promise.race([
@@ -260,17 +261,27 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   // the consumer signals an assistant message arrived (or the loop terminated).
   const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
   const TURN_GATE_TIMEOUT_MS = 120_000;
+  const MAX_CONSECUTIVE_TIMEOUTS = 2;
   let turnGateResolve: (() => void) | null = null;
   let turnGatePromise: Promise<void> = Promise.resolve();
+  let consecutiveTimeouts = 0;
+  let turnsAtLastGate = 0;
   function armTurnGate(): void {
+    turnsAtLastGate = journey.turns;
     turnGatePromise = new Promise<void>((r) => {
       turnGateResolve = r;
-      // Safety: if the consumer never releases (subprocess died, async
-      // iterator hung), auto-release after TURN_GATE_TIMEOUT_MS so the
-      // generator can re-evaluate its loop conditions and exit.
       setTimeout(() => {
         if (turnGateResolve === r) {
-          logger.warn('loop-sdk.turnGate.timeout', { agentId: agent.id });
+          if (journey.turns === turnsAtLastGate) {
+            consecutiveTimeouts += 1;
+          } else {
+            consecutiveTimeouts = 0;
+          }
+          logger.warn('loop-sdk.turnGate.timeout', {
+            agentId: agent.id,
+            consecutiveTimeouts,
+            turnsCompleted: journey.turns,
+          });
           r();
           turnGateResolve = null;
         }
@@ -279,6 +290,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   }
   function releaseTurnGate(): void {
     if (turnGateResolve) {
+      consecutiveTimeouts = 0;
       const r = turnGateResolve;
       turnGateResolve = null;
       r();
@@ -292,8 +304,10 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     while (
       journey.turns < agent.budget.max_turns &&
       !abortSignal.aborted &&
-      journey.terminationReason !== 'end_session' &&
-      journey.costUsd < agent.budget.max_usd
+      !journey.terminationReason &&
+      journey.costUsd < agent.budget.max_usd &&
+      consecutiveTimeouts < MAX_CONSECUTIVE_TIMEOUTS &&
+      Date.now() - new Date(journey.startedAt).getTime() < agent.budget.max_minutes * 60_000
     ) {
       const nudge = consumeNudge(agent.id);
       if (nudge) {
@@ -378,6 +392,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         // load user/project CLAUDE.md into the agent's system prompt.
         tools: [],
         settingSources: [],
+        permissionMode: 'dontAsk',
         mcpServers: {
           [HARNESS_SERVER_NAME]: harnessServer,
           [BROWSER_SERVER_NAME]: browserServer,
@@ -500,12 +515,15 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     releaseTurnGate();
   }
 
-  // Belt-and-braces — if no termination reason was set (e.g. the loop just
-  // exhausted without emitting a 'result' message), pick the most accurate
-  // available reason. Prefer concrete budget reasons over the generic
-  // 'sdk-end' so telemetry tells the truth.
   if (!journey.terminationReason) {
-    if (controller.signal.aborted || abortSignal.aborted) {
+    if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+      journey.terminationReason = 'error';
+      logger.error('loop-sdk.subprocess-unresponsive', {
+        agentId: agent.id,
+        consecutiveTimeouts,
+        turnsCompleted: journey.turns,
+      });
+    } else if (controller.signal.aborted || abortSignal.aborted) {
       journey.terminationReason = 'signal';
     } else if (journey.turns >= agent.budget.max_turns) {
       journey.terminationReason = 'max-turns';

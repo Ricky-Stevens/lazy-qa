@@ -409,6 +409,7 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
         // and the user's global CLAUDE.md / settings.json from the prompt.
         tools: [],
         settingSources: [],
+        permissionMode: 'dontAsk',
         mcpServers: { [SUPERVISOR_SERVER_NAME]: supervisorServer },
         allowedTools: supervisorAllowedTools,
         abortController: controller,

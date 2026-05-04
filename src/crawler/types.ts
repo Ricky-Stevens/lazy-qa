@@ -45,25 +45,25 @@ export interface SiteMap {
 }
 
 export interface CrawlOptions {
-  /** BFS depth from rootUrl. Default 2. */
-  maxDepth: number;
+  /** Root URL to start crawling from. */
+  rootUrl: string;
   /** Hard cap on routes visited during pre-run crawl. Default 60. */
   maxRoutes: number;
-  /** Max wall-clock for pre-run crawl, ms. Default 30_000. */
+  /** Max wall-clock for pre-run crawl, ms. Default 60_000. */
   maxWallClockMs: number;
   /** Allowed-host filter from config. */
   allowedHosts: string[];
-  /** Optional custom link extractor. Defaults to built-in same-origin walker. */
+  /** Path to auth-state.json for authenticated crawling. */
+  storageStatePath?: string;
+  /** Optional custom link extractor. Defaults to Crawlee's built-in. */
   linkExtractor?: (page: Page) => Promise<string[]>;
   logger: Logger;
   /** Event writer for this run. Optional — emits crawl.* events. */
   events?: EventWriter;
-  /** Number of concurrent tabs the crawler may open from the input page's
-   * BrowserContext. 1 = serial (uses the input page, preserves any
-   * `page.route()` mocks attached by tests). >1 = parallel pool (opens new
-   * tabs which inherit `context.route()` handlers but not page-level ones).
-   * Default 1. */
+  /** Number of concurrent browser tabs. Default 3. */
   parallelism?: number;
+  /** Use CloakBrowser stealth mode. */
+  stealth?: boolean;
 }
 
 /**

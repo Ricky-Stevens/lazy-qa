@@ -77,7 +77,7 @@ export interface RawToolDef {
 /** Profiles considered "attacker-flavoured". Tools marked `attackerOnly` are
  *  only exposed to agents whose profileName matches. Listed here (not on the
  *  tool definitions themselves) so we can add new attacker profiles centrally. */
-export const ATTACKER_PROFILES: ReadonlySet<string> = new Set(['bobby-tables']);
+export const ATTACKER_PROFILES: ReadonlySet<string> = new Set(['bobby-tables', 'zero-cool']);
 
 export interface BrowserServerInput {
   /** Returns the page the agent should drive. Closure-style so caller can
