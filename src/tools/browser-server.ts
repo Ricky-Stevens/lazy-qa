@@ -256,6 +256,21 @@ function claimMatchesUser(claim: Record<string, unknown>, username: string): boo
   return walk(claim);
 }
 
+/** Resolve a possibly-relative URL against the current page's origin.
+ *  Agents frequently emit bare paths ("/campaigns") from navLink snapshots. */
+function resolveAgentUrl(raw: string, getPage: () => Page): string {
+  try {
+    new URL(raw);
+    return raw;
+  } catch {
+    try {
+      return new URL(raw, getPage().url()).toString();
+    } catch {
+      return raw;
+    }
+  }
+}
+
 /** Strip query/fragment so /clients?page=2 and /clients/123 count as the same area. */
 function routeOf(rawUrl: string): string {
   try {
@@ -709,8 +724,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     defTool(
       'navigate',
       'Navigate to a URL. Returns a status line. Records anomalies (4xx/5xx/console) seen since the last action.',
-      { url: z.string().url() },
-      async ({ url }) => {
+      { url: z.string().min(1) },
+      async ({ url: rawUrl }) => {
+        const url = resolveAgentUrl(rawUrl, getPage);
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           let hostname = url;
           try {
@@ -1209,12 +1225,13 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       'fetch_resource',
       "Plain HTTP GET (or other method) of a URL on the same origin or any allowed host. Cookie-less by default — does NOT use the agent's session cookies. Returns the response status, headers, and body (truncated to 4 KB). Use this for: reading exposed paths (.git/HEAD, .env, swagger.json), reading JSON API responses without rendering them, fetching response bodies that the SPA shell would otherwise hide. For session-aware requests use `request_with_session` instead.",
       {
-        url: z.string().url(),
+        url: z.string().min(1),
         method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']).optional(),
         headers: z.record(z.string(), z.string()).optional(),
         body: z.string().optional(),
       },
-      async ({ url, method, headers, body }) => {
+      async ({ url: rawUrl, method, headers, body }) => {
+        const url = resolveAgentUrl(rawUrl, getPage);
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`fetch_resource refused: ${url} not in allowed_hosts.`);
         }
@@ -1256,12 +1273,13 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       'request_with_session',
       "Same as fetch_resource but uses the current browser context's cookies — i.e. requests are made AS the logged-in user. Use after a login (yours, recon's, or a teammate's) when you want to hit an authenticated API endpoint without rendering it as a page. Body is truncated to 4 KB.",
       {
-        url: z.string().url(),
+        url: z.string().min(1),
         method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']).optional(),
         headers: z.record(z.string(), z.string()).optional(),
         body: z.string().optional(),
       },
-      async ({ url, method, headers, body }) => {
+      async ({ url: rawUrl, method, headers, body }) => {
+        const url = resolveAgentUrl(rawUrl, getPage);
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`request_with_session refused: ${url} not in allowed_hosts.`);
         }
@@ -1432,8 +1450,13 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         // On a cache hit, attempt to click the cached locator with a short
         // timeout. Success: return early and skip the multi-strategy probe.
         // Failure (stale): invalidate the route and fall through.
-        const urlForCache = new URL(page.url());
-        const cachedLocator = selectorCache?.get(urlForCache.pathname, hint, role);
+        let cachePathname: string | null = null;
+        try {
+          cachePathname = new URL(page.url()).pathname;
+        } catch {
+          // page URL not parseable — skip cache
+        }
+        const cachedLocator = cachePathname ? selectorCache?.get(cachePathname, hint, role) : undefined;
         if (cachedLocator) {
           try {
             await page.locator(cachedLocator).first().click({ timeout: 2_000 });
@@ -1443,7 +1466,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             );
           } catch {
             // Cached locator is stale — remove route entries and re-probe.
-            selectorCache?.invalidateRoute(urlForCache.pathname);
+            if (cachePathname) selectorCache?.invalidateRoute(cachePathname);
           }
         }
 
@@ -1473,7 +1496,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             }
             await loc.click({ timeout: 3_000 });
             // Write back to cache on successful probe resolution.
-            selectorCache?.set(urlForCache.pathname, hint, role, sel);
+            if (cachePathname) selectorCache?.set(cachePathname, hint, role, sel);
             speculate(page);
             return textResult(
               `find_and_click: matched "${hint}" via \`${sel}\` | URL: ${page.url()}`,

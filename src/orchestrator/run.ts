@@ -129,6 +129,22 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   // the try body control flow exits.
   let selectorCache: SelectorCache | undefined;
 
+  // Hoisted above try so finally can remove the listener even if the try
+  // body throws before the const would have been initialized.
+  const onUnhandledRejection = (err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/EBADF|bad file descriptor/i.test(msg)) {
+      logger.warn('run.ebadf.swallowed', { error: msg });
+      return;
+    }
+    if (/cannot be parsed as a URL/i.test(msg)) {
+      logger.debug('run.url-parse.swallowed', { error: msg });
+      return;
+    }
+    logger.error('run.unhandledRejection', { error: msg });
+  };
+  process.on('unhandledRejection', onUnhandledRejection);
+
   try {
     // 4. Best-effort `last` symlink so `runs/last` always points at the most
     // recent run for ad-hoc inspection.
@@ -181,20 +197,6 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     }
     process.once('SIGINT', () => handleSignal('SIGINT'));
     process.once('SIGTERM', () => handleSignal('SIGTERM'));
-
-    // SDK child processes can die mid-run leaving dead file descriptors.
-    // The SDK's internal pipe write throws EBADF asynchronously — without
-    // this handler Bun's default handler prints a noisy warning per event.
-    // Only swallow EBADF; log everything else and let the scan continue.
-    const onUnhandledRejection = (err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/EBADF|bad file descriptor/i.test(msg)) {
-        logger.warn('run.ebadf.swallowed', { error: msg });
-        return;
-      }
-      logger.error('run.unhandledRejection', { error: msg });
-    };
-    process.on('unhandledRejection', onUnhandledRejection);
 
     // In auto mode, credentials come from target.auth.credentials.
     // In manual mode, use the first agent's credentials.

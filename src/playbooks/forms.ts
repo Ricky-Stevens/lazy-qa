@@ -1159,7 +1159,13 @@ export const formPersistenceRoundtrip: Playbook<FormPersistenceRoundtripInput> =
     steps.push({ label: 'submit complete', ok: true, detail: `toast=${toastVisible}` });
 
     // Phase 2 — navigate away then back.
-    const away = input.awayUrl ?? new URL(urlBefore).origin;
+    let awayDefault: string;
+    try {
+      awayDefault = new URL(urlBefore).origin;
+    } catch {
+      awayDefault = urlBefore;
+    }
+    const away = input.awayUrl ?? awayDefault;
     try {
       await ctx.page.goto(away, { waitUntil: 'domcontentloaded', timeout: 5_000 });
       await ctx.page.waitForTimeout(500);
