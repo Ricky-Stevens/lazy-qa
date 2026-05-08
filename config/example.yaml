@@ -11,19 +11,19 @@
 # clone can verify the harness end-to-end. The seeded admin account
 # (admin@juice-sh.op / admin123) is the default — supply it in .env as
 # JUICE_SHOP_USER / JUICE_SHOP_PASS. Compare findings against
-# http://localhost:3000/#/score-board.
+# http://localhost:3050/#/score-board.
 #
 # Sections in this file are roughly ordered: REQUIRED on top, then optional /
 # tunable. Commented-out blocks show defaults — uncomment to override.
 
 target:
-  url: http://localhost:3000/
+  url: http://localhost:3050/
 
   # Hosts agents may navigate to. Every entry MUST also appear in the
   # operator-controlled REGRESS_TRUSTED_HOSTS env var; the harness refuses
   # to start otherwise. Match the URL's host:port form for local targets.
   allowed_hosts:
-    - localhost:3000
+    - localhost:3050
 
   auth:
     # 'form' = pre-run AI auth-agent (Haiku) navigates to the login URL,
@@ -37,7 +37,7 @@ target:
     # ="cc-dismiss"> "Me want it!" cookie button on Juice Shop) without
     # configuration. Just supply credentials.
     type: form
-    login_url: http://localhost:3000/#/login
+    login_url: http://localhost:3050/#/login
 
     # ─── Anonymous-only browsing (uncomment to revert) ───────────────────
     # type: none

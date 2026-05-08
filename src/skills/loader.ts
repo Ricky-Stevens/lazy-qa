@@ -40,6 +40,16 @@ export interface Skill {
     max_usd: number;
     max_minutes: number;
   };
+  /** Persona suite: 'attacker' for security agents, 'qa' for QA agents.
+   *  Derived from the subdirectory (`attackers/` or `qa/`) or frontmatter. */
+  category?: 'attacker' | 'qa';
+  /** Attacker personas only: wave number (1-based). Wave 1 runs first,
+   *  wave 2 starts when wave 1 completes, etc. QA personas ignore this. */
+  wave?: number;
+  /** Per-persona model override. When set, this model is used instead of the
+   *  global attacker_model / qa_model. Allows recon agents to run on Haiku
+   *  while exploitation agents stay on Sonnet. */
+  model?: string;
   /** For playbooks: Zod raw shape imported from handler.ts. */
   inputShape?: z.ZodRawShape;
   /** For playbooks: the async run function from handler.ts. */
@@ -68,6 +78,9 @@ interface SkillFrontmatter {
   type: 'persona' | 'playbook';
   description: string;
   defaultBudget?: { max_turns: number; max_usd: number; max_minutes: number };
+  category?: 'attacker' | 'qa';
+  wave?: number;
+  model?: string;
   categories?: PlaybookCategory[];
   estimatedDurationMs?: number;
   personaAllowlist?: string[];
@@ -126,6 +139,18 @@ function parseFrontmatter(
     }
   }
 
+  if (obj.category === 'attacker' || obj.category === 'qa') {
+    fm.category = obj.category;
+  }
+
+  if (typeof obj.wave === 'number' && obj.wave >= 1) {
+    fm.wave = obj.wave;
+  }
+
+  if (typeof obj.model === 'string' && obj.model.length > 0) {
+    fm.model = obj.model;
+  }
+
   if (Array.isArray(obj.categories)) {
     fm.categories = obj.categories as PlaybookCategory[];
   }
@@ -175,32 +200,49 @@ export async function loadSkills(rootDir?: string): Promise<SkillsBundle> {
   const playbooks = new Map<string, Skill>();
 
   // ── Load personas ──────────────────────────────────────────────────────────
+  // Scan three locations:
+  //   skills/personas/<slug>/SKILL.md          (legacy flat layout)
+  //   skills/personas/attackers/<slug>/SKILL.md (attacker suite)
+  //   skills/personas/qa/<slug>/SKILL.md        (QA suite)
+  // Category is inferred from the subdirectory name, overridden by frontmatter.
   const personasDir = path.join(root, 'personas');
-  let personaSlugs: string[];
-  try {
-    personaSlugs = await readdir(personasDir);
-  } catch {
-    personaSlugs = [];
-  }
+  const suiteEntries: Array<{ dir: string; inferredCategory?: 'attacker' | 'qa' }> = [
+    { dir: personasDir },
+    { dir: path.join(personasDir, 'attackers'), inferredCategory: 'attacker' },
+    { dir: path.join(personasDir, 'qa'), inferredCategory: 'qa' },
+  ];
 
-  for (const slug of personaSlugs) {
-    const skillFile = path.join(personasDir, slug, 'SKILL.md');
-    let content: string;
+  for (const { dir, inferredCategory } of suiteEntries) {
+    let slugs: string[];
     try {
-      content = await readFile(skillFile, 'utf-8');
+      slugs = await readdir(dir);
     } catch {
-      // Not a skill folder (e.g. a stray file) — skip
-      continue;
+      slugs = [];
     }
-    const { fm, body } = parseFrontmatter(content, skillFile);
-    const skill: Skill = {
-      name: fm.name,
-      type: 'persona',
-      description: fm.description,
-      body,
-      defaultBudget: fm.defaultBudget,
-    };
-    personas.set(fm.name, skill);
+
+    for (const slug of slugs) {
+      if (slug === 'attackers' || slug === 'qa') continue;
+      const skillFile = path.join(dir, slug, 'SKILL.md');
+      let content: string;
+      try {
+        content = await readFile(skillFile, 'utf-8');
+      } catch {
+        continue;
+      }
+      const { fm, body } = parseFrontmatter(content, skillFile);
+      const category = fm.category ?? inferredCategory;
+      const skill: Skill = {
+        name: fm.name,
+        type: 'persona',
+        description: fm.description,
+        body,
+        defaultBudget: fm.defaultBudget,
+        category,
+        wave: fm.wave,
+        model: fm.model,
+      };
+      personas.set(fm.name, skill);
+    }
   }
 
   // ── Load playbooks ─────────────────────────────────────────────────────────

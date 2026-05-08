@@ -23,6 +23,7 @@ const MAX_ITEMS = 10;
 export type AskSitemapQuery =
   | 'unvisited routes'
   | 'untested forms'
+  | 'unfuzzed forms'
   | 'unsorted tables'
   | 'unexercised modals'
   | 'unexercised wizards'
@@ -36,6 +37,7 @@ const askSitemapShape = {
   query: z.enum([
     'unvisited routes',
     'untested forms',
+    'unfuzzed forms',
     'unsorted tables',
     'unexercised modals',
     'unexercised wizards',
@@ -72,7 +74,7 @@ function hashItems(items: unknown[]): string {
 export const askSitemap: Playbook<AskSitemapInput> = {
   name: 'ask_sitemap',
   description:
-    'Query the shared SiteMap for unvisited routes, untested forms, unsorted tables, unexercised modals, unexercised wizards, or 4xx routes. Returns up to 10 items in evidence. Repeated identical queries return a brief "no change" message — act on the prior answer instead of re-asking.',
+    'Query the shared SiteMap for unvisited routes, untested forms, unfuzzed forms, unsorted tables, unexercised modals, unexercised wizards, or 4xx routes. Returns up to 10 items in evidence. Repeated identical queries return a brief "no change" message — act on the prior answer instead of re-asking.',
   categories: ['discovery'],
   estimatedDurationMs: 200,
   inputShape: askSitemapShape,
@@ -98,12 +100,16 @@ export const askSitemap: Playbook<AskSitemapInput> = {
           items = ctx.siteMap.listFormsUntested('crud_create_form').slice(0, MAX_ITEMS);
           break;
         }
+        case 'unfuzzed forms': {
+          items = ctx.siteMap.listFormsUntested('form_fuzz_validation').slice(0, MAX_ITEMS);
+          break;
+        }
         case 'unsorted tables': {
           items = ctx.siteMap.listTablesUntested('table_sort_each_column').slice(0, MAX_ITEMS);
           break;
         }
         case 'unexercised modals': {
-          items = ctx.siteMap.listModalsUntested('modal_open_close').slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listModalsUntested('modal_lifecycle').slice(0, MAX_ITEMS);
           break;
         }
         case 'unexercised wizards': {

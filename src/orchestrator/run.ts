@@ -32,6 +32,7 @@ import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../s
 import { loadSkills } from '../skills/loader.ts';
 import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import { SelectorCache } from '../tools/selector-cache.ts';
+import type { ResolvedAgent } from '../types/agent.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 import { runAuthAgent } from './auth-agent.ts';
@@ -39,9 +40,9 @@ import { EventWriter, formatEventLine } from './events.ts';
 import { FindingCache } from './finding-cache.ts';
 import { resolveMemoryPath } from './memory.ts';
 import { startRebalancer } from './rebalancer.ts';
-import { resolveAgents, resolveAutoAgents } from './resolve.ts';
+import { buildAgentQueues, resolveAgents } from './resolve.ts';
 import { SharedKnowledge } from './shared-knowledge.ts';
-import { generateSitePlaybook, type SitePlaybookResult } from './site-playbook.ts';
+import { classifySite, type SitePlaybookResult } from './site-playbook.ts';
 import { spawnAgent } from './spawn-agent.ts';
 import { runSupervisor } from './supervisor.ts';
 
@@ -86,10 +87,12 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
   const skillsBundle = await loadSkills();
   const isAutoMode = cfg.agents === 'auto';
   // In manual mode, resolve agents up front. In auto mode, agents are resolved
-  // after crawl + site-playbook (the LLM recommends which personas to spawn).
-  let agents: Awaited<ReturnType<typeof resolveAgents>> = isAutoMode
+  // after crawl + site-playbook into two ordered queues (security + QA).
+  let agents: ResolvedAgent[] = isAutoMode
     ? []
     : await resolveAgents(cfg, skillsBundle);
+  let securityQueue: ResolvedAgent[] = [];
+  let qaQueue: ResolvedAgent[] = [];
 
   // 3. Run ID + output directory.
   const runId = randomUUID();
@@ -178,6 +181,20 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     }
     process.once('SIGINT', () => handleSignal('SIGINT'));
     process.once('SIGTERM', () => handleSignal('SIGTERM'));
+
+    // SDK child processes can die mid-run leaving dead file descriptors.
+    // The SDK's internal pipe write throws EBADF asynchronously — without
+    // this handler Bun's default handler prints a noisy warning per event.
+    // Only swallow EBADF; log everything else and let the scan continue.
+    const onUnhandledRejection = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/EBADF|bad file descriptor/i.test(msg)) {
+        logger.warn('run.ebadf.swallowed', { error: msg });
+        return;
+      }
+      logger.error('run.unhandledRejection', { error: msg });
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
 
     // In auto mode, credentials come from target.auth.credentials.
     // In manual mode, use the first agent's credentials.
@@ -285,87 +302,37 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // site-specific intent (what to do here), which fixes the regression
     // where personas navigated without ever completing a flow.
     //
-    // In auto mode, the site-playbook ALSO recommends which personas to spawn.
-    // After the playbook returns, resolveAutoAgents builds the agent roster.
-    //
-    // Best-effort: failure is non-fatal. Agents fall back to persona-only
-    // prompts (manual mode) or default roster (auto mode).
-    let sitePlaybook: SitePlaybookResult | null = null;
-    try {
-      let personaBriefs: Array<{ name: string; description: string }>;
+    // Site classifier — heuristic, no LLM call, instant.
+    // Produces siteShape + siteSummary for agent orientation.
+    const sitePlaybook = classifySite({
+      rootUrl: cfg.target.url,
+      sitemap: crawledMap,
+      logger: logger.child({ phase: 'site-classify' }),
+      events,
+    });
+    await writeFile(
+      path.join(runDir, 'site-playbook.json'),
+      JSON.stringify(sitePlaybook, null, 2),
+      'utf8',
+    );
 
-      if (isAutoMode) {
-        // Auto mode: pass ALL personas so the LLM can recommend the best set.
-        personaBriefs = Array.from(skillsBundle.personas.values()).map((p) => ({
-          name: p.name,
-          description: p.description,
-        }));
-      } else {
-        // Manual mode: only brief honest (non-attacker) personas.
-        personaBriefs = Array.from(
-          new Map(
-            agents
-              .filter((a) => !ATTACKER_PROFILES.has(a.profileName))
-              .map((a) => {
-                const persona = skillsBundle.personas.get(a.profileName);
-                return [a.profileName, persona?.description ?? a.profileName];
-              }),
-          ).entries(),
-        ).map(([name, description]) => ({ name, description }));
-      }
-
-      sitePlaybook = await generateSitePlaybook({
-        rootUrl: cfg.target.url,
-        sitemap: crawledMap,
-        personas: personaBriefs,
-        backend,
-        model: 'claude-sonnet-4-6',
-        logger: logger.child({ phase: 'site-playbook' }),
-        events,
-        autoMode: isAutoMode,
-        abortSignal: runAbortController.signal,
-      });
-
-      await writeFile(
-        path.join(runDir, 'site-playbook.json'),
-        JSON.stringify(sitePlaybook, null, 2),
-        'utf8',
-      );
-
-      // Auto mode: resolve agents from the LLM's roster recommendation.
-      if (isAutoMode && sitePlaybook.recommendedRoster?.length) {
-        agents = resolveAutoAgents(sitePlaybook.recommendedRoster, cfg, skillsBundle);
-        logger.info('auto-agents.resolved', {
-          count: agents.length,
-          roster: agents.map((a) => `${a.id}(${a.model}, $${a.budget.max_usd})`),
-        });
-      }
-    } catch (err) {
-      logger.warn('site-playbook.crashed', {
-        error: err instanceof Error ? err.message : String(err),
+    // Auto mode: build two ordered queues from ALL personas.
+    if (isAutoMode) {
+      const queues = buildAgentQueues(cfg, skillsBundle);
+      securityQueue = queues.securityQueue;
+      qaQueue = queues.qaQueue;
+      logger.info('auto-agents.queued', {
+        securityTotal: securityQueue.length,
+        qaTotal: qaQueue.length,
+        securityOrder: securityQueue.map((a) => {
+          const w = skillsBundle.personas.get(a.profileName)?.wave ?? 0;
+          return `${a.id}(w${w})`;
+        }),
+        qaOrder: qaQueue.map((a) => a.id),
       });
     }
 
-    // Auto mode fallback: if site-playbook failed or returned no roster,
-    // spawn a default set: zero-cool + the first 4 honest personas.
-    if (isAutoMode && agents.length === 0) {
-      logger.warn('auto-agents.fallback', { reason: 'no roster from site-playbook' });
-      const defaultPersonas = ['zero-cool', 'house', 'leeroy-jenkins', 'the-magpie', 'caine'];
-      if (cfg.target.auth.type === 'form') {
-        defaultPersonas.unshift('bobby-tables');
-      }
-      const fallbackRoster = defaultPersonas
-        .filter((name) => skillsBundle.personas.has(name))
-        .map((persona) => ({ persona, priority: 2, reason: 'fallback default' }));
-      agents = resolveAutoAgents(fallbackRoster, cfg, skillsBundle);
-      logger.info('auto-agents.resolved', {
-        count: agents.length,
-        roster: agents.map((a) => `${a.id}(${a.model}, $${a.budget.max_usd})`),
-        fallback: true,
-      });
-    }
-
-    if (agents.length === 0) {
+    if (!isAutoMode && agents.length === 0) {
       throw new Error('runScan: no agents resolved — check config or site-playbook output');
     }
 
@@ -400,16 +367,9 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     // credential as verified).
     const sharedKnowledge = new SharedKnowledge();
 
-    // 10. Launch agents in parallel, but stagger the spawn fan-out. Each
-    // spawnAgent() spins up an SDK query() which spawns a heavyweight
-    // claude SEA child and a bidirectional MCP transport with 30+ tool
-    // registrations. Firing all of them at the same instant produced a
-    // multi-GB allocation spike in the parent that pushed V8 over its
-    // default ~4 GB old-space cap (the harness runs under bun normally,
-    // but the headroom is still finite). A 2 s delay between spawns lets
-    // each one reach steady state before the next allocates its transport
-    // — the agents still run concurrently after start. The supervisor
-    // continues to launch right alongside them.
+    // 10. Slot-based agent spawning. Only `security_slots + qa_slots` agents
+    // run concurrently (default 2+2=4). The rebalancer fills empty slots
+    // from the queues every 15s. Attackers respect wave ordering.
     const runStartedAt = new Date().toISOString();
 
     const supervisorEnabled = cfg.supervisor.enabled;
@@ -417,81 +377,79 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
     const explorerPromises: ReturnType<typeof spawnAgent>[] = [];
     const liveJourneys = new Map<string, import('../types/journey.ts').Journey>();
 
-    for (let i = 0; i < agents.length; i++) {
-      const agent = agents[i];
-      if (!agent) continue;
-      explorerPromises.push(
-        spawnAgent({
-          runId,
-          runDir,
-          targetUrl: cfg.target.url,
-          allowedHosts: cfg.target.allowed_hosts,
-          auth: cfg.target.auth,
-          agent,
-          backend,
-          siteMap,
-          logger,
-          abortSignal: runAbortController.signal,
-          stealth: cfg.target.stealth,
-          memoryEnabled,
-          memoryPath,
-          skillsBundle,
-          events,
-          selectorCache,
-          findingCache,
-          sharedKnowledge,
-          sessionInfo,
-          sitePlaybookText: sitePlaybook?.perPersona[agent.profileName],
-          siteSummary: sitePlaybook?.siteSummary,
-          siteShape: sitePlaybook?.siteShape,
-          journeyMap: liveJourneys,
-        }),
-      );
-      if (i < agents.length - 1) {
+    const spawnOne = (agent: ResolvedAgent) =>
+      spawnAgent({
+        runId,
+        runDir,
+        targetUrl: cfg.target.url,
+        allowedHosts: cfg.target.allowed_hosts,
+        auth: cfg.target.auth,
+        agent,
+        backend,
+        siteMap,
+        logger,
+        abortSignal: runAbortController.signal,
+        stealth: cfg.target.stealth,
+        memoryEnabled,
+        memoryPath,
+        skillsBundle,
+        events,
+        selectorCache,
+        findingCache,
+        sharedKnowledge,
+        sessionInfo,
+        siteSummary: sitePlaybook.siteSummary,
+        siteShape: sitePlaybook.siteShape,
+        journeyMap: liveJourneys,
+      });
+
+    // Dequeue initial agents to fill slots.
+    const sel = cfg.agent_selection;
+    const initialAgents: ResolvedAgent[] = [];
+
+    for (let i = 0; i < sel.security_slots && securityQueue.length > 0; i++) {
+      const agent = securityQueue.shift()!;
+      initialAgents.push(agent);
+      agents.push(agent);
+    }
+    for (let i = 0; i < sel.qa_slots && qaQueue.length > 0; i++) {
+      const agent = qaQueue.shift()!;
+      initialAgents.push(agent);
+      agents.push(agent);
+    }
+
+    // Spawn initial agents with stagger.
+    for (let i = 0; i < initialAgents.length; i++) {
+      explorerPromises.push(spawnOne(initialAgents[i]!));
+      if (i < initialAgents.length - 1) {
         await new Promise((r) => setTimeout(r, SPAWN_STAGGER_MS));
       }
     }
 
-    // 10a. Adaptive agent pool manager — scores agent health every 45s,
-    // terminates unproductive agents, spawns replacement personas from the
-    // unused pool, and boosts productive agents' budgets.
+    logger.info('slot.initial', {
+      security: initialAgents.filter((a) => ATTACKER_PROFILES.has(a.profileName)).map((a) => a.id),
+      qa: initialAgents.filter((a) => !ATTACKER_PROFILES.has(a.profileName)).map((a) => a.id),
+      securityQueued: securityQueue.length,
+      qaQueued: qaQueue.length,
+    });
+
+    // 10a. Slot manager (rebalancer). Scores health every 15s, terminates
+    // stagnant agents, and fills empty slots from the queues. Handles wave
+    // gating for attackers (wave N only dequeues when wave N-1 is done).
     const replacementPromises: ReturnType<typeof spawnAgent>[] = [];
     const stopRebalancer = startRebalancer({
       agents,
       journeys: liveJourneys,
-      siteMap,
       skillsBundle,
       defaultModel: cfg.anthropic.default_model,
       authType: cfg.target.auth.type,
       credentials: runCredentials,
+      securityQueue,
+      qaQueue,
+      securitySlots: sel.security_slots,
+      qaSlots: sel.qa_slots,
       spawnReplacement: (newAgent) => {
-        replacementPromises.push(
-          spawnAgent({
-            runId,
-            runDir,
-            targetUrl: cfg.target.url,
-            allowedHosts: cfg.target.allowed_hosts,
-            auth: cfg.target.auth,
-            agent: newAgent,
-            backend,
-            siteMap,
-            logger,
-            abortSignal: runAbortController.signal,
-            stealth: cfg.target.stealth,
-            memoryEnabled,
-            memoryPath,
-            skillsBundle,
-            events,
-            selectorCache,
-            findingCache,
-            sharedKnowledge,
-            sessionInfo,
-            sitePlaybookText: sitePlaybook?.perPersona[newAgent.profileName],
-            siteSummary: sitePlaybook?.siteSummary,
-            siteShape: sitePlaybook?.siteShape,
-            journeyMap: liveJourneys,
-          }),
-        );
+        replacementPromises.push(spawnOne(newAgent));
       },
       logger: logger.child({ phase: 'rebalancer' }),
       events,
@@ -510,8 +468,8 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
           events,
           authType: cfg.target.auth.type,
           sharedKnowledge,
+          siteMap,
         }).catch((err) => {
-          // Supervisor is best-effort — never fail the run if it errors.
           logger.error('supervisor.crashed', {
             error: err instanceof Error ? err.message : String(err),
           });
@@ -519,54 +477,89 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
         })
       : Promise.resolve(null);
 
-    // Belt-and-braces wall-clock cap. Fire abort after the deadline so
-    // still-running agents get signalled, then let allSettled collect
-    // results — preserves the settled status of agents that already
-    // finished instead of overriding everything with a blanket rejection.
-    const longestAgentBudgetMs =
-      Math.max(...agents.map((a) => a.budget.max_minutes), cfg.supervisor.max_minutes) * 60_000;
-    const OUTER_WAIT_DEADLINE_MS = longestAgentBudgetMs * 2 + 5 * 60_000;
+    // Wall-clock deadline. With slot-based rotation all agents run
+    // sequentially in groups, so estimate total time from queue sizes.
+    const totalAgentCount = agents.length + securityQueue.length + qaQueue.length;
+    const totalSlots = sel.security_slots + sel.qa_slots;
+    const avgMinutes = 10;
+    const estimatedWaves = Math.ceil(totalAgentCount / Math.max(totalSlots, 1));
+    const OUTER_WAIT_DEADLINE_MS = Math.max(
+      estimatedWaves * avgMinutes * 60_000 * 1.5 + 5 * 60_000,
+      cfg.supervisor.max_minutes * 60_000 * 2,
+    );
     const outerDeadlineHandle = setTimeout(() => {
       logger.error('explorer.allSettled.deadline.fired', {
         deadlineMs: OUTER_WAIT_DEADLINE_MS,
       });
       runAbortController.abort();
     }, OUTER_WAIT_DEADLINE_MS);
-    if (typeof outerDeadlineHandle === 'object' && outerDeadlineHandle !== null && 'unref' in outerDeadlineHandle) {
+    if (
+      typeof outerDeadlineHandle === 'object' &&
+      outerDeadlineHandle !== null &&
+      'unref' in outerDeadlineHandle
+    ) {
       (outerDeadlineHandle as { unref: () => void }).unref();
     }
 
-    const [explorerResults] = await Promise.all([
-      Promise.allSettled(explorerPromises) as Promise<PromiseSettledResult<{ journey: Journey }>[]>,
-      supervisorPromise,
-    ]);
+    // Wait for initial agents to complete.
+    const initialResults = await Promise.allSettled(explorerPromises) as PromiseSettledResult<{ journey: Journey }>[];
 
-    // Await any replacement agents spawned by the rebalancer.
-    let replacementResults: PromiseSettledResult<{ journey: Journey }>[] = [];
-    if (replacementPromises.length > 0) {
-      replacementResults = await Promise.allSettled(replacementPromises) as
-        PromiseSettledResult<{ journey: Journey }>[];
+    // Drain slot-filled replacement agents until all queues empty and all done.
+    const allSettledResults = [...initialResults];
+    const DRAIN_TIMEOUT_MS = 5 * 60_000;
+    const drainStart = Date.now();
+    while (!runAbortController.signal.aborted) {
+      // Batch any pending replacement promises.
+      if (replacementPromises.length > 0) {
+        const batch = [...replacementPromises];
+        replacementPromises.length = 0;
+        const batchResults = await Promise.allSettled(batch) as PromiseSettledResult<{ journey: Journey }>[];
+        allSettledResults.push(...batchResults);
+        continue;
+      }
+
+      // Check whether all agents are truly done via the liveJourneys map.
+      const allTerminated = Array.from(liveJourneys.values()).every(
+        (j) => !!j.terminationReason,
+      );
+      const queuesEmpty = securityQueue.length === 0 && qaQueue.length === 0;
+      if (queuesEmpty && allTerminated) break;
+
+      // Safety: don't spin forever if something is stuck.
+      if (Date.now() - drainStart > DRAIN_TIMEOUT_MS) {
+        logger.warn('drain.timeout', {
+          elapsed: Date.now() - drainStart,
+          liveJourneyCount: liveJourneys.size,
+          pendingReplacements: replacementPromises.length,
+          unterminated: Array.from(liveJourneys.entries())
+            .filter(([, j]) => !j.terminationReason)
+            .map(([id]) => id),
+        });
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, 2_000));
     }
 
-    clearTimeout(outerDeadlineHandle);
     stopRebalancer();
+    clearTimeout(outerDeadlineHandle);
+    // Signal the supervisor to stop now that all agents are done.
+    if (!runAbortController.signal.aborted) runAbortController.abort();
+    await Promise.race([
+      supervisorPromise,
+      new Promise<void>((r) => setTimeout(r, 15_000)),
+    ]);
+    const explorerResults = allSettledResults;
 
-    // 10. Collect journeys from original + replacement agents.
+    // 10. Collect journeys from all agents (initial + slot-filled).
     const journeys: Journey[] = [];
-    const allResults = [...explorerResults, ...replacementResults];
-    for (const [i, result] of allResults.entries()) {
-      const agent = agents[i];
-      if (!agent) continue;
+    for (const result of explorerResults) {
       if (result.status === 'fulfilled') {
         journeys.push(result.value.journey);
       } else {
-        logger.error('agent.rejected', {
-          agentId: agent.id,
-          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
-        });
         journeys.push({
           runId,
-          agentId: agent.id,
+          agentId: 'unknown',
           startedAt: runStartedAt,
           endedAt: new Date().toISOString(),
           startUrl: cfg.target.url,
@@ -693,6 +686,7 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
                   allowedHosts: cfg.target.allowed_hosts,
                   model: cfg.review.verify_model ?? cfg.review.model,
                   concurrency: cfg.review.verify_concurrency,
+                  verifyOnlyUncertain: cfg.review.verify_only_uncertain,
                 },
               }
             : {}),
@@ -769,8 +763,9 @@ export async function runScan(opts: RunOptions): Promise<RunResult> {
       });
     }
 
-    // Flush selector cache — best-effort. The 2s debounce will have persisted
-    // most entries during the run; this final close() catches the last batch.
+
+    process.removeListener('unhandledRejection', onUnhandledRejection);
+
     if (selectorCache) {
       try {
         await selectorCache.close();
@@ -812,12 +807,8 @@ async function collectPlaybookOutcomesFromEvents(
     out.push({
       agentId: String(e.agentId ?? ''),
       playbookName: String(e.playbookName ?? ''),
-      // `playbook.outcome` events don't carry route/targetId yet; coverage's
-      // overall "Playbooks executed" tally and per-agent depth still work
-      // without them, but per-target percentages will read 0%. That's fine
-      // for now — the bare execution count is the regression we're fixing.
-      route: '',
-      targetId: null,
+      route: typeof e.route === 'string' ? e.route : '',
+      targetId: typeof e.targetId === 'string' ? e.targetId : null,
       status,
     });
   }

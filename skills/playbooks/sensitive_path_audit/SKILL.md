@@ -4,7 +4,7 @@ description: Probe well-known sensitive paths (.git, .env, /backup, /api/swagger
 type: playbook
 categories: [security]
 estimatedDurationMs: 10000
-personaAllowlist: [bobby-tables, caine]
+personaAllowlist: [bobby-tables, johnny-five, dilbert, konami]
 ---
 
 # Usage

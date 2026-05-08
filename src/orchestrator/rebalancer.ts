@@ -1,38 +1,34 @@
 /**
- * Adaptive Agent Pool Manager.
+ * Slot-Based Agent Pool Manager.
  *
- * Runs every TICK_INTERVAL_MS during a scan. Scores each agent's health
- * based on finding velocity, action diversity, cost efficiency, and
- * momentum. Agents that persistently score low are terminated and their
- * budget is either redistributed to high-performers or used to spawn a
- * replacement persona from the unused pool.
+ * Maintains a fixed number of concurrent agent slots (default: 2 security +
+ * 2 QA). Every TICK_INTERVAL_MS it:
+ *   1. Scores each running agent's health
+ *   2. Terminates stagnant agents (freeing their slot)
+ *   3. Fills any empty slots from the queues
  *
- * Health scoring uses rolling windows — an agent that found 5 things
- * early then stalled scores lower than one that just found its first bug.
- * This rewards sustained output over early luck.
+ * Security queue is wave-gated: wave N agents only dequeue when all wave
+ * N-1 agents have finished. QA queue is FIFO.
  */
 
 import type { Logger } from '../logging/logger.ts';
-import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { SkillsBundle } from '../skills/loader.ts';
+import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Journey } from '../types/journey.ts';
-import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
-import { snapshotAll, type AgentRuntimeState } from './registry.ts';
 import type { EventWriter } from './events.ts';
+import { type AgentRuntimeState, snapshotAll } from './registry.ts';
 
 // ─── Tuning constants ────────────────────────────────────────────────────────
 
-const TICK_INTERVAL_MS = 45_000;
-const GRACE_PERIOD_TURNS = 20;
+const TICK_INTERVAL_MS = 15_000;
+const GRACE_PERIOD_TURNS = 8;
 const PROBATION_TICKS_BEFORE_TERMINATE = 2;
-const MIN_SPEND_BEFORE_EVAL = 0.15;
+const MIN_SPEND_BEFORE_EVAL = 0.08;
 
-// Health score thresholds.
 const THRESHOLD_THRIVING = 50;
 const THRESHOLD_STRUGGLING = 25;
 
-// Finding recency windows.
 const RECENCY_HOT_MS = 2 * 60_000;
 const RECENCY_WARM_MS = 5 * 60_000;
 const RECENCY_COOL_MS = 10 * 60_000;
@@ -70,7 +66,6 @@ function computeHealth(
   const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
   const inGrace = turns < GRACE_PERIOD_TURNS;
 
-  // 1. Finding recency (0–30): rewards recent output over stale history.
   let findingRecency = 0;
   if (inGrace) {
     findingRecency = 15;
@@ -83,7 +78,6 @@ function computeHealth(
     else findingRecency = 5;
   }
 
-  // 2. Action diversity (0–25): unique tools in the recent window.
   let actionDiversity = 0;
   if (registry) {
     const uniqueTools = new Set(registry.recentTools).size;
@@ -93,7 +87,6 @@ function computeHealth(
     else actionDiversity = 2;
   }
 
-  // 3. Cost efficiency (0–25): findings per dollar.
   let costEfficiency = 0;
   if (spent > 0 && findings > 0) {
     const fpd = findings / spent;
@@ -105,7 +98,6 @@ function computeHealth(
     costEfficiency = 10;
   }
 
-  // 4. Momentum (0–20): how recently the agent made a model turn.
   let momentum = 0;
   if (registry?.lastTurnAt) {
     const sinceTurn = now - registry.lastTurnAt;
@@ -114,15 +106,30 @@ function computeHealth(
     else if (sinceTurn < 60_000) momentum = 10;
   }
 
-  // 5. Stagnation penalty: an agent past grace with zero findings is burning
-  // budget for nothing. Cap the activity-only components (momentum + diversity)
-  // so pure busy-work can't keep the score above the struggling threshold.
-  // Without this, an active-but-unproductive agent scores ~35 from momentum (20)
-  // + diversity (15) alone, which exceeds THRESHOLD_STRUGGLING (25) and the
-  // rebalancer never terminates it.
+  // Stagnation penalty: 0 findings past grace → cap activity scores hard.
   if (!inGrace && findings === 0 && spent >= MIN_SPEND_BEFORE_EVAL) {
-    actionDiversity = Math.min(actionDiversity, 8);
-    momentum = Math.min(momentum, 5);
+    actionDiversity = Math.min(actionDiversity, 5);
+    momentum = Math.min(momentum, 3);
+  }
+
+  // Stale-finding penalty: agent found something early but nothing recent.
+  // One early finding shouldn't grant permanent immunity. Triggers 10 turns
+  // after grace period, or when the last finding is older than RECENCY_COOL_MS.
+  if (!inGrace && findings > 0 && turns > GRACE_PERIOD_TURNS + 10) {
+    const lastFindingTs = journey.findings[findings - 1]?.ts;
+    const lastFindingAge = lastFindingTs ? now - new Date(lastFindingTs).getTime() : Infinity;
+    if (lastFindingAge > RECENCY_WARM_MS) {
+      actionDiversity = Math.min(actionDiversity, 5);
+      momentum = Math.min(momentum, 3);
+    }
+  }
+
+  // Findings-per-turn floor: an agent burning 15+ turns with fewer than
+  // 1 finding per 15 turns is wandering, not testing — regardless of how
+  // "active" it looks. Hard cap on total score.
+  if (!inGrace && turns >= 15 && findings < Math.ceil(turns / 15)) {
+    findingRecency = Math.min(findingRecency, 5);
+    costEfficiency = Math.min(costEfficiency, 3);
   }
 
   const score = findingRecency + actionDiversity + costEfficiency + momentum;
@@ -140,15 +147,12 @@ function computeHealth(
   };
 }
 
-// ─── Pool context (everything the rebalancer needs to spawn replacements) ────
+// ─── Pool context ────────────────────────────────────────────────────────────
 
 export interface PoolContext {
   agents: ResolvedAgent[];
   journeys: Map<string, Journey>;
-  siteMap: SiteMapAccessor;
   skillsBundle: SkillsBundle;
-  /** Called to spawn a replacement agent. The rebalancer builds the
-   *  ResolvedAgent; this callback handles the actual spawnAgent() call. */
   spawnReplacement: (agent: ResolvedAgent) => void;
   logger: Logger;
   events?: EventWriter;
@@ -156,62 +160,124 @@ export interface PoolContext {
   defaultModel: string;
   authType: 'form' | 'none';
   credentials: { username: string; password: string } | null;
+  securityQueue: ResolvedAgent[];
+  qaQueue: ResolvedAgent[];
+  securitySlots: number;
+  qaSlots: number;
 }
 
-// ─── Replacement persona selection ───────────────────────────────────────────
+// ─── Wave-gated security dequeue ─────────────────────────────────────────────
 
-function selectReplacementPersona(
-  ctx: PoolContext,
-  terminatedProfile: string,
-): string | null {
-  const runningProfiles = new Set(
-    ctx.agents
-      .filter((a) => {
-        const j = ctx.journeys.get(a.id);
-        return j && !j.terminationReason;
-      })
-      .map((a) => a.profileName),
-  );
+function dequeueNextSecurity(ctx: PoolContext): ResolvedAgent | null {
+  if (ctx.securityQueue.length === 0) return null;
 
-  // Check what's untested.
-  const untestedForms = ctx.siteMap.listFormsUntested('form_fuzz_validation').length;
-  const untestedRoutes = ctx.siteMap.listUnvisitedRoutes().length;
+  const nextAgent = ctx.securityQueue[0]!;
+  const nextPersona = ctx.skillsBundle.personas.get(nextAgent.profileName);
+  const nextWave = nextPersona?.wave ?? 0;
 
-  // Persona priority based on what's uncovered.
-  const candidates: Array<{ name: string; score: number }> = [];
+  if (nextWave > 0) {
+    const prevWave = nextWave - 1;
+    const prevWaveRunning = ctx.agents.some((a) => {
+      const p = ctx.skillsBundle.personas.get(a.profileName);
+      if (p?.category !== 'attacker') return false;
+      if ((p?.wave ?? 0) !== prevWave) return false;
+      const j = ctx.journeys.get(a.id);
+      return j && !j.terminationReason;
+    });
 
-  for (const [name, persona] of ctx.skillsBundle.personas) {
-    if (runningProfiles.has(name)) continue;
-    if (name === terminatedProfile) continue;
+    // Also check: are there previous-wave agents still in the queue ahead of us?
+    // (Shouldn't happen since queue is wave-sorted, but guard anyway.)
+    const prevWaveQueued = ctx.securityQueue.some((a) => {
+      if (a === nextAgent) return false;
+      const p = ctx.skillsBundle.personas.get(a.profileName);
+      return (p?.wave ?? 0) === prevWave;
+    });
 
-    const isAttacker = ATTACKER_PROFILES.has(name);
-    if (isAttacker && ctx.authType === 'none' && name === 'bobby-tables') continue;
-
-    let score = 0;
-    if (isAttacker) {
-      score = 30;
-    } else if (untestedForms > 5 && (name === 'house' || name === 'the-spanner')) {
-      score = 25;
-    } else if (untestedRoutes > 10 && (name === 'caine' || name === 'the-magpie')) {
-      score = 20;
-    } else if (name === 'leeroy-jenkins') {
-      score = 15;
-    } else {
-      score = 10;
-    }
-
-    candidates.push({ name, score });
+    if (prevWaveRunning || prevWaveQueued) return null;
   }
 
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0]?.name ?? null;
+  return ctx.securityQueue.shift()!;
+}
+
+// ─── Slot filling ────────────────────────────────────────────────────────────
+
+function fillSlots(ctx: PoolContext): void {
+  let activeSecurity = 0;
+  let activeQa = 0;
+  for (const agent of ctx.agents) {
+    const journey = ctx.journeys.get(agent.id);
+    if (!journey || journey.terminationReason) continue;
+    if (ATTACKER_PROFILES.has(agent.profileName)) activeSecurity++;
+    else activeQa++;
+  }
+
+  while (activeSecurity < ctx.securitySlots && ctx.securityQueue.length > 0) {
+    const next = dequeueNextSecurity(ctx);
+    if (!next) break;
+    ctx.agents.push(next);
+    ctx.spawnReplacement(next);
+    activeSecurity++;
+
+    const persona = ctx.skillsBundle.personas.get(next.profileName);
+    ctx.logger.info('slot.fill', {
+      agentId: next.id,
+      category: 'security',
+      wave: persona?.wave,
+      activeSlots: activeSecurity + activeQa,
+      securityQueueRemaining: ctx.securityQueue.length,
+      qaQueueRemaining: ctx.qaQueue.length,
+    });
+    void ctx.events?.write({
+      type: 'slot.fill',
+      agentId: next.id,
+      category: 'security',
+      wave: persona?.wave,
+      securityQueueRemaining: ctx.securityQueue.length,
+      qaQueueRemaining: ctx.qaQueue.length,
+      activeSlots: activeSecurity + activeQa,
+    });
+  }
+
+  while (activeQa < ctx.qaSlots && ctx.qaQueue.length > 0) {
+    const next = ctx.qaQueue.shift()!;
+    ctx.agents.push(next);
+    ctx.spawnReplacement(next);
+    activeQa++;
+
+    ctx.logger.info('slot.fill', {
+      agentId: next.id,
+      category: 'qa',
+      activeSlots: activeSecurity + activeQa,
+      securityQueueRemaining: ctx.securityQueue.length,
+      qaQueueRemaining: ctx.qaQueue.length,
+    });
+    void ctx.events?.write({
+      type: 'slot.fill',
+      agentId: next.id,
+      category: 'qa',
+      securityQueueRemaining: ctx.securityQueue.length,
+      qaQueueRemaining: ctx.qaQueue.length,
+      activeSlots: activeSecurity + activeQa,
+    });
+  }
+
+  if (
+    ctx.securityQueue.length === 0 &&
+    ctx.qaQueue.length === 0 &&
+    activeSecurity === 0 &&
+    activeQa === 0
+  ) {
+    ctx.logger.info('slot.drain', { totalAgentsRun: ctx.agents.length });
+    void ctx.events?.write({
+      type: 'slot.drain',
+      totalAgentsRun: ctx.agents.length,
+    });
+  }
 }
 
 // ─── Main tick ───────────────────────────────────────────────────────────────
 
-const probationCounters = new Map<string, number>();
-
-function tick(ctx: PoolContext): void {
+function tick(ctx: PoolContext, probationCounters: Map<string, number>): void {
   const now = Date.now();
   const registrySnap = new Map(snapshotAll().map((s) => [s.agentId, s]));
 
@@ -224,174 +290,83 @@ function tick(ctx: PoolContext): void {
   }
 
   const active = healths.filter((h) => !h.isFinished);
-  if (active.length <= 1) {
-    emitTickEvent(ctx, active, [], {});
-    return;
-  }
 
+  // Health scoring and termination (only when 2+ agents active).
   const terminated: string[] = [];
   const boosted: Record<string, number> = {};
-  let freedBudget = 0;
 
-  for (const health of active) {
-    if (health.spent < MIN_SPEND_BEFORE_EVAL) continue;
-    if (health.turns < GRACE_PERIOD_TURNS) continue;
+  if (active.length >= 2) {
+    let freedBudget = 0;
 
-    if (health.score < THRESHOLD_STRUGGLING) {
-      const prev = probationCounters.get(health.agentId) ?? 0;
-      probationCounters.set(health.agentId, prev + 1);
-
-      if (prev + 1 >= PROBATION_TICKS_BEFORE_TERMINATE) {
-        const journey = ctx.journeys.get(health.agentId);
-        if (journey) {
-          journey.terminationReason = 'rebalanced';
-          freedBudget += Math.max(health.remaining, 0);
-          terminated.push(health.agentId);
-
-          ctx.logger.info('rebalancer.terminate', {
-            agentId: health.agentId,
-            score: health.score,
-            breakdown: health.breakdown,
-            turns: health.turns,
-            findings: health.findings,
-            spent: `$${health.spent.toFixed(2)}`,
-            freed: `$${Math.max(health.remaining, 0).toFixed(2)}`,
-          });
-        }
-        probationCounters.delete(health.agentId);
-      } else {
-        ctx.logger.info('rebalancer.probation', {
-          agentId: health.agentId,
-          score: health.score,
-          tick: prev + 1,
-          of: PROBATION_TICKS_BEFORE_TERMINATE,
-        });
-      }
-    } else {
-      // Recovered — clear probation.
-      probationCounters.delete(health.agentId);
-    }
-  }
-
-  if (freedBudget <= 0 && terminated.length === 0) {
-    // No terminations — check if any thriving agent needs a boost.
     for (const health of active) {
-      if (
-        health.score >= THRESHOLD_THRIVING &&
-        health.findings >= 3 &&
-        health.spent / (health.spent + health.remaining) >= 0.80
-      ) {
-        // Agent is thriving but running out. Give it a small bump from
-        // the global pool headroom (if any).
-        const bump = Math.min(0.50, health.remaining * 0.5);
-        if (bump > 0.05) {
-          const agent = ctx.agents.find((a) => a.id === health.agentId);
-          if (agent) {
-            agent.budget.max_usd += bump;
-            boosted[health.agentId] = bump;
-            ctx.logger.info('rebalancer.boost', {
+      if (health.spent < MIN_SPEND_BEFORE_EVAL) continue;
+      if (health.turns < GRACE_PERIOD_TURNS) continue;
+
+      const nudgeCount = registrySnap.get(health.agentId)?.nudgesReceived ?? 0;
+      const fastKill = nudgeCount >= 2 && health.findings === 0;
+
+      if (fastKill || health.score < THRESHOLD_STRUGGLING) {
+        const prev = probationCounters.get(health.agentId) ?? 0;
+        probationCounters.set(health.agentId, prev + 1);
+
+        if (fastKill || prev + 1 >= PROBATION_TICKS_BEFORE_TERMINATE) {
+          const journey = ctx.journeys.get(health.agentId);
+          if (journey) {
+            journey.terminationReason = 'rebalanced';
+            freedBudget += Math.max(health.remaining, 0);
+            terminated.push(health.agentId);
+
+            ctx.logger.info('rebalancer.terminate', {
               agentId: health.agentId,
               score: health.score,
+              breakdown: health.breakdown,
+              turns: health.turns,
               findings: health.findings,
-              boost: `+$${bump.toFixed(2)}`,
+              spent: `$${health.spent.toFixed(2)}`,
+              freed: `$${Math.max(health.remaining, 0).toFixed(2)}`,
+            });
+          }
+          probationCounters.delete(health.agentId);
+        } else {
+          ctx.logger.info('rebalancer.probation', {
+            agentId: health.agentId,
+            score: health.score,
+            tick: prev + 1,
+            of: PROBATION_TICKS_BEFORE_TERMINATE,
+          });
+        }
+      } else {
+        probationCounters.delete(health.agentId);
+      }
+    }
+
+    // Boost thriving agents with any freed budget.
+    if (freedBudget > 0.05) {
+      const thriving = active.filter(
+        (h) => !terminated.includes(h.agentId) && h.score >= THRESHOLD_THRIVING,
+      );
+      if (thriving.length > 0) {
+        const totalFindings = thriving.reduce((s, h) => s + h.findings, 0) || 1;
+        for (const h of thriving) {
+          const share = (h.findings / totalFindings) * freedBudget;
+          const rounded = Math.round(share * 100) / 100;
+          if (rounded < 0.05) continue;
+          const agent = ctx.agents.find((a) => a.id === h.agentId);
+          if (agent) {
+            agent.budget.max_usd += rounded;
+            boosted[h.agentId] = rounded;
+            ctx.logger.info('rebalancer.boost', {
+              agentId: h.agentId,
+              score: h.score,
+              findings: h.findings,
+              boost: `+$${rounded.toFixed(2)}`,
             });
           }
         }
       }
     }
-    emitTickEvent(ctx, active, terminated, boosted);
-    return;
   }
 
-  // Redistribute freed budget.
-  if (freedBudget > 0) {
-    // Decision: spawn a replacement or boost existing?
-    const thriving = active.filter(
-      (h) => !terminated.includes(h.agentId) && h.score >= THRESHOLD_THRIVING,
-    );
-
-    // Try to spawn a replacement for each terminated agent.
-    let budgetForReplacements = freedBudget * 0.6;
-    let budgetForBoosts = freedBudget * 0.4;
-    let spawned = 0;
-
-    for (const agentId of terminated) {
-      if (budgetForReplacements < 0.30) break;
-
-      const terminatedAgent = ctx.agents.find((a) => a.id === agentId);
-      if (!terminatedAgent) continue;
-
-      const replacementPersona = selectReplacementPersona(ctx, terminatedAgent.profileName);
-      if (!replacementPersona) continue;
-
-      const persona = ctx.skillsBundle.personas.get(replacementPersona);
-      if (!persona?.defaultBudget) continue;
-
-      const isAttacker = ATTACKER_PROFILES.has(replacementPersona);
-      const replacementBudget = Math.min(budgetForReplacements, isAttacker ? 2.5 : 1.5);
-      budgetForReplacements -= replacementBudget;
-
-      const suffix = spawned > 0 ? `-${spawned + 1}` : '-r';
-      const newAgent: ResolvedAgent = {
-        id: `${replacementPersona}${suffix}`,
-        profileName: persona.name,
-        personality: persona.body,
-        model: isAttacker ? 'claude-sonnet-4-6' : ctx.defaultModel,
-        maxThinkingTokens: isAttacker ? 2000 : 1024,
-        plannerModel: undefined,
-        budget: {
-          max_turns: persona.defaultBudget.max_turns,
-          max_usd: Math.round(replacementBudget * 100) / 100,
-          max_minutes: isAttacker ? 20 : 15,
-        },
-        credentials: ctx.credentials,
-      };
-
-      ctx.agents.push(newAgent);
-      ctx.spawnReplacement(newAgent);
-      spawned += 1;
-
-      ctx.logger.info('rebalancer.spawn', {
-        newAgentId: newAgent.id,
-        persona: replacementPersona,
-        budget: `$${newAgent.budget.max_usd.toFixed(2)}`,
-        replacing: agentId,
-      });
-    }
-
-    // Boost remaining budget to thriving agents.
-    budgetForBoosts += budgetForReplacements;
-    if (budgetForBoosts > 0.05 && thriving.length > 0) {
-      const totalFindings = thriving.reduce((s, h) => s + h.findings, 0) || 1;
-      for (const h of thriving) {
-        const share = (h.findings / totalFindings) * budgetForBoosts;
-        const rounded = Math.round(share * 100) / 100;
-        if (rounded < 0.05) continue;
-        const agent = ctx.agents.find((a) => a.id === h.agentId);
-        if (agent) {
-          agent.budget.max_usd += rounded;
-          boosted[h.agentId] = rounded;
-          ctx.logger.info('rebalancer.boost', {
-            agentId: h.agentId,
-            score: h.score,
-            findings: h.findings,
-            boost: `+$${rounded.toFixed(2)}`,
-          });
-        }
-      }
-    }
-  }
-
-  emitTickEvent(ctx, active, terminated, boosted);
-}
-
-/** Emit a rebalancer.tick event with health scores for observability. */
-function emitTickEvent(
-  ctx: PoolContext,
-  active: AgentHealth[],
-  terminated: string[],
-  boosted: Record<string, number>,
-): void {
   void ctx.events?.write({
     type: 'rebalancer.tick',
     terminated,
@@ -405,17 +380,21 @@ function emitTickEvent(
       spent: h.spent,
     })),
   });
+
+  // Fill any empty slots (from natural termination or rebalancer kills).
+  fillSlots(ctx);
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 export function startRebalancer(ctx: PoolContext): () => void {
   let stopped = false;
+  const probationCounters = new Map<string, number>();
 
   const interval = setInterval(() => {
     if (stopped || ctx.abortSignal?.aborted) return;
     try {
-      tick(ctx);
+      tick(ctx, probationCounters);
     } catch (err) {
       ctx.logger.warn('rebalancer.error', {
         error: err instanceof Error ? err.message : String(err),

@@ -150,6 +150,8 @@ export type Event =
       runId: string;
       agentId: string;
       playbookName: string;
+      route: string;
+      targetId: string | null;
       status: 'ok' | 'suspicious' | 'failed' | 'skipped';
       durationMs: number;
       evidence: unknown;
@@ -244,18 +246,7 @@ export type Event =
       postLoginUrl?: string;
     }
   | {
-      // Site-playbook generator: starting analysis of the crawler's sitemap.
-      type: 'site-playbook.start';
-      ts: string;
-      seq: number;
-      runId: string;
-      rootUrl: string;
-      routeCount: number;
-      personas: string[];
-      model: string;
-    }
-  | {
-      // Site-playbook generator: analysis finished (success or failure).
+      // Site classifier: heuristic analysis complete (or failed on empty sitemap).
       type: 'site-playbook.complete';
       ts: string;
       seq: number;
@@ -282,6 +273,25 @@ export type Event =
         turns: number;
         spent: number;
       }>;
+    }
+  | {
+      type: 'slot.fill';
+      ts: string;
+      seq: number;
+      runId: string;
+      agentId: string;
+      category: 'security' | 'qa';
+      wave?: number;
+      securityQueueRemaining: number;
+      qaQueueRemaining: number;
+      activeSlots: number;
+    }
+  | {
+      type: 'slot.drain';
+      ts: string;
+      seq: number;
+      runId: string;
+      totalAgentsRun: number;
     };
 
 /**
@@ -372,12 +382,10 @@ export function formatEventLine(e: Event): string | null {
       return `  ✦ team-broadcast${e.forProfile ? ` [${e.forProfile}]` : ''}  ${e.message.slice(0, 80)}`;
     case 'auth.try_login':
       return `  ${e.success ? '✓' : '✗'} try_login ${e.agentId} as ${e.username}  ${e.detail.slice(0, 80)}`;
-    case 'site-playbook.start':
-      return `▶ site-playbook  routes=${e.routeCount} personas=${e.personas.length} model=${e.model}`;
     case 'site-playbook.complete':
       return e.ok
-        ? `■ site-playbook  shape=${e.siteShape} personas=${e.personas.length} cost=$${e.costUsd.toFixed(4)} ${e.durationMs}ms`
-        : `■ site-playbook FAILED  ${(e.detail ?? '').slice(0, 80)}`;
+        ? `■ site-classify  shape=${e.siteShape} ${e.durationMs}ms`
+        : `■ site-classify FAILED  ${(e.detail ?? '').slice(0, 80)}`;
     case 'critic.start':
       return `▶ critic start  findings=${e.findingCount} model=${e.model}`;
     case 'critic.verdict':
@@ -388,6 +396,12 @@ export function formatEventLine(e: Event): string | null {
       return `  ▶ verify ${e.findingId} (${e.model})`;
     case 'critic.verify.end':
       return `  ■ verify ${e.findingId} → ${e.verdict} cost=$${e.costUsd.toFixed(4)}`;
+    case 'rebalancer.tick':
+      return null; // too chatty for console
+    case 'slot.fill':
+      return `  ▶ slot fill ${e.agentId} (${e.category}${e.wave ? ` w${e.wave}` : ''})  active=${e.activeSlots} secQ=${e.securityQueueRemaining} qaQ=${e.qaQueueRemaining}`;
+    case 'slot.drain':
+      return `  ■ all agents complete  total=${e.totalAgentsRun}`;
     default:
       return null;
   }

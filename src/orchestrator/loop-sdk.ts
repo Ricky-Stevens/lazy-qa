@@ -38,6 +38,7 @@ import { ATTACKER_PROFILES, BROWSER_TOOL_NAMES } from '../tools/browser-server.t
 import { computeCostUsd } from './cost.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
 import {
+  buildTaskQueue,
   buildUserMessage,
   extractPersonaTagline,
   extractRoute,
@@ -48,7 +49,7 @@ import {
   PLAYBOOK_TOOL_PREFIX,
   tryParsePlaybookOutcome,
 } from './loop-shared.ts';
-import { consumeNudge, updateOnTurn } from './registry.ts';
+import { consumeNudge, getAgentState, updateOnTurn } from './registry.ts';
 import type { MemoryEntry } from './summary-memory.ts';
 
 export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
@@ -131,7 +132,12 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
           rt.handler(args),
           new Promise<never>((_, reject) =>
             setTimeout(
-              () => reject(new Error(`tool ${rt.name} timed out after ${TOOL_TIMEOUT_MS / 1000}s (browser may have crashed)`)),
+              () =>
+                reject(
+                  new Error(
+                    `tool ${rt.name} timed out after ${TOOL_TIMEOUT_MS / 1000}s (browser may have crashed)`,
+                  ),
+                ),
               TOOL_TIMEOUT_MS,
             ),
           ),
@@ -180,6 +186,8 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
             type: 'playbook.outcome',
             agentId: agent.id,
             playbookName: outcome.playbookName,
+            route,
+            targetId,
             status: outcome.status as 'ok' | 'suspicious' | 'failed' | 'skipped',
             durationMs: outcome.durationMs,
             evidence: outcome.evidence ?? null,
@@ -244,6 +252,11 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
+  let lastFindingTurn = 0;
+  let previousFindingsCount = 0;
+  let turnsOnSameUrl = 0;
+  let previousUrl: string | undefined;
+
   // Per-turn user message generator. The SDK pulls a new user message from
   // this iterator before each assistant turn — that gives us the API-mode
   // "fresh sitemap + intel + nudge each turn" feature inside `query()`.
@@ -261,7 +274,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   // the consumer signals an assistant message arrived (or the loop terminated).
   const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
   const TURN_GATE_TIMEOUT_MS = 120_000;
-  const MAX_CONSECUTIVE_TIMEOUTS = 2;
+  const MAX_CONSECUTIVE_TIMEOUTS = 1;
   let turnGateResolve: (() => void) | null = null;
   let turnGatePromise: Promise<void> = Promise.resolve();
   let consecutiveTimeouts = 0;
@@ -320,14 +333,23 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
       const knownFindings = input.findingCache
         ? input.findingCache.forAgent(agent.id).slice(0, 30)
         : [];
-      // Honest personas only get a per-turn site-playbook reminder. Attackers
-      // are intentionally unconstrained by the inferred site shape — their OWASP
-      // methodology drives target selection.
-      const sitePlaybookForTurn = isAttacker ? undefined : input.sitePlaybookText;
       const sharedSnap = input.sharedKnowledge?.snapshot();
       const broadcasts = input.sharedKnowledge
         ? input.sharedKnowledge.consumeBroadcasts(agent.id, agent.profileName)
         : [];
+
+      const agentState = getAgentState(agent.id);
+      const currentAgentUrl = agentState?.currentUrl ?? undefined;
+      if (currentAgentUrl && currentAgentUrl === previousUrl) {
+        turnsOnSameUrl += 1;
+      } else {
+        turnsOnSameUrl = 0;
+        previousUrl = currentAgentUrl;
+      }
+      if (journey.findings.length > previousFindingsCount) {
+        lastFindingTurn = journey.turns;
+        previousFindingsCount = journey.findings.length;
+      }
 
       const userContent = buildUserMessage({
         isFirstTurn: journey.turns === 0,
@@ -343,15 +365,31 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         sharedRoutes: sharedSnap?.routes ?? [],
         broadcasts,
         sessionInfo: input.sessionInfo,
-        sitePlaybookText: sitePlaybookForTurn,
         fuzzedFormIds,
         isAttacker,
         personaTagline: extractPersonaTagline(agent.personality),
+        personaName: agent.profileName,
+        currentUrl: currentAgentUrl,
+        turnsOnSameUrl,
+        lastFindingTurn,
       });
 
-      // Emit agent.turn.start before the SDK fires the next assistant turn.
-      // Turn number is 1-indexed in the event stream — `journey.turns` is the
-      // count of turns already completed, so the upcoming turn is +1.
+      // Scope-completion: QA agents whose personal task queue is empty have
+      // finished their job. Only applies to agents WITH a task profile —
+      // attackers and unmapped personas run to their natural budget.
+      if (!isAttacker && journey.turns >= 8) {
+        const queue = buildTaskQueue(agent.profileName, input.siteMap, fuzzedFormIds);
+        if (queue.length === 0) {
+          journey.terminationReason = 'scope-complete';
+          logger.info('loop-sdk.scope-complete', {
+            agentId: agent.id,
+            turns: journey.turns,
+            findings: journey.findings.length,
+          });
+          break;
+        }
+      }
+
       await events?.write({
         type: 'agent.turn.start',
         agentId: agent.id,
@@ -371,12 +409,15 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     }
   }
 
-  // Dedupe assistant messages: the SDK emits each completed assistant message
-  // twice in stream-json mode (verified in the smoke run — pairs of identical
-  // tokenUsage / content arrived ms apart). Without dedup `journey.turns` and
-  // `journey.costUsd` are doubled, which fires per-agent budget caps at half
-  // the configured budget. Dedupe by `message.id` (the upstream Anthropic
-  // BetaMessage id, stable across the duplicate emissions).
+  // Continuation loop: the SDK's query() terminates when the model emits
+  // end_turn (text without tool calls). In API mode, the loop just sends
+  // another user message. In SDK mode, we must re-launch query() to keep
+  // the agent going. Cap retries to avoid infinite re-launches.
+  const MAX_SDK_CONTINUATIONS = 5;
+  let sdkContinuations = 0;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
   const seenAssistantIds = new Set<string>();
   try {
     for await (const message of query({
@@ -384,7 +425,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
       options: {
         model: agent.model,
         systemPrompt: input.systemPrompt,
-        maxTurns: agent.budget.max_turns,
+        maxTurns: Math.max(1, agent.budget.max_turns - journey.turns),
         pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
         // Persona's tool surface is exactly the three MCP servers below.
         // Disable the SDK's built-in Claude Code tools (Bash/Read/Edit/etc.)
@@ -400,6 +441,9 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         },
         allowedTools,
         abortController: controller,
+        stderr: (data: string) => {
+          if (data.trim()) logger.debug('loop-sdk.stderr', { agentId: agent.id, data: data.trim().slice(0, 500) });
+        },
         ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
           ? { maxThinkingTokens: agent.maxThinkingTokens }
           : {}),
@@ -475,7 +519,6 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
       }
 
       if (message.type === 'result') {
-        // Final result — the SDK has terminated. Set termination reason.
         if (!journey.terminationReason) {
           if (controller.signal.aborted) {
             journey.terminationReason = 'signal';
@@ -484,11 +527,13 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
           } else if (journey.costUsd >= agent.budget.max_usd) {
             journey.terminationReason = 'budget-hit';
           } else {
+            // The model stopped calling tools (end_turn). In API mode, the
+            // loop just sends another user message. In SDK mode, the query()
+            // terminates. Mark as sdk-end; the outer retry loop below will
+            // re-launch if budget remains.
             journey.terminationReason = 'sdk-end';
           }
         }
-        // Unblock the gate so prompts() can re-evaluate its loop conditions
-        // (which now see terminationReason set) and exit cleanly.
         releaseTurnGate();
       }
     }
@@ -511,7 +556,6 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     // can observe terminationReason and exit cleanly during cleanup.
     releaseTurnGate();
   } finally {
-    abortSignal.removeEventListener('abort', onAbort);
     releaseTurnGate();
   }
 
@@ -533,4 +577,34 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
       journey.terminationReason = 'sdk-end';
     }
   }
+
+  // Continuation: if the SDK terminated because the model stopped calling
+  // tools (sdk-end) but the agent still has budget, re-launch query() with
+  // a continuation nudge. This mirrors the API-mode loop's `continue` on
+  // end_turn — the model gets another chance with a fresh user message.
+  if (
+    journey.terminationReason === 'sdk-end' &&
+    sdkContinuations < MAX_SDK_CONTINUATIONS &&
+    journey.turns < agent.budget.max_turns &&
+    journey.costUsd < agent.budget.max_usd &&
+    !abortSignal.aborted &&
+    Date.now() - new Date(journey.startedAt).getTime() < agent.budget.max_minutes * 60_000
+  ) {
+    sdkContinuations += 1;
+    (journey as { terminationReason: string | undefined }).terminationReason = undefined;
+    logger.info('loop-sdk.continuation', {
+      agentId: agent.id,
+      attempt: sdkContinuations,
+      turnsCompleted: journey.turns,
+      findings: journey.findings.length,
+      costUsd: journey.costUsd,
+    });
+    consecutiveTimeouts = 0;
+    continue;
+  }
+
+  break;
+  } // end continuation while loop
+
+  abortSignal.removeEventListener('abort', onAbort);
 }

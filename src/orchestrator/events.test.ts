@@ -113,6 +113,8 @@ function buildTestEvents(): EventPayload[] {
       type: 'playbook.outcome',
       agentId: AGENT_A,
       playbookName: 'crud_create_form',
+      route: '/dashboard',
+      targetId: 'create-user-form',
       status: 'ok',
       durationMs: 1200,
       evidence: { formId: 'create-user-form', route: '/dashboard' },

@@ -272,6 +272,10 @@ export const ReviewConfigSchema = z
     verify_model: ModelSchema.optional(),
     /** Concurrency cap on parallel verifier tabs. Default 3. */
     verify_concurrency: z.number().int().min(1).max(8).default(3),
+    /** When true, only verify findings where the agent's confidence is below
+     *  'certain'. Findings marked 'certain' by the agent skip browser
+     *  re-verification, saving significant time and cost. Default true. */
+    verify_only_uncertain: z.boolean().default(true),
   })
   .default({
     enabled: true,
@@ -279,6 +283,7 @@ export const ReviewConfigSchema = z
     batch_mode: 'auto',
     verify_with_browser: true,
     verify_concurrency: 3,
+    verify_only_uncertain: true,
   });
 export type ReviewConfig = z.infer<typeof ReviewConfigSchema>;
 
@@ -311,8 +316,12 @@ export const AgentSelectionSchema = z
     attacker_model: ModelSchema.default('claude-sonnet-4-6'),
     /** Model for QA personas (mechanical playbook execution). Default: anthropic.default_model. */
     qa_model: ModelSchema.optional(),
-    /** Maximum agents to spawn. Default 7. */
-    max_agents: z.number().int().min(1).max(10).default(7),
+    /** @deprecated No longer used — all agents cycle through slots. Kept for backward compat. */
+    max_agents: z.number().int().min(1).max(20).default(7),
+    /** Number of concurrent security/attacker agent slots. Default 2. */
+    security_slots: z.number().int().min(1).max(6).default(2),
+    /** Number of concurrent QA agent slots. Default 2. */
+    qa_slots: z.number().int().min(1).max(6).default(2),
     /** Thinking token budget for attacker agents. */
     attacker_thinking_tokens: z
       .number()
@@ -337,6 +346,8 @@ export const AgentSelectionSchema = z
   .default({
     attacker_model: 'claude-sonnet-4-6',
     max_agents: 7,
+    security_slots: 2,
+    qa_slots: 2,
     attacker_thinking_tokens: 2000,
     qa_thinking_tokens: 1024,
   });

@@ -15,9 +15,9 @@ import { loadSkills } from './loader.ts';
 const SKILLS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../skills');
 
 describe('loadSkills', () => {
-  it('discovers exactly 7 personas', async () => {
+  it('discovers all personas from attackers/ and qa/ subdirectories', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    expect(bundle.personas.size).toBe(7);
+    expect(bundle.personas.size).toBe(24);
   });
 
   it('discovers exactly 14 playbooks', async () => {
@@ -25,16 +25,33 @@ describe('loadSkills', () => {
     expect(bundle.playbooks.size).toBe(14);
   });
 
-  it('persona names match the 7 expected slugs', async () => {
+  it('persona names match the expected slugs across both suites', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
     const names = Array.from(bundle.personas.keys()).sort();
     expect(names).toEqual([
+      'all-your-base',
       'bobby-tables',
-      'caine',
-      'house',
+      'bonzi-buddy',
+      'clippy',
+      'copy-pasta',
+      'dilbert',
+      'johnny-five',
+      'karen',
+      'konami',
       'leeroy-jenkins',
-      'the-magpie',
-      'the-spanner',
+      'longcat',
+      'marty-mcfly',
+      'mitnick',
+      'mulder',
+      'mystique',
+      'pac-man',
+      'press-f',
+      'rickroll',
+      'sheldon',
+      'sudo',
+      'there-is-no-spoon',
+      'trust-me-bro',
+      'wreck-it-ralph',
       'zero-cool',
     ]);
   });
@@ -60,14 +77,14 @@ describe('loadSkills', () => {
     ]);
   });
 
-  it('house persona preserves frontmatter budget', async () => {
+  it('mulder persona preserves frontmatter budget', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    const persona = bundle.personas.get('house');
+    const persona = bundle.personas.get('mulder');
     expect(persona).toBeDefined();
     expect(persona?.defaultBudget).toEqual({
-      max_turns: 250,
-      max_usd: 1.5,
-      max_minutes: 5,
+      max_turns: 25,
+      max_usd: 0.25,
+      max_minutes: 4,
     });
   });
 

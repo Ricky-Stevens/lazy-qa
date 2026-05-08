@@ -133,10 +133,47 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
           }
         }
 
+        let exhaustedText = '';
+        if (input.siteMap) {
+          const untestedForms = new Set(
+            input.siteMap.listFormsUntested('form_fuzz_validation').map((f) => f.route),
+          );
+          const untestedTables = new Set(
+            input.siteMap.listTablesUntested('table_sort_each_column').map((t) => t.route),
+          );
+          const untestedModals = new Set(
+            input.siteMap.listModalsUntested('modal_lifecycle').map((m) => m.route),
+          );
+          const untestedWizards = new Set(
+            input.siteMap.listWizardsUntested('wizard_full_walkthrough').map((w) => w.route),
+          );
+          const allRoutes = input.siteMap.listAllRoutes();
+          const exhausted = allRoutes
+            .filter((r) => {
+              if (!r.visited) return false;
+              const hasAffordances =
+                r.formIds.length > 0 ||
+                r.tableIds.length > 0 ||
+                r.modalIds.length > 0 ||
+                r.wizardIds.length > 0;
+              if (!hasAffordances) return false;
+              return (
+                !untestedForms.has(r.route) &&
+                !untestedTables.has(r.route) &&
+                !untestedModals.has(r.route) &&
+                !untestedWizards.has(r.route)
+              );
+            })
+            .map((r) => r.route);
+          if (exhausted.length > 0) {
+            exhaustedText = `\nExhausted routes (fully tested — agents should AVOID these):\n  ${exhausted.slice(0, 30).join('\n  ')}\n`;
+          }
+        }
+
         const text =
           lines.length === 0
             ? `${intelText}No agents registered yet. Wait and check again.`
-            : `${header}${intelText}Agents (${lines.length}):\n${lines.join('\n')}`;
+            : `${header}${intelText}${exhaustedText}Agents (${lines.length}):\n${lines.join('\n')}`;
         return { content: [{ type: 'text' as const, text }] };
       },
     },

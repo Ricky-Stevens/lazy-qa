@@ -137,11 +137,14 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
           stealth: input.stealth,
         });
         result.browser.on('disconnected', () => {
+          const err = new Error('browser disconnected');
           input.logger.error('browser.disconnected', {
             key: redactedKey(key),
             refCount: 'unknown',
-            stack: new Error('browser disconnected').stack,
+            stack: err.stack,
+            browserPid: (result.browser as unknown as { process?: () => { pid?: number } }).process?.()?.pid ?? 'unknown',
           });
+          sessions.delete(key);
         });
         return {
           browser: result.browser,

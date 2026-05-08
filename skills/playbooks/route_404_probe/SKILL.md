@@ -4,7 +4,7 @@ description: "Navigate each caller-supplied path (relative to the current origin
 type: playbook
 categories: [discovery]
 estimatedDurationMs: 8000
-personaAllowlist: [bobby-tables, caine]
+personaAllowlist: [bobby-tables, johnny-five, bonzi-buddy, konami]
 ---
 
 # Usage

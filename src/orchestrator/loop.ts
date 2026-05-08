@@ -28,6 +28,7 @@ import type { ResolvedAgent } from '../types/agent.ts';
 import { computeCostUsd } from './cost.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
 import {
+  buildTaskQueue,
   buildUserMessage,
   extractPersonaTagline,
   extractRoute,
@@ -37,7 +38,7 @@ import {
   PLAYBOOK_TOOL_PREFIX,
   tryParsePlaybookOutcome,
 } from './loop-shared.ts';
-import { consumeNudge, updateOnTurn } from './registry.ts';
+import { consumeNudge, getAgentState, updateOnTurn } from './registry.ts';
 import type { MemoryEntry, SummaryMemory } from './summary-memory.ts';
 
 // Re-export so existing consumers (loop-sdk.ts, spawn-agent.ts, tests) can
@@ -94,11 +95,15 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
   // re-orient to the elided context with a smarter model. All other turns
   // use agent.model (typically Haiku).
   let nextTurnIsPlanning = false;
+  let lastFindingTurn = 0;
+  let previousFindingsCount = 0;
+  let turnsOnSameUrl = 0;
+  let previousUrl: string | undefined;
 
   while (
     journey.turns < agent.budget.max_turns &&
     !input.abortSignal.aborted &&
-    journey.terminationReason !== 'end_session' &&
+    !journey.terminationReason &&
     journey.costUsd < agent.budget.max_usd
   ) {
     // Drain any supervisor-issued nudge — rendezvous point with
@@ -119,16 +124,24 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const knownFindings = input.findingCache
       ? input.findingCache.forAgent(agent.id).slice(0, 30)
       : [];
-    // Only honest personas get a per-turn site-playbook reminder. The attacker
-    // is intentionally unconstrained by the inferred site shape — its OWASP
-    // methodology drives target selection.
-    const sitePlaybookForTurn = ATTACKER_PROFILES.has(agent.profileName)
-      ? undefined
-      : input.sitePlaybookText;
     const sharedSnap = input.sharedKnowledge?.snapshot();
     const broadcasts = input.sharedKnowledge
       ? input.sharedKnowledge.consumeBroadcasts(agent.id, agent.profileName)
       : [];
+    const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
+    const agentState = getAgentState(agent.id);
+    const currentAgentUrl = agentState?.currentUrl ?? undefined;
+    if (currentAgentUrl && currentAgentUrl === previousUrl) {
+      turnsOnSameUrl += 1;
+    } else {
+      turnsOnSameUrl = 0;
+      previousUrl = currentAgentUrl;
+    }
+    if (journey.findings.length > previousFindingsCount) {
+      lastFindingTurn = journey.turns;
+      previousFindingsCount = journey.findings.length;
+    }
+
     const userContent = buildUserMessage({
       isFirstTurn: journey.turns === 0,
       targetUrl: input.targetUrl,
@@ -143,10 +156,13 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       sharedRoutes: sharedSnap?.routes ?? [],
       broadcasts,
       sessionInfo: input.sessionInfo,
-      sitePlaybookText: sitePlaybookForTurn,
       fuzzedFormIds,
-      isAttacker: ATTACKER_PROFILES.has(agent.profileName),
+      isAttacker,
       personaTagline: extractPersonaTagline(agent.personality),
+      personaName: agent.profileName,
+      currentUrl: currentAgentUrl,
+      turnsOnSameUrl,
+      lastFindingTurn,
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -231,7 +247,19 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const modelForThisTurn =
       nextTurnIsPlanning && agent.plannerModel ? agent.plannerModel : agent.model;
 
-    // Emit agent.turn.start before the API call.
+    if (!isAttacker && journey.turns >= 8) {
+      const queue = buildTaskQueue(agent.profileName, siteMap, fuzzedFormIds);
+      if (queue.length === 0) {
+        journey.terminationReason = 'scope-complete';
+        logger.info('loop.scope-complete', {
+          agentId: agent.id,
+          turns: journey.turns,
+          findings: journey.findings.length,
+        });
+        break;
+      }
+    }
+
     await events?.write({
       type: 'agent.turn.start',
       agentId: agent.id,
@@ -480,6 +508,8 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
         type: 'playbook.outcome',
         agentId: agent.id,
         playbookName: outcome.playbookName,
+        route,
+        targetId,
         status: outcome.status as 'ok' | 'suspicious' | 'failed' | 'skipped',
         durationMs: outcome.durationMs,
         evidence: outcome.evidence ?? null,

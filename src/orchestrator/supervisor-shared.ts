@@ -32,6 +32,10 @@ export interface SupervisorInput {
    *  surface team intel in list_agents and writes to it via broadcast_to_team
    *  to push directives at all explorers. */
   sharedKnowledge?: SharedKnowledge;
+  /** Site map accessor — used to compute exhausted routes (routes where all
+   *  applicable playbooks have completed) so the supervisor can steer agents
+   *  away from already-tested pages. */
+  siteMap?: import('../crawler/types.ts').SiteMapAccessor;
 }
 
 export interface SupervisorResult {
@@ -94,6 +98,8 @@ ${stormRule}
 
 3. NO PROGRESS — Date.now() - agent.lastActionAt > 60_000 (>60s since last browser action) AND status === 'active' AND NOT currently paused
    → ACTION: nudge_agent(agentId, "You haven't taken an action in over a minute. Try a completely different approach: <reference their recentTools and currentUrl to suggest something specific, e.g. 'open a kebab menu on a table row' or 'navigate to the dashboard and pick a different module'>.")
+   → EXHAUSTED ROUTES: if list_agents shows "Exhausted routes" — agents on those routes MUST navigate away immediately. Include the exhausted routes list in your nudge: "Route X is fully tested. Navigate to <untested route> instead."
+   → IMPORTANT: if an agent's currentUrl matches an exhausted route, nudge them EVEN IF they have been active recently. Exhausted routes should not be re-explored.
 
 4. NEW TEAM INTELLIGENCE — list_agents shows teamIntel.credentials > 0 OR teamIntel.routes > 0 (whatever growth happened since the last cycle). Specifically watch for newly shared CREDENTIALS — they are gold and must be broadcast immediately.
    → CREDENTIALS: broadcast_to_team({message: "Team intelligence: credentials available — username=<X>, password=<Y> (source: <Z>). Call try_login(<X>, <Y>) on your next turn. The authenticated surface has many more affordances; explore there before returning to anonymous routes."})

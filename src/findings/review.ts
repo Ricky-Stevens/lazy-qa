@@ -192,7 +192,8 @@ async function runVerifications(
         }),
         new Promise<never>((_, reject) =>
           setTimeout(
-            () => reject(new Error(`verify timeout after ${VERIFY_PER_FINDING_TIMEOUT_MS / 1000}s`)),
+            () =>
+              reject(new Error(`verify timeout after ${VERIFY_PER_FINDING_TIMEOUT_MS / 1000}s`)),
             VERIFY_PER_FINDING_TIMEOUT_MS,
           ),
         ),
@@ -244,6 +245,9 @@ export interface VerifyContext {
   model: string;
   /** Concurrency cap for parallel verifications. Default 3. */
   concurrency?: number;
+  /** When true, skip browser verification for findings where the agent's
+   *  confidence is 'certain'. Only verify 'likely' and 'maybe-flake'. */
+  verifyOnlyUncertain?: boolean;
 }
 
 export interface ReviewInput {
@@ -601,10 +605,14 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   // Critic-with-browser verification, if a verify context was provided.
   let verifyCostUsd = 0;
   if (input.verify) {
-    const candidates = reviews.filter(
-      (r) =>
-        r.review.classification === 'confirmed_bug' || r.review.classification === 'likely_bug',
-    );
+    const skipCertain = input.verify.verifyOnlyUncertain !== false;
+    const candidates = reviews.filter((r) => {
+      if (r.review.classification !== 'confirmed_bug' && r.review.classification !== 'likely_bug') {
+        return false;
+      }
+      if (skipCertain && r.finding.confidence === 'certain') return false;
+      return true;
+    });
     if (candidates.length > 0) {
       logger.info('verify.start', {
         candidates: candidates.length,

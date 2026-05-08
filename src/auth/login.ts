@@ -107,6 +107,11 @@ export async function launchBrowser(
   const stabilityArgs = [
     '--disable-dev-shm-usage',
     '--disable-gpu',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
   ];
   const mergedOptions = {
     ...options,

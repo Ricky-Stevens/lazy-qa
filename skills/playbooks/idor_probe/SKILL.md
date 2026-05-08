@@ -4,7 +4,7 @@ description: Probe a route containing an id segment (numeric or UUID) by navigat
 type: playbook
 categories: [security]
 estimatedDurationMs: 8000
-personaAllowlist: [bobby-tables]
+personaAllowlist: [bobby-tables, mystique, mitnick]
 ---
 
 # Usage

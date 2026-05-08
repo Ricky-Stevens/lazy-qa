@@ -77,7 +77,18 @@ export interface RawToolDef {
 /** Profiles considered "attacker-flavoured". Tools marked `attackerOnly` are
  *  only exposed to agents whose profileName matches. Listed here (not on the
  *  tool definitions themselves) so we can add new attacker profiles centrally. */
-export const ATTACKER_PROFILES: ReadonlySet<string> = new Set(['bobby-tables', 'zero-cool']);
+export const ATTACKER_PROFILES: ReadonlySet<string> = new Set([
+  'bobby-tables',
+  'johnny-five',
+  'clippy',
+  'zero-cool',
+  'dilbert',
+  'sudo',
+  'mystique',
+  'rickroll',
+  'trust-me-bro',
+  'mitnick',
+]);
 
 export interface BrowserServerInput {
   /** Returns the page the agent should drive. Closure-style so caller can
@@ -1138,6 +1149,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
       { expression: z.string().min(1).max(2000) },
       async ({ expression }) => {
         const page = ensureListeners();
+        reportToRegistry(page, 'evaluate');
         await awaitPauseIfNeeded();
         // Two-pass evaluation: try expression-mode first (single expression
         // wrapped in parens — succeeds for `localStorage.length`,
@@ -1200,6 +1212,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`fetch_resource refused: ${url} not in allowed_hosts.`);
         }
+        onAction?.({ url, toolName: 'fetch_resource', authWalled: false });
         const startedAt = Date.now();
         try {
           const resp = await fetch(url, {
@@ -1246,6 +1259,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`request_with_session refused: ${url} not in allowed_hosts.`);
         }
+        onAction?.({ url, toolName: 'request_with_session', authWalled: false });
         const page = ensureListeners();
         const startedAt = Date.now();
         try {

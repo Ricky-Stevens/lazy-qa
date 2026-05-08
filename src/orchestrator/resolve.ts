@@ -3,7 +3,6 @@ import type { AgentConfig, Config } from '../config/types.ts';
 import type { SkillsBundle } from '../skills/loader.ts';
 import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
-import type { RosterRecommendation } from './site-playbook.ts';
 
 /**
  * Resolve manually-configured agents from the `agents` array in config.
@@ -14,7 +13,7 @@ export async function resolveAgents(
   skillsBundle: SkillsBundle,
 ): Promise<ResolvedAgent[]> {
   if (cfg.agents === 'auto') {
-    throw new Error('resolveAgents called with agents=auto — use resolveAutoAgents instead');
+    throw new Error('resolveAgents called with agents=auto — use buildAgentQueues instead');
   }
   const targetCreds = resolveTargetCredentials(cfg);
   return Promise.all(
@@ -55,93 +54,57 @@ export async function resolveAgents(
   );
 }
 
+// ─── Slot-based queue builder ────────────────────────────────────────────────
+
+export interface AgentQueues {
+  securityQueue: ResolvedAgent[];
+  qaQueue: ResolvedAgent[];
+}
+
+const AUTH_GATED_ATTACKERS = new Set([
+  'bobby-tables',
+  'sudo',
+  'mystique',
+  'mitnick',
+  'trust-me-bro',
+  'rickroll',
+]);
+
 /**
- * Resolve agents automatically from the site-playbook's roster recommendation.
+ * Build two ordered agent queues from ALL personas in the skills bundle.
  *
- * Pipeline:
- * 1. Start with the LLM-recommended roster (sorted by priority)
- * 2. Apply hard rules (auth.type gates attacker selection)
- * 3. Cap to max_agents
- * 4. Allocate budgets from the total pool
- * 5. Build ResolvedAgent[] with models from agent_selection config
+ * Security queue: ordered by (wave ASC, name ASC). Wave gating is enforced
+ * at dequeue time by the rebalancer, not here.
+ *
+ * QA queue: ordered alphabetically by name for deterministic, reproducible runs.
+ *
+ * Each agent gets its SKILL.md defaultBudget verbatim — no pool-splitting.
  */
-export function resolveAutoAgents(
-  roster: RosterRecommendation[],
+export function buildAgentQueues(
   cfg: Config,
   skillsBundle: SkillsBundle,
-): ResolvedAgent[] {
+): AgentQueues {
   const sel = cfg.agent_selection;
   const credentials = resolveTargetCredentials(cfg);
   const isAuth = cfg.target.auth.type === 'form';
 
-  // Sort by priority (1 = must-have first), then alphabetically for stability.
-  const sorted = [...roster].sort(
-    (a, b) => a.priority - b.priority || a.persona.localeCompare(b.persona),
-  );
+  const securityQueue: ResolvedAgent[] = [];
+  const qaQueue: ResolvedAgent[] = [];
 
-  // Hard rules: gate attacker personas by auth type.
-  const filtered = sorted.filter((r) => {
-    const isAttacker = ATTACKER_PROFILES.has(r.persona);
-    // bobby-tables (insider) requires auth
-    if (r.persona === 'bobby-tables' && !isAuth) return false;
-    // zero-cool (external) is always valid — probes unauthenticated surface
-    if (r.persona === 'zero-cool') return true;
-    // Other attackers: require auth if they use authenticated tools
-    if (isAttacker && !isAuth) return false;
-    return true;
-  });
+  for (const [name, persona] of skillsBundle.personas) {
+    if (persona.type !== 'persona') continue;
+    if (!persona.defaultBudget) continue;
 
-  // Ensure at least one attacker is present.
-  const hasAttacker = filtered.some((r) => ATTACKER_PROFILES.has(r.persona));
-  if (!hasAttacker) {
-    // Add zero-cool (external attacker) as minimum attacker.
-    const zeroCool = skillsBundle.personas.get('zero-cool');
-    if (zeroCool) {
-      filtered.unshift({ persona: 'zero-cool', priority: 1, reason: 'auto: minimum attacker' });
-    }
-  }
+    const isAttacker = persona.category === 'attacker';
 
-  // Cap to max_agents.
-  const capped = filtered.slice(0, sel.max_agents);
+    if (isAttacker && !isAuth && AUTH_GATED_ATTACKERS.has(name)) continue;
 
-  // Budget allocation.
-  const supervisorCost = cfg.supervisor.enabled ? cfg.supervisor.max_usd : 0;
-  const reviewEstimate = cfg.review.enabled ? 1.5 : 0;
-  const totalPool = Math.max(cfg.run.max_budget_usd - supervisorCost - reviewEstimate, 2);
-
-  const attackerCount = capped.filter((r) => ATTACKER_PROFILES.has(r.persona)).length;
-  const qaCount = capped.length - attackerCount;
-
-  // Attackers get ~35% of pool (capped at $4 each), QA splits the rest.
-  const attackerBudgetEach = Math.min(
-    totalPool * 0.35 / Math.max(attackerCount, 1),
-    4.0,
-  );
-  const qaPool = totalPool - attackerCount * attackerBudgetEach;
-  const qaBudgetEach = qaCount > 0 ? Math.min(qaPool / qaCount, 2.5) : 0;
-
-  const qaModel = sel.qa_model ?? cfg.anthropic.default_model;
-
-  return capped.map((r) => {
-    const persona = skillsBundle.personas.get(r.persona);
-    if (!persona) {
-      throw new Error(
-        `Auto roster recommended persona '${r.persona}' but it's not in the skills bundle. ` +
-          `Available: ${Array.from(skillsBundle.personas.keys()).join(', ')}`,
-      );
-    }
-    if (!persona.defaultBudget) {
-      throw new Error(`Persona '${r.persona}' is missing defaultBudget in SKILL.md`);
-    }
-
-    const isAttacker = ATTACKER_PROFILES.has(r.persona);
-    const budgetUsd = isAttacker ? attackerBudgetEach : qaBudgetEach;
-    const model = isAttacker ? sel.attacker_model : qaModel;
+    const defaultModel = isAttacker ? sel.attacker_model : (sel.qa_model ?? cfg.anthropic.default_model);
+    const model = persona.model ?? defaultModel;
     const thinkingTokens = isAttacker ? sel.attacker_thinking_tokens : sel.qa_thinking_tokens;
-    const maxMinutes = isAttacker ? 25 : 20;
 
-    return {
-      id: r.persona,
+    const agent: ResolvedAgent = {
+      id: name,
       profileName: persona.name,
       personality: persona.body,
       model,
@@ -149,10 +112,27 @@ export function resolveAutoAgents(
       plannerModel: undefined,
       budget: {
         max_turns: persona.defaultBudget.max_turns,
-        max_usd: Math.round(budgetUsd * 100) / 100,
-        max_minutes: maxMinutes,
+        max_usd: persona.defaultBudget.max_usd,
+        max_minutes: persona.defaultBudget.max_minutes,
       },
       credentials,
     };
+
+    if (isAttacker) {
+      securityQueue.push(agent);
+    } else {
+      qaQueue.push(agent);
+    }
+  }
+
+  securityQueue.sort((a, b) => {
+    const waveA = skillsBundle.personas.get(a.profileName)?.wave ?? 0;
+    const waveB = skillsBundle.personas.get(b.profileName)?.wave ?? 0;
+    if (waveA !== waveB) return waveA - waveB;
+    return a.profileName.localeCompare(b.profileName);
   });
+
+  qaQueue.sort((a, b) => a.profileName.localeCompare(b.profileName));
+
+  return { securityQueue, qaQueue };
 }

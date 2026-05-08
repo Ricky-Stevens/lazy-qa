@@ -88,12 +88,6 @@ export interface LoopInput {
    *  log out, DO NOT re-attempt login]` so the agent knows it's already
    *  authed via inherited storageState. */
   sessionInfo?: { username: string; role?: string };
-  /** Site-playbook text generated for this persona. When present AND the agent
-   *  is not an attacker, a compact reminder block is rendered in every per-turn
-   *  user message. Without per-turn reinforcement the brief stops being
-   *  load-bearing past turn 1 — agents follow the first sentence then drift.
-   *  Excluded for attackers (their freedom-to-attack is a deliberate property). */
-  sitePlaybookText?: string;
 }
 
 /** Build the per-turn user message — sitemap snapshot + summary memory + continue line. */
@@ -111,19 +105,22 @@ export function buildUserMessage(args: {
   sharedRoutes: SharedDiscoveredRoute[];
   broadcasts: SharedBroadcast[];
   sessionInfo?: { username: string; role?: string };
-  sitePlaybookText?: string;
   /** Form IDs the agent has already touched (fuzzed / filled / verified) this
    *  run. Used to render an "Un-fuzzed forms" TODO so honest personas notice
    *  forms they haven't acted on. */
   fuzzedFormIds: Set<string>;
   /** True for attacker profiles. Skips the form-fuzz TODO render for them. */
   isAttacker: boolean;
-  /** Short persona-character reminder. Re-injected EVERY turn so the persona's
-   *  identity survives sliding-window compaction (the system prompt's persona
-   *  body gets elided after ~14 messages). Without this, by turn 20 The Spanner
-   *  drifts to "I should fill the form correctly" and The Magpie stops hoarding.
-   *  Typically the persona's `# Closing` line — extracted by the caller. */
+  /** Short persona-character reminder. */
   personaTagline?: string;
+  /** Persona name (slug) — used to compute the task queue. */
+  personaName?: string;
+  /** Agent's current URL from the registry — used for stagnation detection. */
+  currentUrl?: string;
+  /** Consecutive turns the agent has spent on the same URL. */
+  turnsOnSameUrl?: number;
+  /** Turn number of the agent's most recent finding. 0 if no findings yet. */
+  lastFindingTurn?: number;
 }): string {
   const sections: string[] = [];
 
@@ -159,31 +156,44 @@ export function buildUserMessage(args: {
     sections.push(`[TEAM BROADCAST]\n${b.message}`);
   }
 
-  const intel = renderTeamIntel(args.sharedCredentials, args.sharedRoutes);
-  if (intel) sections.push(intel);
-
-  // Per-turn site-playbook reminder. The brief is also in the system prompt,
-  // but a compact reinforcement here keeps it load-bearing past turn 1 — without
-  // it agents follow the first sentence then drift back to "explore the
-  // snapshot." Skipped for attackers (filtered upstream).
-  if (args.sitePlaybookText && args.sitePlaybookText.trim().length > 0) {
-    sections.push(
-      [
-        "[your plan for this site — pursue it, don't drift]",
-        args.sitePlaybookText.trim(),
-        'If a step in the plan succeeds with no surprises, move to the NEXT step rather than re-exploring. Plan steps not yet attempted are higher-priority than the snapshot below.',
-      ].join('\n'),
-    );
+  // Team intel: attackers get credentials + routes, QA agents only get routes
+  // (they don't call try_login — credential intel wastes their input tokens).
+  if (args.isAttacker) {
+    const intel = renderTeamIntel(args.sharedCredentials, args.sharedRoutes);
+    if (intel) sections.push(intel);
+  } else if (args.sharedRoutes.length > 0) {
+    const intel = renderTeamIntel([], args.sharedRoutes);
+    if (intel) sections.push(intel);
   }
 
   const knownBlock = renderKnownFindings(args.knownFindings);
   if (knownBlock) sections.push(knownBlock);
 
-  // Un-fuzzed forms TODO. Honest personas only — attackers have a different
-  // job (they probe APIs, not UI forms, in the typical attack surface).
-  if (!args.isAttacker) {
+  // Task queue: directed task list for QA agents, replaces generic exploration.
+  // Attackers get the sitemap snapshot instead (they need creative freedom).
+  const taskQueue = !args.isAttacker && args.personaName
+    ? buildTaskQueue(args.personaName, args.siteMap, args.fuzzedFormIds)
+    : [];
+
+  if (taskQueue.length > 0) {
+    const queueBlock = renderTaskQueue(taskQueue, args.personaName);
+    if (queueBlock) sections.push(queueBlock);
+  } else if (!args.isAttacker) {
     const todo = renderUnfuzzedFormsTodo(args.siteMap, args.fuzzedFormIds);
     if (todo) sections.push(todo);
+  }
+
+  // Stagnation warnings (programmatic, no LLM cost).
+  if (!args.isFirstTurn) {
+    const warning = buildStagnationWarning({
+      turnsCompleted: args.turnsCompleted,
+      findingsCount: args.findingsCount,
+      lastFindingTurn: args.lastFindingTurn ?? 0,
+      currentUrl: args.currentUrl,
+      turnsOnSameUrl: args.turnsOnSameUrl ?? 0,
+      personaName: args.personaName,
+    });
+    if (warning) sections.push(warning);
   }
 
   const snapshot = renderSiteMapSnapshot(args.siteMap);
@@ -193,15 +203,18 @@ export function buildUserMessage(args: {
   if (memory) sections.push(memory);
 
   if (args.isFirstTurn) {
-    sections.push(
-      `Begin. You're already on ${args.targetUrl}. Pick a playbook from the list above (or invent your own action via the primitive browser tools) and start exercising the app as your character would.`,
-    );
+    if (taskQueue.length > 0) {
+      sections.push(
+        `Begin. You're already on ${args.targetUrl}. Your task queue above tells you exactly what to test. Go to the NEXT item and start.`,
+      );
+    } else {
+      sections.push(
+        `Begin. You're already on ${args.targetUrl}. Start exercising the app as your character would. Batch tool calls aggressively.`,
+      );
+    }
   } else {
     sections.push(
-      [
-        `[continue] Progress: ${args.turnsCompleted} turns, ${args.findingsCount} findings, ~${args.remainingMin.toFixed(1)} min remaining.`,
-        `Stay in character. Pick something from the snapshot above you have NOT yet touched. Batch tool calls aggressively.`,
-      ].join('\n'),
+      `[continue] ${args.turnsCompleted} turns, ${args.findingsCount} findings, ~${args.remainingMin.toFixed(1)} min left. ${taskQueue.length > 0 ? 'Follow your task queue.' : 'Stay in character. Batch tool calls.'}`,
     );
   }
 
@@ -614,4 +627,146 @@ export function extractPersonaTagline(body: string): string {
       return firstPara.length <= 400 ? firstPara : `${firstPara.slice(0, 397)}...`;
   }
   return '';
+}
+
+// ─── Task Queue ──────────────────────────────────────────────────────────────
+
+const PERSONA_TASK_PROFILE: Record<string, {
+  label: string;
+  query: 'forms' | 'tables' | 'routes' | 'modals';
+  playbook?: string;
+}> = {
+  'all-your-base':      { label: 'test boundary values on', query: 'forms', playbook: 'form_fuzz_validation' },
+  'there-is-no-spoon':  { label: 'submit empty',            query: 'forms', playbook: 'form_fuzz_validation' },
+  'copy-pasta':         { label: 'double-submit',           query: 'forms', playbook: 'form_double_submit' },
+  'wreck-it-ralph':     { label: 'wrong-type input on',     query: 'forms', playbook: 'form_fuzz_validation' },
+  'longcat':            { label: 'layout-stress',           query: 'forms', playbook: 'form_fuzz_validation' },
+  'mulder':             { label: 'save-and-reload',         query: 'forms', playbook: 'fill_and_verify' },
+  'leeroy-jenkins':     { label: 'interrupt mid-flow on',   query: 'forms', playbook: 'form_fuzz_validation' },
+  'marty-mcfly':        { label: 'skip steps on',           query: 'forms', playbook: 'form_fuzz_validation' },
+  'pac-man':            { label: 'volume-test',             query: 'tables', playbook: 'table_sort_each_column' },
+  'sheldon':            { label: 'accessibility-check',     query: 'routes' },
+  'bonzi-buddy':        { label: 'bad-URL probe',           query: 'routes' },
+  'press-f':            { label: 'stale-state probe',       query: 'routes' },
+  'konami':             { label: 'hidden-UI probe',         query: 'routes' },
+  'karen':              { label: 'happy-path walk',         query: 'routes' },
+};
+
+export interface TaskQueueItem {
+  route: string;
+  targetId?: string;
+  action: string;
+}
+
+export function buildTaskQueue(
+  personaName: string,
+  siteMap: SiteMapAccessor,
+  fuzzedFormIds: Set<string>,
+): TaskQueueItem[] {
+  const profile = PERSONA_TASK_PROFILE[personaName];
+  if (!profile) return [];
+
+  const items: TaskQueueItem[] = [];
+  const MAX_QUEUE = 15;
+
+  switch (profile.query) {
+    case 'forms': {
+      const playbook = profile.playbook ?? 'form_fuzz_validation';
+      const untested = siteMap.listFormsUntested(playbook);
+      for (const f of untested) {
+        if (fuzzedFormIds.has(f.formId)) continue;
+        items.push({ route: f.route, targetId: f.formId, action: `${profile.label} form "${f.formId}"` });
+        if (items.length >= MAX_QUEUE) break;
+      }
+      break;
+    }
+    case 'tables': {
+      const playbook = profile.playbook ?? 'table_sort_each_column';
+      const untested = siteMap.listTablesUntested(playbook);
+      for (const t of untested) {
+        items.push({ route: t.route, targetId: t.tableId, action: `${profile.label} table "${t.tableId}"` });
+        if (items.length >= MAX_QUEUE) break;
+      }
+      break;
+    }
+    case 'routes': {
+      const unvisited = siteMap.listUnvisitedRoutes();
+      const visited = siteMap.listAllRoutes().filter((r) => r.visited);
+      const candidates = [...unvisited, ...visited];
+      for (const r of candidates) {
+        items.push({ route: r.route, action: `${profile.label} ${r.route}` });
+        if (items.length >= MAX_QUEUE) break;
+      }
+      break;
+    }
+    case 'modals': {
+      const untested = siteMap.listModalsUntested(profile.playbook ?? 'modal_lifecycle');
+      for (const m of untested) {
+        items.push({ route: m.route, targetId: m.modalId, action: `${profile.label} modal "${m.modalId}"` });
+        if (items.length >= MAX_QUEUE) break;
+      }
+      break;
+    }
+  }
+  return items;
+}
+
+const DEPTH_PERSONAS = new Set(['sheldon', 'konami', 'karen', 'press-f']);
+
+export function renderTaskQueue(queue: TaskQueueItem[], personaName?: string): string {
+  if (queue.length === 0) return '';
+  const isDepth = personaName ? DEPTH_PERSONAS.has(personaName) : false;
+  const lines: string[] = [`[YOUR TASK QUEUE — ${queue.length} remaining]`];
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i]!;
+    const prefix = i === 0 ? 'NEXT →' : `${i + 1}.`;
+    const target = item.targetId ? `${item.route} (${item.targetId})` : item.route;
+    lines.push(`  ${prefix} ${item.action} at ${target}`);
+    if (i >= 7) {
+      lines.push(`  ... +${queue.length - 8} more`);
+      break;
+    }
+  }
+  if (isDepth) {
+    lines.push('Navigate to the NEXT item. Test it THOROUGHLY — spend multiple turns if needed. Report findings. Move on when you are satisfied, not before.');
+  } else {
+    lines.push('Navigate to the NEXT item. Test it. Report findings. Move on. Do NOT skip items or wander.');
+  }
+  return lines.join('\n');
+}
+
+// ─── Stagnation Detection ────────────────────────────────────────────────────
+
+export function buildStagnationWarning(args: {
+  turnsCompleted: number;
+  findingsCount: number;
+  lastFindingTurn: number;
+  currentUrl: string | undefined;
+  turnsOnSameUrl: number;
+  personaName?: string;
+}): string {
+  const warnings: string[] = [];
+  const isDepth = args.personaName ? DEPTH_PERSONAS.has(args.personaName) : false;
+  const stuckThreshold = isDepth ? 6 : 3;
+
+  if (args.turnsOnSameUrl >= stuckThreshold && args.turnsCompleted > 5) {
+    warnings.push(
+      `⚠ STUCK: You have been on ${args.currentUrl ?? 'the same page'} for ${args.turnsOnSameUrl} turns. Navigate to a different page NOW.`,
+    );
+  }
+
+  const turnsSinceFinding = args.turnsCompleted - args.lastFindingTurn;
+  if (turnsSinceFinding >= 8 && args.turnsCompleted > 10) {
+    warnings.push(
+      `⚠ STAGNANT: ${turnsSinceFinding} turns since your last finding. Move to the next untested item in your task queue.`,
+    );
+  }
+
+  if (args.turnsCompleted >= 12 && args.findingsCount === 0) {
+    warnings.push(
+      '⚠ ZERO FINDINGS after 12 turns. You are not being productive. Change your approach completely.',
+    );
+  }
+
+  return warnings.length > 0 ? `[AUTOMATED PERFORMANCE WARNING]\n${warnings.join('\n')}` : '';
 }

@@ -46,6 +46,10 @@ export interface AgentRuntimeState {
   /** A message queued by the supervisor. The agent's chunk loop drains this
    * at chunk start and prepends it to the user prompt. */
   pendingNudge: string | null;
+  /** Total nudges received from supervisor. Used by the rebalancer to
+   *  force-terminate agents that ignore repeated nudges (3+ nudges with
+   *  0 findings → immediate kill, skip probation). */
+  nudgesReceived: number;
   /** Bounded ring buffer of recent backend HTTP statuses observed by the
    * browser server's network listener. Used to detect 4xx storms (WAF/rate-limit
    * /backend-down) and trigger per-agent backoff. */
@@ -85,6 +89,7 @@ export function registerAgent(agentId: string, profileName: string): void {
     recentTools: [],
     status: 'starting',
     pendingNudge: null,
+    nudgesReceived: 0,
     recentHttpStatuses: [],
     pauseUntil: null,
     probeDepth: 0,
@@ -173,6 +178,7 @@ export function pushNudge(agentId: string, message: string): boolean {
   const s = states.get(agentId);
   if (!s) return false;
   s.pendingNudge = message;
+  s.nudgesReceived += 1;
   return true;
 }
 
@@ -186,6 +192,12 @@ export function consumeNudge(agentId: string): string | null {
 }
 
 /** Snapshot ALL agents — used by the supervisor's `list_agents` tool. */
+export function getAgentState(agentId: string): AgentRuntimeState | undefined {
+  const s = states.get(agentId);
+  if (!s) return undefined;
+  return { ...s, recentTools: [...s.recentTools], recentHttpStatuses: [...s.recentHttpStatuses] };
+}
+
 export function snapshotAll(): AgentRuntimeState[] {
   return Array.from(states.values()).map((s) => ({
     ...s,
