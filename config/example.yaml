@@ -2,19 +2,29 @@
 #
 # This example targets a local Juice Shop instance — run it with:
 #
-#   docker run --rm -p 3000:3000 bkimminich/juice-shop
+#   docker run -d --restart unless-stopped -p 3050:3000 \
+#     --name juice-shop --entrypoint /nodejs/bin/node \
+#     bkimminich/juice-shop \
+#     -e "process.on('uncaughtException', e => console.error('[CAUGHT]', e.message)); require('/juice-shop/build/app.js')"
+#
 #   bun run scan config/example.yaml
 #
 # Output:   runs/<runId>/{findings.json, review.md, summary.md, journeys/}
 #
 # Why Juice Shop? It's deliberately broken in well-known ways, so a fresh
-# clone can verify the harness end-to-end. The seeded admin account
-# (admin@juice-sh.op / admin123) is the default — supply it in .env as
-# JUICE_SHOP_USER / JUICE_SHOP_PASS. Compare findings against
+# clone can verify the harness end-to-end. Compare findings against
 # http://localhost:3050/#/score-board.
 #
-# Sections in this file are roughly ordered: REQUIRED on top, then optional /
-# tunable. Commented-out blocks show defaults — uncomment to override.
+# ─── Philosophy ─────────────────────────────────────────────────────────
+#
+# Prefer `agents: auto` — the harness crawls the site, classifies the
+# surface, and picks personas + budgets automatically. Manual agent lists
+# are only needed when you want precise control over which personas run,
+# their models, or per-agent budget caps.
+
+# ═══════════════════════════════════════════════════════════════════════
+# TARGET — where to point the scan
+# ═══════════════════════════════════════════════════════════════════════
 
 target:
   url: http://localhost:3050/
@@ -25,161 +35,182 @@ target:
   allowed_hosts:
     - localhost:3050
 
+  # Path prefixes the crawler and agents must never visit. Matched against
+  # the URL pathname — "/users" blocks "/users", "/users/123", etc. Use
+  # this to wall off admin areas, user management, or anything that could
+  # wreck shared state during a scan.
+  # banned_path_prefixes:
+  #   - /admin/danger-zone
+
   auth:
     # 'form' = pre-run AI auth-agent (Haiku) navigates to the login URL,
     # dismisses banners, fills the form, and verifies success. The captured
     # storageState is then loaded by the crawler and every persona session.
     # 'none' = anonymous browsing only (no auth-agent runs).
     #
-    # The auth-agent reads the page semantically — it doesn't need brittle
-    # CSS selectors and handles GDPR banners, multi-step flows, and
-    # framework-specific button quirks (e.g. Angular Material's <a class
-    # ="cc-dismiss"> "Me want it!" cookie button on Juice Shop) without
-    # configuration. Just supply credentials.
+    # The auth-agent reads the page semantically — it handles GDPR banners,
+    # multi-step flows, and framework-specific quirks without configuration.
+    # Just supply credentials.
     type: form
     login_url: http://localhost:3050/#/login
 
-    # ─── Anonymous-only browsing (uncomment to revert) ───────────────────
-    # type: none
+    # Shared credentials for all agents (required for auto mode).
+    # Values live in .env — only env-var NAMES go here.
+    credentials:
+      username_env: JUICE_SHOP_USER
+      password_env: JUICE_SHOP_PASS
+
+    # CSS selectors are auto-detected for most login forms. Override only
+    # when the defaults don't work:
+    # username_selector: 'input[name="username"]'
+    # password_selector: 'input[type="password"]'
+    # submit_selector: 'button[type="submit"]'
+    # success_url_pattern: '^http://localhost:3050'
 
   # Default Playwright Chromium — Juice Shop has no bot-detection. Set true
   # for targets behind Cloudflare / DataDome / similar.
   stealth: false
 
+# ═══════════════════════════════════════════════════════════════════════
+# ANTHROPIC — LLM configuration
+# ═══════════════════════════════════════════════════════════════════════
+
 anthropic:
-  # Env var holding the API key (set in .env). The supervisor and post-run
-  # reviewer require the API key path; subscription auth is not supported.
+  # Env var holding the API key (set in .env). Required for the supervisor
+  # and post-run reviewer. When omitted or unset, explorer agents fall back
+  # to subscription auth via the local `claude` CLI.
   api_key_env: ANTHROPIC_API_KEY
 
-  # Default model for agents (overridable per-agent below).
+  # Default model for explorer agents (overridable per-agent or via
+  # agent_selection below).
   default_model: claude-haiku-4-5-20251001
 
-# Always-on supervisor agent — watches all explorers, calls relogin_session
-# on auth-walls, pause_agents on triangulated backend storms (≥2 agents
-# simultaneously seeing 5xx), nudge_agent on stuck agents.
+# ═══════════════════════════════════════════════════════════════════════
+# SUPERVISOR — watches explorers, handles auth-walls and stuck agents
+# ═══════════════════════════════════════════════════════════════════════
+
 supervisor:
   enabled: true
   model: claude-sonnet-4-6
-  max_minutes: 8
-  max_usd: 0.5
-  max_turns: 60
+  max_minutes: 30
+  max_usd: 3.00
+  max_turns: 400
 
-# Post-run reviewer — critic LLM classifies each finding (confirmed_bug /
-# likely_bug / duplicate / environmental / not_a_bug) and writes review.md.
-# critic-with-browser then re-checks confirmed/likely findings against the
-# live app, downgrading any that don't reproduce.
+# ═══════════════════════════════════════════════════════════════════════
+# REVIEW — post-run critic that classifies and verifies findings
+# ═══════════════════════════════════════════════════════════════════════
+
 review:
   enabled: true
   model: claude-sonnet-4-6
-  batch_mode: inline                # 'inline' | 'auto' | 'force_batch'
-  verify_with_browser: true
-  verify_concurrency: 3
+  batch_mode: inline          # 'inline' | 'auto' | 'force_batch'
+  verify_with_browser: true   # re-check findings against the live app
+  verify_concurrency: 4
+
+# ═══════════════════════════════════════════════════════════════════════
+# CRAWLER — pre-run site discovery
+# ═══════════════════════════════════════════════════════════════════════
 
 crawler:
-  parallelism: 3                    # concurrent tabs during pre-run crawl
+  parallelism: 4              # concurrent tabs during pre-run crawl
+  max_depth: 8                # BFS depth from root URL (default 2)
+  max_routes: 250             # cap on distinct routes visited
+  max_wall_clock_s: 180       # hard timeout in seconds
+
+# ═══════════════════════════════════════════════════════════════════════
+# CACHES & MEMORY
+# ═══════════════════════════════════════════════════════════════════════
 
 selector_cache:
-  enabled: true                     # persistent locator cache for find_and_click
-
-run:
-  max_budget_usd: 6.00              # informational cap; per-agent budgets enforce
-  output_dir: ./runs
+  enabled: true               # persistent locator cache for find_and_click
 
 memory:
-  # Anthropic Memory tool — currently disabled. Re-enable once the in-process
-  # client-side handler is wired (the SDK exposes the tool but we don't yet
-  # service the read/write/delete commands).
-  enabled: false
+  enabled: false              # per-target persistent memory across runs
 
-agents:
-  # Built-in profiles: house, the-spanner, leeroy-jenkins, the-magpie, caine,
-  # bobby-tables. Add your own under skills/personas/<slug>/. Each persona owns
-  # a distinct bug-detection lens — see skills/personas/<slug>/SKILL.md for
-  # the mandate.
-  #
-  # Per-agent fields:
-  #   model               override anthropic.default_model
-  #   max_thinking_tokens 0 = off (fastest); >=1024 = enabled (API floor).
-  #                       Sonnet attacker/completionist want 2000+.
-  #   planner_model       optional smarter model for one-shot plan calls
-  #                       between chunks; the cheap executor follows the plan
-  #   override_personality inline string to bypass the SKILL.md prose
-  #   credentials         env-var names (values stay in .env)
-  #   budget              per-agent caps (turns, USD, minutes)
+# ═══════════════════════════════════════════════════════════════════════
+# RUN — global budget and output
+# ═══════════════════════════════════════════════════════════════════════
 
-  # Default Juice Shop credentials — `admin@juice-sh.op:admin123` is the seeded
-  # admin from the demo fixtures. Add to your .env as JUICE_SHOP_USER and
-  # JUICE_SHOP_PASS. Every agent shares ONE login (session-pool dedups by
-  # credentials), so the actual Auth0/login form fills only once per run.
+run:
+  max_budget_usd: 18.00
+  output_dir: ./runs
 
-  - id: attacker
-    profile: bobby-tables
-    model: claude-sonnet-4-6
-    max_thinking_tokens: 2000
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 15
-      max_turns: 250
-      max_usd: 2.00
+# ═══════════════════════════════════════════════════════════════════════
+# AGENTS — auto mode (recommended)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# `agents: auto` lets the harness crawl the site, classify the attack
+# surface, and spawn the right mix of security + QA personas with
+# appropriate budgets. This is the recommended mode for most scans.
+#
+# Available personas (auto mode picks from these):
+#
+#   Security (attacker):
+#     mitnick        privileged insider (IDOR, privesc, JWT abuse)
+#     sudo           broken access control (IDOR, forced browsing)
+#     mystique       auth bypass (JWT manipulation, password reset abuse)
+#     johnny-five    injection (SQL, NoSQL, command, SSRF, path traversal)
+#     dilbert        security misconfiguration (defaults, headers, cookies)
+#     zero-cool      XSS (stored, reflected, DOM-based)
+#     bobby-tables   data integrity / request forgery (mass assignment, CSRF)
+#     clippy         recon — tech fingerprinting and security headers
+#     trust-me-bro   recon — path/file/API surface discovery
+#     rickroll       data exfiltration via injection and access control flaws
+#
+#   QA:
+#     sheldon        accessibility and semantic QA (ARIA, tab order, focus)
+#     mulder         save persistence (fill, save, reload, verify)
+#     pac-man        volume and duplicates (bulk create, pagination)
+#     leeroy-jenkins browser interruption (refresh mid-save, back button)
+#     karen          wrong-type input (postcodes in name fields)
+#     wreck-it-ralph layout breaker (long strings, emoji, special chars)
+#     copy-pasta     double-submit and idempotency
+#     press-f        stale state and deletion (back to deleted items)
+#     konami         hidden UI discovery (accordions, kebabs, hover menus)
+#     bonzi-buddy    empty form submission (required-field validation)
+#     marty-mcfly    workflow sequence breaker (skip steps, stale tabs)
+#     longcat        boundary values (min/max, negatives, extremes)
+#     all-your-base  routing and error handling (404s, bad params)
+#     there-is-no-spoon  happy-path smoke test (core journeys end-to-end)
 
-  - id: house
-    profile: house
-    model: claude-haiku-4-5-20251001
-    max_thinking_tokens: 1024
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 10
-      max_turns: 250
-      max_usd: 0.80
+agent_selection:
+  max_agents: 10              # cap on total personas spawned
+  security_slots: 2           # concurrent security agent slots
+  qa_slots: 2                 # concurrent QA agent slots
+  attacker_model: claude-sonnet-4-6
+  # qa_model:                 # defaults to anthropic.default_model
+  attacker_thinking_tokens: 2000
+  qa_thinking_tokens: 1024
 
-  - id: leeroy
-    profile: leeroy-jenkins
-    model: claude-haiku-4-5-20251001
-    max_thinking_tokens: 1024
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 10
-      max_turns: 250
-      max_usd: 0.60
+agents: auto
 
-  - id: spanner
-    profile: the-spanner
-    model: claude-haiku-4-5-20251001
-    max_thinking_tokens: 1024
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 10
-      max_turns: 200
-      max_usd: 0.60
-
-  - id: magpie
-    profile: the-magpie
-    model: claude-haiku-4-5-20251001
-    max_thinking_tokens: 1024
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 10
-      max_turns: 200
-      max_usd: 1.00
-
-  - id: caine
-    profile: caine
-    model: claude-haiku-4-5-20251001
-    max_thinking_tokens: 1024
-    credentials:
-      username_env: JUICE_SHOP_USER
-      password_env: JUICE_SHOP_PASS
-    budget:
-      max_minutes: 10
-      max_turns: 200
-      max_usd: 0.80
+# ═══════════════════════════════════════════════════════════════════════
+# AGENTS — manual mode (uncomment to override auto)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Replace `agents: auto` above with a list to hand-pick personas:
+#
+# agents:
+#   - id: attacker
+#     profile: mitnick
+#     model: claude-sonnet-4-6
+#     max_thinking_tokens: 2000
+#     credentials:
+#       username_env: JUICE_SHOP_USER
+#       password_env: JUICE_SHOP_PASS
+#     budget:
+#       max_minutes: 10
+#       max_turns: 250
+#       max_usd: 2.00
+#
+#   - id: smoke
+#     profile: there-is-no-spoon
+#     model: claude-haiku-4-5-20251001
+#     max_thinking_tokens: 1024
+#     credentials:
+#       username_env: JUICE_SHOP_USER
+#       password_env: JUICE_SHOP_PASS
+#     budget:
+#       max_minutes: 5
+#       max_turns: 250
+#       max_usd: 0.40

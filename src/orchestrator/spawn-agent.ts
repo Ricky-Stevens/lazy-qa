@@ -47,6 +47,7 @@ export interface SpawnAgentInput {
   runDir: string;
   targetUrl: string;
   allowedHosts: string[];
+  bannedPathPrefixes: string[];
   auth: AuthConfig;
   agent: ResolvedAgent;
   /** Resolved LLM backend for this run. api-mode uses the Anthropic SDK
@@ -120,6 +121,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     runDir,
     targetUrl,
     allowedHosts,
+    bannedPathPrefixes,
     auth,
     agent,
     backend,
@@ -274,6 +276,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     playbooks: playbookSkills,
     onAction: (patch) => updateOnAction(agent.id, patch),
     allowedHosts,
+    bannedPathPrefixes,
     events,
     selectorCache,
     sharedKnowledge: input.sharedKnowledge,

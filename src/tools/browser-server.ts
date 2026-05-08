@@ -31,7 +31,7 @@ import { serializeForAgent } from '../page-model/serialize.ts';
 import type { ConsoleEntry, NetworkAnomaly, PageModel } from '../page-model/types.ts';
 import type { PlaybookContext } from '../playbooks/framework.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
-import { isHostAllowed } from '../safety/guards.ts';
+import { isHostAllowed, isPathBanned } from '../safety/guards.ts';
 import { isLogoutLink } from '../safety/logout-guard.ts';
 import type { Skill } from '../skills/loader.ts';
 import type { SelectorCache } from './selector-cache.ts';
@@ -112,6 +112,8 @@ export interface BrowserServerInput {
    * Subresources (css, font, image, etc.) are always allowed so CDN-backed
    * staging portals continue to work. */
   allowedHosts?: string[];
+  /** Path prefixes the agent must never visit (e.g. "/users"). */
+  bannedPathPrefixes?: string[];
   /** Event writer for this run. Optional — emits navigate events. */
   events?: EventWriter;
   /** Persistent selector cache for find_and_click. Optional — undefined when
@@ -367,6 +369,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     playbooks,
     onAction,
     allowedHosts = [],
+    bannedPathPrefixes = [],
     events,
     selectorCache,
   } = input;
@@ -732,6 +735,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             reason: `${hostname} not in allowed_hosts`,
           });
           return textResult(`navigate refused: ${hostname} not in allowed_hosts`);
+        }
+        if (isPathBanned(url, bannedPathPrefixes)) {
+          return textResult(`navigate refused: path matches banned_path_prefixes — this area is off-limits for this scan`);
         }
         const page = ensureListeners();
         const fromUrl = page.url();

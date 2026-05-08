@@ -53,6 +53,8 @@ export interface CrawlOptions {
   maxWallClockMs: number;
   /** Allowed-host filter from config. */
   allowedHosts: string[];
+  /** Path prefixes to skip (e.g. "/users" blocks "/users/123"). */
+  bannedPathPrefixes?: string[];
   /** Path to auth-state.json for authenticated crawling. */
   storageStatePath?: string;
   /** Optional custom link extractor. Defaults to Crawlee's built-in. */

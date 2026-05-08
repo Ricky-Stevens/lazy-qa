@@ -172,6 +172,17 @@ export function isHostAllowed(url: string, allowedHosts: string[]): boolean {
   return false;
 }
 
+export function isPathBanned(url: string, bannedPrefixes: string[]): boolean {
+  if (bannedPrefixes.length === 0) return false;
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return false;
+  }
+  return bannedPrefixes.some((prefix) => pathname.startsWith(prefix));
+}
+
 export function createNetworkAllowlistRoute(allowedHosts: string[]) {
   const set = new Set(allowedHosts);
   return async (route: PlaywrightRoute) => {

@@ -152,6 +152,10 @@ export const TargetConfigSchema = z
     url: z.string().url(),
     // Allowed hosts agents can navigate to (prevents drift; wired to Playwright MCP --allowed-origins)
     allowed_hosts: z.array(z.string().min(1)).min(1),
+    // Path prefixes the crawler and agents must never visit. Useful for
+    // walling off admin/user-management areas that could wreck shared state.
+    // Matched against the URL pathname (e.g. "/users" blocks "/users/123").
+    banned_path_prefixes: z.array(z.string().min(1)).default([]),
     auth: AuthConfigSchema,
     /** Use CloakBrowser stealth Chromium binary instead of bundled Playwright Chromium.
      *  Recommended for portals behind Cloudflare/Akamai/PerimeterX bot-detection.

@@ -4,14 +4,16 @@
  * concurrency, and SPA navigation natively. We parse each visited page into
  * a PageModel and store it in the shared SiteMap.
  *
- * Link discovery is three-pronged:
+ * Link discovery is four-pronged:
  *  1. Crawlee's built-in `enqueueLinks()` — standard `<a href>` links.
- *  2. Our custom `extractLinks()` — Angular `[routerLink]`, `data-routerlink`,
- *     `ng-reflect-router-link`, and SPA hash-routes (`#/path`) that Crawlee
- *     doesn't understand.
- *  3. Angular bundle scanning — on the root page, we fetch `main*.js` and
- *     scan for compiled route definitions (`path:"admin"`) to discover routes
- *     that aren't linked from any visible DOM element.
+ *  2. Our custom `extractLinks()` — `[routerLink]`, `data-routerlink`,
+ *     `data-href`, and SPA hash-routes (`#/path`) that Crawlee misses.
+ *  3. Bundle scanning — on the root page, fetch JS bundles and scan for
+ *     compiled route definitions (`path:"admin"`). Works for Angular AOT,
+ *     React Router, Vue Router, and similar frameworks.
+ *  4. Interactive nav expansion — click collapsed sidebar/nav toggles
+ *     (`aria-expanded="false"`, `<details>`, tree items) and re-extract
+ *     links from the expanded DOM.
  *
  * Crawlee launches its own browser but inherits the auth session via
  * storageState from the auth-agent phase.
@@ -21,35 +23,31 @@ import { randomUUID } from 'node:crypto';
 import { PlaywrightCrawler, Configuration, type PlaywrightCrawlingContext, LogLevel, Log } from 'crawlee';
 import { chromium as playwrightChromium } from 'playwright';
 import { parsePage } from '../page-model/parser.ts';
+import { isPathBanned } from '../safety/guards.ts';
 import { extractLinks } from './extract-links.ts';
 import { buildRouteEntry, SiteMapImpl } from './sitemap.ts';
 import type { CrawlOptions, RouteEntry, SiteMap } from './types.ts';
 
 /**
- * Scan `<script>` tags on the current page for Angular compiled route
- * definitions. Angular's AOT compiler emits patterns like `path:"admin"` or
- * `path:'wallet'` in the main bundle. We extract those path segments and
- * return them as absolute hash-route URLs.
+ * Scan `<script>` tags on the current page for compiled route definitions.
+ * Works for Angular AOT (`path:"admin"`), React Router (`path:"/dashboard"`),
+ * Vue Router, and most SPA frameworks — they all compile route configs into
+ * `{path: "segment"}` object literals.
  *
- * This is a best-effort heuristic — it catches routes that aren't linked
- * from any visible element (e.g. admin panels, hidden features).
+ * Returns absolute URLs. Detects hash vs browser-history routing from the
+ * root URL: if the root uses `#/` or `#!/`, routes are emitted as hash
+ * routes; otherwise as pathname routes.
  */
-async function extractAngularBundleRoutes(
+async function extractBundleRoutes(
   page: import('playwright').Page,
   rootOrigin: string,
+  rootUrl: string,
 ): Promise<string[]> {
+  const usesHashRouting = /^#!?\//.test(new URL(rootUrl).hash);
+
   const paths: string[] = await page.evaluate(() => {
     const out: string[] = [];
-    // Match `path:"segment"` or `path:'segment'` in inline/loaded scripts.
-    // Angular AOT compiles route configs into the main bundle this way.
     const re = /path\s*:\s*["']([a-zA-Z0-9_\-\/]+)["']/g;
-    for (const script of document.querySelectorAll('script[src]')) {
-      // We can't read cross-origin script bodies from the DOM, but
-      // Angular bundles are same-origin. Try fetching them.
-      // Skip — fetching is async and complex inside evaluate. Instead,
-      // scan the performance entries for script URLs and handle outside.
-    }
-    // Scan inline scripts (some SPAs inline route config).
     for (const script of document.querySelectorAll('script:not([src])')) {
       const text = script.textContent ?? '';
       let m: RegExpExecArray | null;
@@ -61,13 +59,21 @@ async function extractAngularBundleRoutes(
     return out;
   });
 
-  // Also fetch external JS bundles and scan them. Angular's main.js
-  // contains the compiled route table.
+  // Fetch external JS bundles. Widen the filename filter beyond Angular's
+  // `main.js` to catch Vite (`index-*.js`, `assets/*.js`), webpack chunks,
+  // and explicit route modules.
   const scriptUrls: string[] = await page.evaluate(() =>
     Array.from(document.querySelectorAll('script[src]'))
       .map((s) => s.getAttribute('src'))
       .filter((s): s is string => !!s)
-      .filter((s) => /main[\.\-]/.test(s) || /app[\.\-]/.test(s) || /routes[\.\-]/.test(s)),
+      .filter(
+        (s) =>
+          /main[\.\-]/.test(s) ||
+          /app[\.\-]/.test(s) ||
+          /routes?[\.\-]/.test(s) ||
+          /index[\.\-]/.test(s) ||
+          /assets\//.test(s),
+      ),
   );
 
   for (const src of scriptUrls) {
@@ -98,9 +104,54 @@ async function extractAngularBundleRoutes(
     }
   }
 
-  // Deduplicate and convert to absolute hash-route URLs.
   const unique = [...new Set(paths)];
-  return unique.map((p) => `${rootOrigin}/#/${p}`);
+  if (usesHashRouting) {
+    return unique.map((p) => `${rootOrigin}/#/${p}`);
+  }
+  return unique.map((p) => {
+    const segment = p.startsWith('/') ? p : `/${p}`;
+    return `${rootOrigin}${segment}`;
+  });
+}
+
+/**
+ * Expand collapsed navigation elements and re-extract links. Targets
+ * common SPA sidebar patterns: aria-expanded toggles, <details>/<summary>,
+ * tree items. Only clicks within navigation-scoped containers (nav, aside,
+ * sidebar-like classnames) to avoid triggering page-level actions.
+ */
+async function expandNavAndExtractLinks(
+  page: import('playwright').Page,
+): Promise<string[]> {
+  const EXPAND_SELECTORS = [
+    'nav button[aria-expanded="false"]',
+    'aside button[aria-expanded="false"]',
+    '[class*="sidebar" i] button[aria-expanded="false"]',
+    '[class*="sidenav" i] button[aria-expanded="false"]',
+    '[class*="nav-menu" i] button[aria-expanded="false"]',
+    '[role="tree"] [role="treeitem"][aria-expanded="false"]',
+    'nav details:not([open]) > summary',
+    'aside details:not([open]) > summary',
+  ];
+
+  let clickedAny = false;
+  for (const sel of EXPAND_SELECTORS) {
+    const elements = await page.$$(sel);
+    for (const el of elements) {
+      try {
+        await el.click({ timeout: 300 });
+        clickedAny = true;
+      } catch {
+        // Non-fatal — element may be obscured or detached.
+      }
+    }
+  }
+
+  if (!clickedAny) return [];
+
+  // Let expanded sections animate and render.
+  await page.waitForTimeout(400);
+  return extractLinks(page);
 }
 
 /** Derive a canonical route key from a URL.
@@ -154,6 +205,7 @@ function isAllowedHost(url: string, allowedHosts: string[]): boolean {
 export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
   const startedAt = Date.now();
   const { rootUrl } = opts;
+  const bannedPrefixes = opts.bannedPathPrefixes ?? [];
   const siteMap = new SiteMapImpl({ rootUrl });
   const seen = new Set<string>();
   let visitedCount = 0;
@@ -199,16 +251,30 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
       maxRequestRetries: 0,
       log: new Log({ level: LogLevel.OFF }),
 
+      // Desktop viewport before each navigation so responsive sidebars
+      // (Tailwind `lg:block`, Material `md:`) aren't hidden. Many admin
+      // portals collapse their nav below 1024px.
+      preNavigationHooks: [
+        async ({ page }) => {
+          await page.setViewportSize({ width: 1280, height: 900 });
+        },
+      ],
+
       async requestHandler({ request, page: crawleePage, enqueueLinks, log, crawler: crawlerRef }: PlaywrightCrawlingContext) {
         const url = request.loadedUrl ?? request.url;
         const route = deriveRoute(url);
 
         if (!isAllowedHost(url, opts.allowedHosts)) return;
+        if (isPathBanned(url, bannedPrefixes)) return;
 
-        // Check if we got redirected off-host.
+        // Check if we got redirected off-host or onto a banned path.
         const finalUrl = crawleePage.url();
         if (finalUrl !== 'about:blank' && !isAllowedHost(finalUrl, opts.allowedHosts)) {
           opts.logger.debug('crawl.offHostRedirect', { url, finalUrl });
+          return;
+        }
+        if (finalUrl !== 'about:blank' && isPathBanned(finalUrl, bannedPrefixes)) {
+          opts.logger.debug('crawl.bannedPathRedirect', { url, finalUrl });
           return;
         }
 
@@ -224,8 +290,16 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
           kind: 'http',
         });
 
-        // Wait briefly for SPA hydration.
-        await crawleePage.waitForTimeout(800);
+        // Wait for SPA hydration: network idle means API calls have resolved
+        // and the framework has data to render navigation. Fixed 800ms was too
+        // short for React apps that fetch session/profile before rendering nav.
+        try {
+          await crawleePage.waitForLoadState('networkidle', { timeout: 5000 });
+        } catch {
+          // Some pages never reach networkidle (WebSocket keep-alives, polling).
+        }
+        // Brief buffer for React's async setState re-render after data arrives.
+        await crawleePage.waitForTimeout(300);
 
         let model: Awaited<ReturnType<typeof parsePage>>;
         try {
@@ -295,6 +369,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
             strategy: 'same-hostname',
             transformRequestFunction: (req) => {
               if (!isAllowedHost(req.url, opts.allowedHosts)) return false;
+              if (isPathBanned(req.url, bannedPrefixes)) return false;
               if (visitedCount >= opts.maxRoutes) return false;
               const reqRoute = deriveRoute(req.url);
               if (seen.has(reqRoute)) return false;
@@ -317,6 +392,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
           const toEnqueue: Array<{ url: string; uniqueKey: string }> = [];
           for (const link of customLinks) {
             if (!isAllowedHost(link, opts.allowedHosts)) continue;
+            if (isPathBanned(link, bannedPrefixes)) continue;
             if (visitedCount + toEnqueue.length >= opts.maxRoutes) break;
             const linkRoute = deriveRoute(link);
             if (seen.has(linkRoute)) continue;
@@ -339,10 +415,11 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
         if (request.url === rootUrl) {
           try {
             const origin = new URL(rootUrl).origin;
-            const bundleRoutes = await extractAngularBundleRoutes(crawleePage, origin);
+            const bundleRoutes = await extractBundleRoutes(crawleePage, origin, rootUrl);
             const toEnqueue: Array<{ url: string; uniqueKey: string }> = [];
             for (const link of bundleRoutes) {
               if (!isAllowedHost(link, opts.allowedHosts)) continue;
+            if (isPathBanned(link, bannedPrefixes)) continue;
               if (visitedCount + toEnqueue.length >= opts.maxRoutes) break;
               const linkRoute = deriveRoute(link);
               if (seen.has(linkRoute)) continue;
@@ -357,6 +434,31 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
           } catch {
             // Bundle scanning failure is non-fatal.
           }
+        }
+
+        // 4. Expand collapsed nav/sidebar sections and re-extract links.
+        //    Targets aria-expanded toggles, <details>/<summary>, and tree
+        //    items inside nav/aside/sidebar containers.
+        try {
+          const expandedLinks = await expandNavAndExtractLinks(crawleePage);
+          const toEnqueue: Array<{ url: string; uniqueKey: string }> = [];
+          for (const link of expandedLinks) {
+            if (!isAllowedHost(link, opts.allowedHosts)) continue;
+            if (isPathBanned(link, bannedPrefixes)) continue;
+            if (visitedCount + toEnqueue.length >= opts.maxRoutes) break;
+            const linkRoute = deriveRoute(link);
+            if (seen.has(linkRoute)) continue;
+            toEnqueue.push({ url: link, uniqueKey: link });
+          }
+          if (toEnqueue.length > 0) {
+            await crawlerRef.addRequests(toEnqueue);
+            opts.logger.debug('crawl.expandedNavLinksEnqueued', {
+              count: toEnqueue.length,
+              source: url,
+            });
+          }
+        } catch {
+          // Nav expansion failure is non-fatal.
         }
       },
 
