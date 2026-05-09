@@ -20,10 +20,17 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { PlaywrightCrawler, Configuration, type PlaywrightCrawlingContext, LogLevel, Log } from 'crawlee';
+import {
+  Configuration,
+  Log,
+  LogLevel,
+  PlaywrightCrawler,
+  type PlaywrightCrawlingContext,
+} from 'crawlee';
 import { chromium as playwrightChromium } from 'playwright';
 import { parsePage } from '../page-model/parser.ts';
 import { isPathBanned } from '../safety/guards.ts';
+import { deriveRoute } from '../util/route.ts';
 import { extractLinks } from './extract-links.ts';
 import { buildRouteEntry, SiteMapImpl } from './sitemap.ts';
 import type { CrawlOptions, RouteEntry, SiteMap } from './types.ts';
@@ -47,7 +54,7 @@ async function extractBundleRoutes(
 
   const paths: string[] = await page.evaluate(() => {
     const out: string[] = [];
-    const re = /path\s*:\s*["']([a-zA-Z0-9_\-\/]+)["']/g;
+    const re = /path\s*:\s*["']([a-zA-Z0-9_\-/]+)["']/g;
     for (const script of document.querySelectorAll('script:not([src])')) {
       const text = script.textContent ?? '';
       let m: RegExpExecArray | null;
@@ -68,10 +75,10 @@ async function extractBundleRoutes(
       .filter((s): s is string => !!s)
       .filter(
         (s) =>
-          /main[\.\-]/.test(s) ||
-          /app[\.\-]/.test(s) ||
-          /routes?[\.\-]/.test(s) ||
-          /index[\.\-]/.test(s) ||
+          /main[.-]/.test(s) ||
+          /app[.-]/.test(s) ||
+          /routes?[.-]/.test(s) ||
+          /index[.-]/.test(s) ||
           /assets\//.test(s),
       ),
   );
@@ -79,20 +86,17 @@ async function extractBundleRoutes(
   for (const src of scriptUrls) {
     try {
       const abs = new URL(src, rootOrigin).toString();
-      const resp = await page.evaluate(
-        async (url: string) => {
-          try {
-            const r = await fetch(url);
-            if (!r.ok) return '';
-            return await r.text();
-          } catch {
-            return '';
-          }
-        },
-        abs,
-      );
+      const resp = await page.evaluate(async (url: string) => {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) return '';
+          return await r.text();
+        } catch {
+          return '';
+        }
+      }, abs);
       if (resp) {
-        const re = /path\s*:\s*["']([a-zA-Z0-9_\-\/]+)["']/g;
+        const re = /path\s*:\s*["']([a-zA-Z0-9_\-/]+)["']/g;
         let m: RegExpExecArray | null;
         while ((m = re.exec(resp)) !== null) {
           const seg = m[1];
@@ -120,9 +124,7 @@ async function extractBundleRoutes(
  * tree items. Only clicks within navigation-scoped containers (nav, aside,
  * sidebar-like classnames) to avoid triggering page-level actions.
  */
-async function expandNavAndExtractLinks(
-  page: import('playwright').Page,
-): Promise<string[]> {
+async function expandNavAndExtractLinks(page: import('playwright').Page): Promise<string[]> {
   const EXPAND_SELECTORS = [
     'nav button[aria-expanded="false"]',
     'aside button[aria-expanded="false"]',
@@ -164,19 +166,7 @@ async function expandNavAndExtractLinks(
  * When a SPA hash-route is present, we collapse the pathname to `/` so
  * the route key is determined by the hash alone. Query strings are
  * stripped — they don't typically denote distinct routes. Returns the raw
- * string on parse failure. */
-function deriveRoute(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const isSpaHash = /^#!?\//.test(u.hash);
-    if (isSpaHash) {
-      return `${u.origin}/${u.hash}`;
-    }
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return rawUrl;
-  }
-}
+ * string on parse failure — see `src/util/route.ts`. */
 
 function isAllowedHost(url: string, allowedHosts: string[]): boolean {
   if (allowedHosts.length === 0) return true;
@@ -221,9 +211,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
           args: ['--disable-dev-shm-usage', '--disable-gpu'],
         },
         // Inject the auth session from the auth-agent phase.
-        ...(opts.storageStatePath
-          ? { useIncognitoPages: false, userDataDir: undefined }
-          : {}),
+        ...(opts.storageStatePath ? { useIncognitoPages: false, userDataDir: undefined } : {}),
       },
       browserPoolOptions: {
         postLaunchHooks: [
@@ -260,7 +248,13 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
         },
       ],
 
-      async requestHandler({ request, page: crawleePage, enqueueLinks, log, crawler: crawlerRef }: PlaywrightCrawlingContext) {
+      async requestHandler({
+        request,
+        page: crawleePage,
+        enqueueLinks,
+        log,
+        crawler: crawlerRef,
+      }: PlaywrightCrawlingContext) {
         const url = request.loadedUrl ?? request.url;
         const route = deriveRoute(url);
 
@@ -322,10 +316,23 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
             visited: false,
           });
           siteMap.upsertRoute(stub, {
-            url, route, title: '', forms: [], tables: [], modals: [],
-            wizards: [], toolbars: [], navLinks: [], bareInteractives: [],
-            bareFields: [], discovered: [], network: [], console: [],
-            textHash: '', looksBroken: true, interactiveCount: 0,
+            url,
+            route,
+            title: '',
+            forms: [],
+            tables: [],
+            modals: [],
+            wizards: [],
+            toolbars: [],
+            navLinks: [],
+            bareInteractives: [],
+            bareFields: [],
+            discovered: [],
+            network: [],
+            console: [],
+            textHash: '',
+            looksBroken: true,
+            interactiveCount: 0,
             capturedAt: new Date().toISOString(),
           });
           await opts.events?.write({
@@ -419,7 +426,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
             const toEnqueue: Array<{ url: string; uniqueKey: string }> = [];
             for (const link of bundleRoutes) {
               if (!isAllowedHost(link, opts.allowedHosts)) continue;
-            if (isPathBanned(link, bannedPrefixes)) continue;
+              if (isPathBanned(link, bannedPrefixes)) continue;
               if (visitedCount + toEnqueue.length >= opts.maxRoutes) break;
               const linkRoute = deriveRoute(link);
               if (seen.has(linkRoute)) continue;
@@ -480,10 +487,23 @@ export async function crawlSite(opts: CrawlOptions): Promise<SiteMap> {
           visited: false,
         });
         siteMap.upsertRoute(stub, {
-          url, route, title: '', forms: [], tables: [], modals: [],
-          wizards: [], toolbars: [], navLinks: [], bareInteractives: [],
-          bareFields: [], discovered: [], network: [], console: [],
-          textHash: '', looksBroken: true, interactiveCount: 0,
+          url,
+          route,
+          title: '',
+          forms: [],
+          tables: [],
+          modals: [],
+          wizards: [],
+          toolbars: [],
+          navLinks: [],
+          bareInteractives: [],
+          bareFields: [],
+          discovered: [],
+          network: [],
+          console: [],
+          textHash: '',
+          looksBroken: true,
+          interactiveCount: 0,
           capturedAt: new Date().toISOString(),
         });
 

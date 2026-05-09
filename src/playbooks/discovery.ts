@@ -113,7 +113,7 @@ export const askSitemap: Playbook<AskSitemapInput> = {
           break;
         }
         case 'unexercised wizards': {
-          items = ctx.siteMap.listWizardsUntested('wizard_full_walkthrough').slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listWizardsUntested('walk_wizard').slice(0, MAX_ITEMS);
           break;
         }
         case '4xx routes': {

@@ -16,7 +16,9 @@ function makeLogger() {
   } as never;
 }
 
-function makeSitemap(routes: Array<{ url: string; title?: string; forms?: string[]; tables?: string[] }>): SiteMap {
+function makeSitemap(
+  routes: Array<{ url: string; title?: string; forms?: string[]; tables?: string[] }>,
+): SiteMap {
   const sm: SiteMap = {
     rootUrl: 'http://localhost:3050',
     startedAt: new Date().toISOString(),
@@ -43,7 +45,12 @@ function makeSitemap(routes: Array<{ url: string; title?: string; forms?: string
       route,
       title: r.title ?? '',
       primaryHeading: '',
-      forms: (r.forms ?? []).map((id) => ({ id, name: id, fields: [], submitTarget: null })) as never,
+      forms: (r.forms ?? []).map((id) => ({
+        id,
+        name: id,
+        fields: [],
+        submitTarget: null,
+      })) as never,
       tables: (r.tables ?? []).map((id) => ({ id, name: id, columns: [], rowCount: 0 })) as never,
       modals: [],
       wizards: [],
@@ -127,7 +134,12 @@ describe('classifySite', () => {
     const result = classifySite({
       rootUrl: 'http://localhost:3050',
       sitemap: makeSitemap([
-        { url: 'http://localhost:3050/', title: 'Home', forms: ['login-form', 'search-form'], tables: ['products'] },
+        {
+          url: 'http://localhost:3050/',
+          title: 'Home',
+          forms: ['login-form', 'search-form'],
+          tables: ['products'],
+        },
       ]),
       logger: makeLogger(),
     });

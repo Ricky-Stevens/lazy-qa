@@ -167,6 +167,10 @@ describe('auditHeaders (internal)', () => {
         'x-content-type-options': 'nosniff',
         'referrer-policy': 'no-referrer',
         'content-security-policy': "default-src 'self'",
+        'permissions-policy': 'camera=()',
+        'cross-origin-opener-policy': 'same-origin',
+        'cross-origin-embedder-policy': 'require-corp',
+        'cross-origin-resource-policy': 'same-origin',
       },
       false,
     );

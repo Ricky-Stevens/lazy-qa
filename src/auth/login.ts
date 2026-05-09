@@ -123,7 +123,9 @@ export async function launchBrowser(
     // stable under multi-tab load on WSL2. Falls back to the bundled
     // binary for systems without Chrome stable (CI, containers, etc.).
     return playwrightChromium.launch({ ...mergedOptions, channel: 'chrome' }).catch(() => {
-      process.stderr.write('[playwright] Chrome stable unavailable, falling back to bundled Chromium\n');
+      process.stderr.write(
+        '[playwright] Chrome stable unavailable, falling back to bundled Chromium\n',
+      );
       return playwrightChromium.launch(mergedOptions);
     });
   }

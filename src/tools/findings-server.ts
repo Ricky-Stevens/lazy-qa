@@ -30,6 +30,10 @@ const FINDINGS_RATE_WINDOW_MS = 60_000;
 const CTF_NOISE_RE =
   /\bchallenge\b.{0,40}\b(solved|triggered|completed|unlocked|cleared)\b|\b(solved|triggered|completed|unlocked|cleared)\b.{0,40}\bchallenge\b/i;
 
+const AUTH_PROVIDER_RE = /\b(auth0|okta|cognito|azure\s*ad|microsoft.*login|accounts\.google)\b/i;
+const AUTH_PROVIDER_400_RE =
+  /\b(400|bad\s*request)\b.*\b(auth0|okta|cognito|login\s*page|auth\s*provider)\b|\b(auth0|okta|cognito)\b.*\b(400|bad\s*request|cannot\s*be\s*accessed|blocks?\s*form)\b/i;
+
 export interface HarnessServerInput {
   journey: Journey;
   logger: Logger;
@@ -86,7 +90,7 @@ export function createHarnessMcpServer(
     tools: [
       defTool(
         'report_finding',
-        'Report a suspected bug, regression, or unexpected behaviour. Call this whenever you see something weird — human triagers filter. Be specific and concrete. ONE finding per occurrence — never aggregate ("multiple routes have 404s" is wrong; file each route as its own finding). The route field MUST be the specific URL where the issue happened. After filing, KEEP USING THE APP — a finding is never a reason to stop.',
+        'Report a suspected bug, regression, or unexpected behaviour. Before filing, verify: (1) You observed this directly, not inferred it. (2) It is NOT a normal state — empty pages, loading spinners, and "no data" screens are not bugs. (3) Auth-provider login pages (Auth0, Okta, etc.) returning 400 when accessed directly is expected OAuth behaviour, NOT a bug. (4) You have not already filed this same issue. Be specific and concrete. ONE finding per occurrence — never aggregate. The route field MUST be the specific URL where the issue happened. After filing, KEEP USING THE APP — a finding is never a reason to stop.',
         {
           severity: z
             .enum(['critical', 'major', 'minor', 'cosmetic'])
@@ -176,6 +180,22 @@ export function createHarnessMcpServer(
               ],
             };
           }
+          const combined = `${args.title} ${args.description}`;
+          if (AUTH_PROVIDER_RE.test(args.route ?? '') && AUTH_PROVIDER_400_RE.test(combined)) {
+            logger.info('finding.auth-provider-noise.dropped', {
+              agentId: journey.agentId,
+              title: args.title,
+              route: args.route,
+            });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `NOT A BUG: Auth provider login pages (Auth0, Okta, Cognito, etc.) return 400/error when accessed directly without proper OAuth state/nonce parameters. This is expected OAuth/OIDC behaviour, not a defect in the application. Do NOT file findings about auth provider pages being inaccessible or returning errors. Focus on testing the actual application.`,
+                },
+              ],
+            };
+          }
           const finding: Finding = {
             id: randomUUID(),
             ts: new Date().toISOString(),
@@ -189,6 +209,7 @@ export function createHarnessMcpServer(
             route: args.route,
             confidence: args.confidence,
             source: 'agent',
+            agentId: journey.agentId,
           };
           // Within-agent dedup. Catches the "same bug, three different titles"
           // pattern that cost ~9 redundant findings per attacker run. A match
@@ -212,10 +233,40 @@ export function createHarnessMcpServer(
               ],
             };
           }
+          const fpMatch = findingCache?.matchesFalsePositive(finding);
+          if (fpMatch) {
+            logger.info('finding.false-positive-suppressed', {
+              agentId: journey.agentId,
+              title: args.title,
+              reason: fpMatch.reason,
+            });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `NOT A BUG — this matches a known false-positive pattern from a prior run: "${fpMatch.reason}". Do not re-file. Move on to testing something else.`,
+                },
+              ],
+            };
+          }
           if (args.reproduction_actions && args.reproduction_actions.length > 0) {
             finding.reproductionActions = args.reproduction_actions;
           }
-          if (args.attach_screenshot === true) {
+          // Auto-capture the current page URL as evidence.
+          if (getPage) {
+            try {
+              finding.filedAtUrl = getPage().url();
+            } catch {
+              // Page may be closed or navigating — non-fatal.
+            }
+          }
+          // Auto-capture screenshot for critical/major findings, or when
+          // the agent explicitly requests one.
+          const shouldScreenshot =
+            args.attach_screenshot === true ||
+            args.severity === 'critical' ||
+            args.severity === 'major';
+          if (shouldScreenshot) {
             if (getPage && runDir) {
               try {
                 const page = getPage();
@@ -227,7 +278,9 @@ export function createHarnessMcpServer(
                   error: err instanceof Error ? err.message : String(err),
                 });
               }
-            } else {
+            } else if (args.attach_screenshot === true) {
+              // Only warn when the agent explicitly asked — silent skip for
+              // auto-capture avoids noise when getPage/runDir aren't wired.
               logger.warn('finding.screenshot.unavailable', {
                 agentId: journey.agentId,
                 findingId: finding.id,

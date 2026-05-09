@@ -252,6 +252,9 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
     abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
+  // Pre-compute the persona tagline — the personality text is static per-agent.
+  const personaTagline = extractPersonaTagline(agent.personality);
+
   let lastFindingTurn = 0;
   let previousFindingsCount = 0;
   let turnsOnSameUrl = 0;
@@ -367,7 +370,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         sessionInfo: input.sessionInfo,
         fuzzedFormIds,
         isAttacker,
-        personaTagline: extractPersonaTagline(agent.personality),
+        personaTagline,
         personaName: agent.profileName,
         currentUrl: currentAgentUrl,
         turnsOnSameUrl,
@@ -418,192 +421,196 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-  const seenAssistantIds = new Set<string>();
-  try {
-    for await (const message of query({
-      prompt: prompts(),
-      options: {
-        model: agent.model,
-        systemPrompt: input.systemPrompt,
-        maxTurns: Math.max(1, agent.budget.max_turns - journey.turns),
-        pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
-        // Persona's tool surface is exactly the three MCP servers below.
-        // Disable the SDK's built-in Claude Code tools (Bash/Read/Edit/etc.)
-        // — they would give the agent unrestricted host access — and don't
-        // load user/project CLAUDE.md into the agent's system prompt.
-        tools: [],
-        settingSources: [],
-        permissionMode: 'dontAsk',
-        mcpServers: {
-          [HARNESS_SERVER_NAME]: harnessServer,
-          [BROWSER_SERVER_NAME]: browserServer,
-          [PLAYBOOKS_SERVER_NAME]: playbooksServer,
+    const seenAssistantIds = new Set<string>();
+    try {
+      for await (const message of query({
+        prompt: prompts(),
+        options: {
+          model: agent.model,
+          systemPrompt: input.systemPrompt,
+          maxTurns: Math.max(1, agent.budget.max_turns - journey.turns),
+          pathToClaudeCodeExecutable: resolveClaudeBinaryPath(),
+          // Persona's tool surface is exactly the three MCP servers below.
+          // Disable the SDK's built-in Claude Code tools (Bash/Read/Edit/etc.)
+          // — they would give the agent unrestricted host access — and don't
+          // load user/project CLAUDE.md into the agent's system prompt.
+          tools: [],
+          settingSources: [],
+          permissionMode: 'dontAsk',
+          mcpServers: {
+            [HARNESS_SERVER_NAME]: harnessServer,
+            [BROWSER_SERVER_NAME]: browserServer,
+            [PLAYBOOKS_SERVER_NAME]: playbooksServer,
+          },
+          allowedTools,
+          abortController: controller,
+          stderr: (data: string) => {
+            if (data.trim())
+              logger.debug('loop-sdk.stderr', {
+                agentId: agent.id,
+                data: data.trim().slice(0, 500),
+              });
+          },
+          ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
+            ? { maxThinkingTokens: agent.maxThinkingTokens }
+            : {}),
         },
-        allowedTools,
-        abortController: controller,
-        stderr: (data: string) => {
-          if (data.trim()) logger.debug('loop-sdk.stderr', { agentId: agent.id, data: data.trim().slice(0, 500) });
-        },
-        ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
-          ? { maxThinkingTokens: agent.maxThinkingTokens }
-          : {}),
-      },
-    })) {
-      if (message.type === 'assistant') {
-        // `message` narrows to SDKAssistantMessage; `message.message` is the
-        // BetaMessage with content/stop_reason/usage. Use `as` to widen the
-        // optional usage fields the SDK types declare as required-numbers (the
-        // SDK can omit them mid-stream for partial messages).
-        const m = message.message as {
-          id?: string;
-          content: Array<{ type: string; text?: string; name?: string }>;
-          stop_reason?: string | null;
-          usage?: {
-            input_tokens?: number;
-            output_tokens?: number;
-            cache_read_input_tokens?: number;
-            cache_creation_input_tokens?: number;
+      })) {
+        if (message.type === 'assistant') {
+          // `message` narrows to SDKAssistantMessage; `message.message` is the
+          // BetaMessage with content/stop_reason/usage. Use `as` to widen the
+          // optional usage fields the SDK types declare as required-numbers (the
+          // SDK can omit them mid-stream for partial messages).
+          const m = message.message as {
+            id?: string;
+            content: Array<{ type: string; text?: string; name?: string }>;
+            stop_reason?: string | null;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+            };
           };
-        };
 
-        // Dedup before any state updates. Do NOT release the gate on a
-        // duplicate — the first emission already released it and woke the
-        // generator, which armed a NEW gate for the next turn. Releasing
-        // again here would unblock that next gate prematurely, causing the
-        // generator to yield an extra user message we never asked for.
-        if (m.id && seenAssistantIds.has(m.id)) {
-          continue;
-        }
-        if (m.id) seenAssistantIds.add(m.id);
-
-        const turnUsage = m.usage
-          ? {
-              input: m.usage.input_tokens ?? 0,
-              output: m.usage.output_tokens ?? 0,
-              cacheRead: m.usage.cache_read_input_tokens ?? 0,
-              cacheWrite: m.usage.cache_creation_input_tokens ?? 0,
-            }
-          : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        if (m.usage) {
-          journey.tokenUsage.input += turnUsage.input;
-          journey.tokenUsage.output += turnUsage.output;
-          journey.tokenUsage.cacheRead += turnUsage.cacheRead;
-          journey.tokenUsage.cacheWrite += turnUsage.cacheWrite;
-        }
-        let costUsdDelta = 0;
-        try {
-          costUsdDelta = computeCostUsd(agent.model, turnUsage);
-          journey.costUsd += costUsdDelta;
-        } catch {
-          // Unknown model — token totals only; cost stays at 0 delta.
-        }
-        journey.turns += 1;
-        updateOnTurn(agent.id, {
-          turnsCompleted: journey.turns,
-          findingsCount: journey.findings.length,
-        });
-
-        // agent.turn.end pairs with the agent.turn.start emitted from the
-        // generator before the SDK consumed our user message.
-        await events?.write({
-          type: 'agent.turn.end',
-          agentId: agent.id,
-          turn: journey.turns,
-          tokenUsage: turnUsage,
-          costUsdDelta,
-          stopReason: m.stop_reason ?? 'unknown',
-        });
-
-        // Unblock the prompts() generator so it can yield the next turn.
-        releaseTurnGate();
-      }
-
-      if (message.type === 'result') {
-        if (!journey.terminationReason) {
-          if (controller.signal.aborted) {
-            journey.terminationReason = 'signal';
-          } else if (journey.turns >= agent.budget.max_turns) {
-            journey.terminationReason = 'max-turns';
-          } else if (journey.costUsd >= agent.budget.max_usd) {
-            journey.terminationReason = 'budget-hit';
-          } else {
-            // The model stopped calling tools (end_turn). In API mode, the
-            // loop just sends another user message. In SDK mode, the query()
-            // terminates. Mark as sdk-end; the outer retry loop below will
-            // re-launch if budget remains.
-            journey.terminationReason = 'sdk-end';
+          // Dedup before any state updates. Do NOT release the gate on a
+          // duplicate — the first emission already released it and woke the
+          // generator, which armed a NEW gate for the next turn. Releasing
+          // again here would unblock that next gate prematurely, causing the
+          // generator to yield an extra user message we never asked for.
+          if (m.id && seenAssistantIds.has(m.id)) {
+            continue;
           }
+          if (m.id) seenAssistantIds.add(m.id);
+
+          const turnUsage = m.usage
+            ? {
+                input: m.usage.input_tokens ?? 0,
+                output: m.usage.output_tokens ?? 0,
+                cacheRead: m.usage.cache_read_input_tokens ?? 0,
+                cacheWrite: m.usage.cache_creation_input_tokens ?? 0,
+              }
+            : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+          if (m.usage) {
+            journey.tokenUsage.input += turnUsage.input;
+            journey.tokenUsage.output += turnUsage.output;
+            journey.tokenUsage.cacheRead += turnUsage.cacheRead;
+            journey.tokenUsage.cacheWrite += turnUsage.cacheWrite;
+          }
+          let costUsdDelta = 0;
+          try {
+            costUsdDelta = computeCostUsd(agent.model, turnUsage);
+            journey.costUsd += costUsdDelta;
+          } catch {
+            // Unknown model — token totals only; cost stays at 0 delta.
+          }
+          journey.turns += 1;
+          updateOnTurn(agent.id, {
+            turnsCompleted: journey.turns,
+            findingsCount: journey.findings.length,
+          });
+
+          // agent.turn.end pairs with the agent.turn.start emitted from the
+          // generator before the SDK consumed our user message.
+          await events?.write({
+            type: 'agent.turn.end',
+            agentId: agent.id,
+            turn: journey.turns,
+            tokenUsage: turnUsage,
+            costUsdDelta,
+            stopReason: m.stop_reason ?? 'unknown',
+          });
+
+          // Unblock the prompts() generator so it can yield the next turn.
+          releaseTurnGate();
         }
-        releaseTurnGate();
+
+        if (message.type === 'result') {
+          if (!journey.terminationReason) {
+            if (controller.signal.aborted) {
+              journey.terminationReason = 'signal';
+            } else if (journey.turns >= agent.budget.max_turns) {
+              journey.terminationReason = 'max-turns';
+            } else if (journey.costUsd >= agent.budget.max_usd) {
+              journey.terminationReason = 'budget-hit';
+            } else {
+              // The model stopped calling tools (end_turn). In API mode, the
+              // loop just sends another user message. In SDK mode, the query()
+              // terminates. Mark as sdk-end; the outer retry loop below will
+              // re-launch if budget remains.
+              journey.terminationReason = 'sdk-end';
+            }
+          }
+          releaseTurnGate();
+        }
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (controller.signal.aborted || abortSignal.aborted) {
+        journey.terminationReason = 'signal';
+      } else if (/Reached maximum number of turns/i.test(errMsg)) {
+        // The SDK throws a "Claude Code returned an error result" with this
+        // exact message when its --max-turns cap fires. That's the configured
+        // budget terminating cleanly, not an actual failure — classify as
+        // max-turns so the run summary is accurate.
+        journey.terminationReason = 'max-turns';
+      } else {
+        journey.terminationReason = 'error';
+        logger.error('loop-sdk.error', { error: errMsg });
+      }
+      // Defensive: if the consumer loop threw mid-turn the gate may still be
+      // armed and prompts() would deadlock awaiting it. Release so the generator
+      // can observe terminationReason and exit cleanly during cleanup.
+      releaseTurnGate();
+    } finally {
+      releaseTurnGate();
+    }
+
+    if (!journey.terminationReason) {
+      if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+        journey.terminationReason = 'error';
+        logger.error('loop-sdk.subprocess-unresponsive', {
+          agentId: agent.id,
+          consecutiveTimeouts,
+          turnsCompleted: journey.turns,
+        });
+      } else if (controller.signal.aborted || abortSignal.aborted) {
+        journey.terminationReason = 'signal';
+      } else if (journey.turns >= agent.budget.max_turns) {
+        journey.terminationReason = 'max-turns';
+      } else if (journey.costUsd >= agent.budget.max_usd) {
+        journey.terminationReason = 'budget-hit';
+      } else {
+        journey.terminationReason = 'sdk-end';
       }
     }
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (controller.signal.aborted || abortSignal.aborted) {
-      journey.terminationReason = 'signal';
-    } else if (/Reached maximum number of turns/i.test(errMsg)) {
-      // The SDK throws a "Claude Code returned an error result" with this
-      // exact message when its --max-turns cap fires. That's the configured
-      // budget terminating cleanly, not an actual failure — classify as
-      // max-turns so the run summary is accurate.
-      journey.terminationReason = 'max-turns';
-    } else {
-      journey.terminationReason = 'error';
-      logger.error('loop-sdk.error', { error: errMsg });
-    }
-    // Defensive: if the consumer loop threw mid-turn the gate may still be
-    // armed and prompts() would deadlock awaiting it. Release so the generator
-    // can observe terminationReason and exit cleanly during cleanup.
-    releaseTurnGate();
-  } finally {
-    releaseTurnGate();
-  }
 
-  if (!journey.terminationReason) {
-    if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
-      journey.terminationReason = 'error';
-      logger.error('loop-sdk.subprocess-unresponsive', {
+    // Continuation: if the SDK terminated because the model stopped calling
+    // tools (sdk-end) but the agent still has budget, re-launch query() with
+    // a continuation nudge. This mirrors the API-mode loop's `continue` on
+    // end_turn — the model gets another chance with a fresh user message.
+    if (
+      journey.terminationReason === 'sdk-end' &&
+      sdkContinuations < MAX_SDK_CONTINUATIONS &&
+      journey.turns < agent.budget.max_turns &&
+      journey.costUsd < agent.budget.max_usd &&
+      !abortSignal.aborted &&
+      Date.now() - new Date(journey.startedAt).getTime() < agent.budget.max_minutes * 60_000
+    ) {
+      sdkContinuations += 1;
+      (journey as { terminationReason: string | undefined }).terminationReason = undefined;
+      logger.info('loop-sdk.continuation', {
         agentId: agent.id,
-        consecutiveTimeouts,
+        attempt: sdkContinuations,
         turnsCompleted: journey.turns,
+        findings: journey.findings.length,
+        costUsd: journey.costUsd,
       });
-    } else if (controller.signal.aborted || abortSignal.aborted) {
-      journey.terminationReason = 'signal';
-    } else if (journey.turns >= agent.budget.max_turns) {
-      journey.terminationReason = 'max-turns';
-    } else if (journey.costUsd >= agent.budget.max_usd) {
-      journey.terminationReason = 'budget-hit';
-    } else {
-      journey.terminationReason = 'sdk-end';
+      consecutiveTimeouts = 0;
+      continue;
     }
-  }
 
-  // Continuation: if the SDK terminated because the model stopped calling
-  // tools (sdk-end) but the agent still has budget, re-launch query() with
-  // a continuation nudge. This mirrors the API-mode loop's `continue` on
-  // end_turn — the model gets another chance with a fresh user message.
-  if (
-    journey.terminationReason === 'sdk-end' &&
-    sdkContinuations < MAX_SDK_CONTINUATIONS &&
-    journey.turns < agent.budget.max_turns &&
-    journey.costUsd < agent.budget.max_usd &&
-    !abortSignal.aborted &&
-    Date.now() - new Date(journey.startedAt).getTime() < agent.budget.max_minutes * 60_000
-  ) {
-    sdkContinuations += 1;
-    (journey as { terminationReason: string | undefined }).terminationReason = undefined;
-    logger.info('loop-sdk.continuation', {
-      agentId: agent.id,
-      attempt: sdkContinuations,
-      turnsCompleted: journey.turns,
-      findings: journey.findings.length,
-      costUsd: journey.costUsd,
-    });
-    consecutiveTimeouts = 0;
-    continue;
-  }
-
-  break;
+    break;
   } // end continuation while loop
 
   abortSignal.removeEventListener('abort', onAbort);

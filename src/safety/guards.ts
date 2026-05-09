@@ -178,7 +178,7 @@ export function isPathBanned(url: string, bannedPrefixes: string[]): boolean {
   try {
     pathname = new URL(url).pathname;
   } catch {
-    return false;
+    return true;
   }
   return bannedPrefixes.some((prefix) => pathname.startsWith(prefix));
 }

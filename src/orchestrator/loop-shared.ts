@@ -124,16 +124,11 @@ export function buildUserMessage(args: {
 }): string {
   const sections: string[] = [];
 
-  // Session banner — appears FIRST on every turn so the agent always knows
-  // it's already authenticated. Without this, agents that inherited auth via
-  // storageState would burn turns re-firing try_login against the inherited
-  // session (the page at /login looks like a normal login form even when
-  // the cookie+localStorage already carry a valid token).
+  // Short session reminder — the full banner now lives in the system prompt
+  // (cached once). This per-turn line is a compact reinforcement so the
+  // agent doesn't forget its auth state after sliding-window compaction.
   if (args.sessionInfo) {
-    const roleStr = args.sessionInfo.role ? ` (role=${args.sessionInfo.role})` : '';
-    sections.push(
-      `[session: AUTHENTICATED as ${args.sessionInfo.username}${roleStr}] You are already logged in via inherited storageState (cookies + localStorage carry a valid session token). DO NOT call try_login. DO NOT log out under ANY circumstances. DO NOT navigate to /logout, /signout, /sign-out, or click any "Logout"/"Sign out" link — even by accident. If team intelligence credentials match this session, ignore them. Spend your turns exercising authenticated functionality.`,
-    );
+    sections.push('[session: logged in]');
   }
 
   if (args.nudge) {
@@ -171,9 +166,10 @@ export function buildUserMessage(args: {
 
   // Task queue: directed task list for QA agents, replaces generic exploration.
   // Attackers get the sitemap snapshot instead (they need creative freedom).
-  const taskQueue = !args.isAttacker && args.personaName
-    ? buildTaskQueue(args.personaName, args.siteMap, args.fuzzedFormIds)
-    : [];
+  const taskQueue =
+    !args.isAttacker && args.personaName
+      ? buildTaskQueue(args.personaName, args.siteMap, args.fuzzedFormIds)
+      : [];
 
   if (taskQueue.length > 0) {
     const queueBlock = renderTaskQueue(taskQueue, args.personaName);
@@ -196,8 +192,10 @@ export function buildUserMessage(args: {
     if (warning) sections.push(warning);
   }
 
-  const snapshot = renderSiteMapSnapshot(args.siteMap);
-  if (snapshot) sections.push(snapshot);
+  if (taskQueue.length === 0) {
+    const snapshot = renderSiteMapSnapshot(args.siteMap);
+    if (snapshot) sections.push(snapshot);
+  }
 
   const memory = args.summaryMemory.serialize();
   if (memory) sections.push(memory);
@@ -631,25 +629,40 @@ export function extractPersonaTagline(body: string): string {
 
 // ─── Task Queue ──────────────────────────────────────────────────────────────
 
-const PERSONA_TASK_PROFILE: Record<string, {
-  label: string;
-  query: 'forms' | 'tables' | 'routes' | 'modals';
-  playbook?: string;
-}> = {
-  'all-your-base':      { label: 'test boundary values on', query: 'forms', playbook: 'form_fuzz_validation' },
-  'there-is-no-spoon':  { label: 'submit empty',            query: 'forms', playbook: 'form_fuzz_validation' },
-  'copy-pasta':         { label: 'double-submit',           query: 'forms', playbook: 'form_double_submit' },
-  'wreck-it-ralph':     { label: 'wrong-type input on',     query: 'forms', playbook: 'form_fuzz_validation' },
-  'longcat':            { label: 'layout-stress',           query: 'forms', playbook: 'form_fuzz_validation' },
-  'mulder':             { label: 'save-and-reload',         query: 'forms', playbook: 'fill_and_verify' },
-  'leeroy-jenkins':     { label: 'interrupt mid-flow on',   query: 'forms', playbook: 'form_fuzz_validation' },
-  'marty-mcfly':        { label: 'skip steps on',           query: 'forms', playbook: 'form_fuzz_validation' },
-  'pac-man':            { label: 'volume-test',             query: 'tables', playbook: 'table_sort_each_column' },
-  'sheldon':            { label: 'accessibility-check',     query: 'routes' },
-  'bonzi-buddy':        { label: 'bad-URL probe',           query: 'routes' },
-  'press-f':            { label: 'stale-state probe',       query: 'routes' },
-  'konami':             { label: 'hidden-UI probe',         query: 'routes' },
-  'karen':              { label: 'happy-path walk',         query: 'routes' },
+const PERSONA_TASK_PROFILE: Record<
+  string,
+  {
+    label: string;
+    query: 'forms' | 'tables' | 'routes' | 'modals';
+    playbook?: string;
+  }
+> = {
+  'all-your-base': {
+    label: 'test boundary values on',
+    query: 'forms',
+    playbook: 'form_fuzz_validation',
+  },
+  'there-is-no-spoon': { label: 'submit empty', query: 'forms', playbook: 'form_fuzz_validation' },
+  'copy-pasta': { label: 'double-submit', query: 'forms', playbook: 'form_double_submit' },
+  'wreck-it-ralph': {
+    label: 'wrong-type input on',
+    query: 'forms',
+    playbook: 'form_fuzz_validation',
+  },
+  longcat: { label: 'layout-stress', query: 'forms', playbook: 'form_fuzz_validation' },
+  mulder: { label: 'save-and-reload', query: 'forms', playbook: 'fill_and_verify' },
+  'leeroy-jenkins': {
+    label: 'interrupt mid-flow on',
+    query: 'forms',
+    playbook: 'form_fuzz_validation',
+  },
+  'marty-mcfly': { label: 'skip steps on', query: 'forms', playbook: 'form_fuzz_validation' },
+  'pac-man': { label: 'volume-test', query: 'tables', playbook: 'table_sort_each_column' },
+  sheldon: { label: 'accessibility-check', query: 'routes' },
+  'bonzi-buddy': { label: 'bad-URL probe', query: 'routes' },
+  'press-f': { label: 'stale-state probe', query: 'routes' },
+  konami: { label: 'hidden-UI probe', query: 'routes' },
+  karen: { label: 'happy-path walk', query: 'routes' },
 };
 
 export interface TaskQueueItem {
@@ -675,7 +688,11 @@ export function buildTaskQueue(
       const untested = siteMap.listFormsUntested(playbook);
       for (const f of untested) {
         if (fuzzedFormIds.has(f.formId)) continue;
-        items.push({ route: f.route, targetId: f.formId, action: `${profile.label} form "${f.formId}"` });
+        items.push({
+          route: f.route,
+          targetId: f.formId,
+          action: `${profile.label} form "${f.formId}"`,
+        });
         if (items.length >= MAX_QUEUE) break;
       }
       break;
@@ -684,7 +701,11 @@ export function buildTaskQueue(
       const playbook = profile.playbook ?? 'table_sort_each_column';
       const untested = siteMap.listTablesUntested(playbook);
       for (const t of untested) {
-        items.push({ route: t.route, targetId: t.tableId, action: `${profile.label} table "${t.tableId}"` });
+        items.push({
+          route: t.route,
+          targetId: t.tableId,
+          action: `${profile.label} table "${t.tableId}"`,
+        });
         if (items.length >= MAX_QUEUE) break;
       }
       break;
@@ -702,7 +723,11 @@ export function buildTaskQueue(
     case 'modals': {
       const untested = siteMap.listModalsUntested(profile.playbook ?? 'modal_lifecycle');
       for (const m of untested) {
-        items.push({ route: m.route, targetId: m.modalId, action: `${profile.label} modal "${m.modalId}"` });
+        items.push({
+          route: m.route,
+          targetId: m.modalId,
+          action: `${profile.label} modal "${m.modalId}"`,
+        });
         if (items.length >= MAX_QUEUE) break;
       }
       break;
@@ -728,9 +753,13 @@ export function renderTaskQueue(queue: TaskQueueItem[], personaName?: string): s
     }
   }
   if (isDepth) {
-    lines.push('Navigate to the NEXT item. Test it THOROUGHLY — spend multiple turns if needed. Report findings. Move on when you are satisfied, not before.');
+    lines.push(
+      'Navigate to the NEXT item. Test it THOROUGHLY — spend multiple turns if needed. Report findings. Move on when you are satisfied, not before.',
+    );
   } else {
-    lines.push('Navigate to the NEXT item. Test it. Report findings. Move on. Do NOT skip items or wander.');
+    lines.push(
+      'Navigate to the NEXT item. Test it. Report findings. Move on. Do NOT skip items or wander.',
+    );
   }
   return lines.join('\n');
 }

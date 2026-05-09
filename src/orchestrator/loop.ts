@@ -33,6 +33,7 @@ import {
   extractPersonaTagline,
   extractRoute,
   extractTargetId,
+  FORM_TOUCHING_TOOLS,
   type LoopInput,
   oneLineSummary,
   PLAYBOOK_TOOL_PREFIX,
@@ -89,6 +90,30 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
   // 2. Continuous conversation. We only ever push to this array; the
   // sliding-window compaction rewrites the head in-place when needed.
   const messages: Anthropic.MessageParam[] = [];
+
+  // Pre-compute the tools array with cache breakpoint — this is static across
+  // turns so we hoist it out of the loop. The last regular tool carries a 1h
+  // cache_control breakpoint; the Memory tool (server-managed) sits after it.
+  const cachedTools: Anthropic.Tool[] =
+    anthropicTools.length > 0
+      ? [
+          ...anthropicTools.slice(0, -1),
+          {
+            ...anthropicTools[anthropicTools.length - 1]!,
+            cache_control: { type: 'ephemeral' as const, ttl: '1h' as const },
+          },
+        ]
+      : [];
+  const MEMORY_TOOL_DEF: MemoryTool20250818 = {
+    type: 'memory_20250818',
+    name: 'memory',
+  };
+  const allTools: Anthropic.ToolUnion[] = input.memoryEnabled
+    ? [...cachedTools, MEMORY_TOOL_DEF]
+    : cachedTools;
+
+  // Pre-compute the persona tagline — the personality text is static per-agent.
+  const personaTagline = extractPersonaTagline(agent.personality);
 
   // Per-turn model routing: the turn IMMEDIATELY after a sliding-window
   // compaction uses plannerModel (typically Sonnet) so the agent can
@@ -158,7 +183,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       sessionInfo: input.sessionInfo,
       fuzzedFormIds,
       isAttacker,
-      personaTagline: extractPersonaTagline(agent.personality),
+      personaTagline,
       personaName: agent.profileName,
       currentUrl: currentAgentUrl,
       turnsOnSameUrl,
@@ -176,32 +201,6 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       // needs to re-orient after elision. Use plannerModel for that one call.
       nextTurnIsPlanning = true;
     }
-
-    // Cache the tools array: mark the last entry with a 1h breakpoint.
-    // Anthropic caches tools[0..lastIndex] inclusive when the last has cache_control.
-    const cachedTools: Anthropic.Tool[] =
-      anthropicTools.length > 0
-        ? [
-            ...anthropicTools.slice(0, -1),
-            {
-              ...anthropicTools[anthropicTools.length - 1]!,
-              cache_control: { type: 'ephemeral', ttl: '1h' },
-            },
-          ]
-        : [];
-
-    // The Memory tool is a server-managed tool — the API handles all I/O.
-    // It is placed AFTER cachedTools so the 1h cache breakpoint on the last
-    // regular tool is preserved. The memory tool itself is uncached (it is
-    // cheap metadata — Anthropic recommends server tools last in the array).
-    // MemoryTool20250818 is part of ToolUnion so no cast is needed.
-    const MEMORY_TOOL_DEF: MemoryTool20250818 = {
-      type: 'memory_20250818',
-      name: 'memory',
-    };
-    const allTools: Anthropic.ToolUnion[] = input.memoryEnabled
-      ? [...cachedTools, MEMORY_TOOL_DEF]
-      : cachedTools;
 
     // Build a per-request messages array with a 5-min cache breakpoint on the
     // last content block of the last message. The persistent `messages` array
@@ -268,28 +267,67 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     });
 
     let response: Anthropic.Message;
-    try {
-      response = await client.messages.create({
-        model: modelForThisTurn,
-        max_tokens: MAX_OUTPUT_TOKENS,
-        system: [
-          {
-            type: 'text',
-            text: input.systemPrompt,
-            // Cache the long system prompt for 1h — cuts per-turn input cost dramatically.
-            cache_control: { type: 'ephemeral', ttl: '1h' },
-          },
-        ],
-        messages: requestMessages,
-        tools: allTools,
-        ...(typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0
-          ? { thinking: { type: 'enabled', budget_tokens: agent.maxThinkingTokens } }
-          : {}),
-      });
-    } catch (err) {
-      if (input.abortSignal.aborted) {
-        journey.terminationReason = 'signal';
-      } else {
+    const API_RETRIES = 3;
+    const API_RETRY_BASE_MS = 5_000;
+    let apiAttempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      apiAttempt += 1;
+      try {
+        const thinkingEnabled =
+          typeof agent.maxThinkingTokens === 'number' && agent.maxThinkingTokens > 0;
+        response = await client.messages.create({
+          model: modelForThisTurn,
+          max_tokens: MAX_OUTPUT_TOKENS,
+          system: [
+            {
+              type: 'text',
+              text: input.systemPrompt,
+              // Cache the long system prompt for 1h — cuts per-turn input cost dramatically.
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+          ],
+          messages: requestMessages,
+          tools: allTools,
+          // Force the agent to always call a tool when extended thinking is off.
+          // Explorer agents should never produce text-only turns — every turn
+          // should advance via a browser action, playbook, or finding report.
+          // When thinking IS enabled, tool_choice must be 'auto' (API constraint),
+          // so we omit it and rely on the system prompt to enforce tool use.
+          ...(!thinkingEnabled ? { tool_choice: { type: 'any' as const } } : {}),
+          ...(thinkingEnabled
+            ? { thinking: { type: 'enabled', budget_tokens: agent.maxThinkingTokens! } }
+            : {}),
+        });
+        break;
+      } catch (err) {
+        if (input.abortSignal.aborted) {
+          journey.terminationReason = 'signal';
+          nextTurnIsPlanning = false;
+          return;
+        }
+        // Retry on transient errors: 429 (rate limit), 529 (overloaded),
+        // 500/502/503 (server errors), and network failures.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const status = (err as { status?: number }).status;
+        const isRetryable =
+          status === 429 ||
+          status === 529 ||
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          /ECONNRESET|ETIMEDOUT|ECONNREFUSED|fetch failed|socket hang up/i.test(errMsg);
+        if (isRetryable && apiAttempt < API_RETRIES) {
+          const delayMs = API_RETRY_BASE_MS * 2 ** (apiAttempt - 1);
+          logger.warn('loop.api.retry', {
+            attempt: apiAttempt,
+            status,
+            error: errMsg,
+            delayMs,
+          });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
         journey.terminationReason = 'error';
         // Compact shape summary helps diagnose request-construction bugs (e.g.
         // orphaned tool_result blocks after history compaction). One entry per
@@ -309,14 +347,15 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           return `${m.role}:[${tags}]`;
         });
         logger.error('loop.api.error', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errMsg,
           shape,
+          attempts: apiAttempt,
         });
+        // Reset the planning flag even on API error so subsequent turns aren't
+        // accidentally promoted to plannerModel.
+        nextTurnIsPlanning = false;
+        return;
       }
-      // Reset the planning flag even on API error so subsequent turns aren't
-      // accidentally promoted to plannerModel.
-      nextTurnIsPlanning = false;
-      return;
     }
 
     // Reset after the call resolves — the planning turn is now complete.
@@ -399,12 +438,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
         // Track form interactions for the un-fuzzed-forms TODO. Any of the
         // three form-touching playbooks count: a fill_and_verify counts because
         // the agent has at least filled the form once, even if not fuzzed.
-        const formTouchingTools = new Set([
-          'mcp__playbooks__form_fuzz_validation',
-          'mcp__playbooks__form_double_submit',
-          'mcp__playbooks__fill_and_verify',
-        ]);
-        if (formTouchingTools.has(use.name)) {
+        if (FORM_TOUCHING_TOOLS.has(use.name)) {
           const formId = (use.input as Record<string, unknown> | undefined)?.['formId'];
           if (typeof formId === 'string' && formId.length > 0) fuzzedFormIds.add(formId);
         }

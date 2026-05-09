@@ -137,6 +137,35 @@ function sameRouteFamily(a: string, b: string): boolean {
 
 export class FindingCache {
   private entries: KnownFindingRef[] = [];
+  private falsePositivePatterns: Array<{ titlePattern: string; route?: string; reason: string }> =
+    [];
+
+  seedFalsePositivePatterns(
+    patterns: Array<{ titlePattern: string; route?: string; reason: string }>,
+  ): void {
+    this.falsePositivePatterns = patterns;
+  }
+
+  matchesFalsePositive(f: { title: string; route?: string }): { reason: string } | null {
+    const normTitle = f.title.toLowerCase().replace(/\s+/g, ' ').trim();
+    for (const p of this.falsePositivePatterns) {
+      // Match when the finding title contains the full pattern (new finding
+      // is a superset of the known FP), OR the pattern contains the full
+      // finding title BUT only when the finding title is long enough to be
+      // meaningful (>= 30 chars). Without the length guard, short titles
+      // like "error" or "form validation" would match any pattern containing
+      // those words, suppressing legitimate new findings.
+      const titleMatchesPattern = normTitle.includes(p.titlePattern);
+      const patternMatchesTitle =
+        normTitle.length >= 30 && p.titlePattern.includes(normTitle.slice(0, 60));
+      if (titleMatchesPattern || patternMatchesTitle) {
+        if (!p.route || p.route === f.route) {
+          return { reason: p.reason };
+        }
+      }
+    }
+    return null;
+  }
 
   /** Append a new finding. Cheap projection — the full Finding object is not
    *  retained. Caller is the report_finding handler in browser-server. */
@@ -201,7 +230,10 @@ export class FindingCache {
       .reverse();
     for (const e of recent) {
       if (e.severity !== f.severity) continue;
-      if (!sameRouteFamily(e.route, f.route ?? '')) continue;
+      const fRoute = f.route ?? '';
+      if (fRoute !== '' || e.route !== '') {
+        if (!sameRouteFamily(e.route, fRoute)) continue;
+      }
       const existingTokens = tokeniseTitle(e.title);
       if (jaccard(newTokens, existingTokens) >= TITLE_JACCARD_THRESHOLD) {
         return e;

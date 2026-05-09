@@ -138,7 +138,7 @@ export async function runSupervisorSdk(input: SupervisorInput): Promise<Supervis
           input.siteMap.listModalsUntested('modal_lifecycle').map((m) => m.route),
         );
         const untestedWizards = new Set(
-          input.siteMap.listWizardsUntested('wizard_full_walkthrough').map((w) => w.route),
+          input.siteMap.listWizardsUntested('walk_wizard').map((w) => w.route),
         );
         const allRoutes = input.siteMap.listAllRoutes();
         const exhausted = allRoutes

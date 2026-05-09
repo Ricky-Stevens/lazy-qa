@@ -1,5 +1,5 @@
+import { type Browser, chromium, type Page } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { type Browser, type Page, chromium } from 'playwright';
 import { parsePage } from './parser.ts';
 
 let browser: Browser;
@@ -177,8 +177,7 @@ describe('parsePage', () => {
       </main>
     `);
     const model = await parsePage(page);
-    const byLabel = (l: string) =>
-      model.bareInteractives.find((b) => b.label === l);
+    const byLabel = (l: string) => model.bareInteractives.find((b) => b.label === l);
     expect(byLabel('Save')?.intent).toBe('action');
     expect(byLabel('Submit')?.intent).toBe('action');
     expect(byLabel('Delete')?.intent).toBe('action');
@@ -214,9 +213,7 @@ describe('parsePage', () => {
   it('passes through network/console signals supplied by the caller', async () => {
     await setHtml(`<button>Click</button>`);
     const model = await parsePage(page, {
-      network: [
-        { ts: 1, status: 500, method: 'GET', url: '/api/x', resourceType: 'fetch' },
-      ],
+      network: [{ ts: 1, status: 500, method: 'GET', url: '/api/x', resourceType: 'fetch' }],
       console: [{ ts: '1', level: 'error', text: 'boom' }],
     });
     expect(model.network).toHaveLength(1);

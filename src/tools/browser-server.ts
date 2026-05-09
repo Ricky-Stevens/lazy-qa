@@ -126,40 +126,6 @@ export interface BrowserServerInput {
 }
 
 /** Accessibility node interface for rendering the AX tree. */
-interface AxNode {
-  role?: string;
-  name?: string;
-  value?: string;
-  disabled?: boolean;
-  checked?: boolean | 'mixed';
-  selected?: boolean;
-  expanded?: boolean;
-  children?: AxNode[];
-}
-
-/** Render an accessibility tree node and its children as an indented text outline. */
-function renderAxTree(node: AxNode, maxDepth: number, depth = 0): string {
-  if (depth > maxDepth) return '';
-  const indent = '  '.repeat(depth);
-  const role = node.role || 'unknown';
-  const name = node.name ? ` "${node.name.slice(0, 60)}"` : '';
-  const value = node.value ? ` = ${node.value.slice(0, 40)}` : '';
-  const flags = [
-    node.disabled && 'disabled',
-    node.checked === true && 'checked',
-    node.selected === true && 'selected',
-    node.expanded === true && 'expanded',
-  ]
-    .filter(Boolean)
-    .join(',');
-  const flagsStr = flags ? ` [${flags}]` : '';
-  const self = `${indent}${role}${name}${value}${flagsStr}`;
-  const children = (node.children ?? [])
-    .map((c) => renderAxTree(c, maxDepth, depth + 1))
-    .filter(Boolean)
-    .join('\n');
-  return children ? `${self}\n${children}` : self;
-}
 
 /** Detect whether the page's browser context is already authenticated as the
  *  given username. Returns a short evidence string when matched, null otherwise.
@@ -753,7 +719,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           return textResult(`navigate refused: ${hostname} not in allowed_hosts`);
         }
         if (isPathBanned(url, bannedPathPrefixes)) {
-          return textResult(`navigate refused: path matches banned_path_prefixes — this area is off-limits for this scan`);
+          return textResult(
+            `navigate refused: path matches banned_path_prefixes — this area is off-limits for this scan`,
+          );
         }
         const page = ensureListeners();
         const fromUrl = page.url();
@@ -1235,6 +1203,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`fetch_resource refused: ${url} not in allowed_hosts.`);
         }
+        if (isPathBanned(url, bannedPathPrefixes)) {
+          return textResult(`fetch_resource refused: path is in banned_path_prefixes.`);
+        }
         onAction?.({ url, toolName: 'fetch_resource', authWalled: false });
         const startedAt = Date.now();
         try {
@@ -1282,6 +1253,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         const url = resolveAgentUrl(rawUrl, getPage);
         if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
           return textResult(`request_with_session refused: ${url} not in allowed_hosts.`);
+        }
+        if (isPathBanned(url, bannedPathPrefixes)) {
+          return textResult(`request_with_session refused: path is in banned_path_prefixes.`);
         }
         onAction?.({ url, toolName: 'request_with_session', authWalled: false });
         const page = ensureListeners();
@@ -1456,7 +1430,9 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         } catch {
           // page URL not parseable — skip cache
         }
-        const cachedLocator = cachePathname ? selectorCache?.get(cachePathname, hint, role) : undefined;
+        const cachedLocator = cachePathname
+          ? selectorCache?.get(cachePathname, hint, role)
+          : undefined;
         if (cachedLocator) {
           try {
             await page.locator(cachedLocator).first().click({ timeout: 2_000 });

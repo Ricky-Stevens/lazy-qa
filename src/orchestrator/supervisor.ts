@@ -145,7 +145,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
             input.siteMap.listModalsUntested('modal_lifecycle').map((m) => m.route),
           );
           const untestedWizards = new Set(
-            input.siteMap.listWizardsUntested('wizard_full_walkthrough').map((w) => w.route),
+            input.siteMap.listWizardsUntested('walk_wizard').map((w) => w.route),
           );
           const allRoutes = input.siteMap.listAllRoutes();
           const exhausted = allRoutes
@@ -356,6 +356,20 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
     },
   ];
 
+  if (input.testPlan) {
+    rawTools.push({
+      name: 'check_plan_coverage',
+      description:
+        'Return the current test plan with completion status. Shows which items have been completed by agents, which are still uncovered, and suggests the best persona for each gap. Call this periodically to decide whether to nudge agents toward uncovered items.',
+      shape: {},
+      handler: async () => {
+        const { getPlanSummary } = await import('./test-plan.ts');
+        const summary = getPlanSummary(input.testPlan!);
+        return { content: [{ type: 'text' as const, text: summary }] };
+      },
+    });
+  }
+
   // For runs with auth.type='none' there is no login to recover. Hide the
   // relogin_session tool entirely so the supervisor's LLM can't waste a turn
   // calling it (and getting "Cannot recover: session was started without
@@ -403,32 +417,70 @@ export async function runSupervisor(input: SupervisorInput): Promise<SupervisorR
     costUsd < input.maxUsd &&
     Date.now() - startedAt < input.maxMinutes * 60_000
   ) {
-    let response: Anthropic.Message;
-    try {
-      response = await client.messages.create({
-        model: input.model,
-        max_tokens: 2048,
-        system: [
-          {
-            type: 'text',
-            text: systemPrompt,
-            cache_control: { type: 'ephemeral', ttl: '1h' },
-          },
-        ],
-        messages,
-        tools: anthropicTools,
-      });
-    } catch (err) {
-      if (input.abortSignal.aborted) {
-        endedReason = 'signal';
-      } else {
+    let response!: Anthropic.Message;
+    const SUPERVISOR_API_RETRIES = 3;
+    const SUPERVISOR_RETRY_BASE_MS = 5_000;
+    let supervisorAttempt = 0;
+    let apiFailed = false;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      supervisorAttempt += 1;
+      try {
+        response = await client.messages.create({
+          model: input.model,
+          max_tokens: 2048,
+          system: [
+            {
+              type: 'text',
+              text: systemPrompt,
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+          ],
+          messages,
+          tools: anthropicTools,
+          // Force tool use every turn. The supervisor's job is to observe
+          // (list_agents) and intervene (nudge/pause/broadcast) — it should
+          // never produce text-only turns. Eliminates the "output text without
+          // calling a tool" correction logic below.
+          tool_choice: { type: 'any' },
+        });
+        break;
+      } catch (err) {
+        if (input.abortSignal.aborted) {
+          endedReason = 'signal';
+          apiFailed = true;
+          break;
+        }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const status = (err as { status?: number }).status;
+        const isRetryable =
+          status === 429 ||
+          status === 529 ||
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          /ECONNRESET|ETIMEDOUT|ECONNREFUSED|fetch failed|socket hang up/i.test(errMsg);
+        if (isRetryable && supervisorAttempt < SUPERVISOR_API_RETRIES) {
+          const delayMs = SUPERVISOR_RETRY_BASE_MS * 2 ** (supervisorAttempt - 1);
+          input.logger.warn('supervisor.api.retry', {
+            attempt: supervisorAttempt,
+            status,
+            error: errMsg,
+            delayMs,
+          });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
         endedReason = 'error';
         input.logger.error('supervisor.api.error', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errMsg,
+          attempts: supervisorAttempt,
         });
+        apiFailed = true;
+        break;
       }
-      break;
     }
+    if (apiFailed) break;
 
     turns += 1;
     const usage = response.usage;

@@ -6,10 +6,12 @@ import { z } from 'zod';
 import type { ApiLlmBackend } from '../llm/api-backend.ts';
 import type { LlmBackend, LlmCallResult } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
+import type { ApplicationModel } from '../orchestrator/app-model.ts';
 import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+import { type PreClassification, preClassifyFinding } from './pre-classify.ts';
 import { type VerifyResult, type VerifyVerdict, verifyFinding } from './verify.ts';
 
 /**
@@ -77,6 +79,9 @@ export interface ReviewResult {
     review: ReviewItem;
     /** Verifier verdict if critic-with-browser ran for this finding. */
     verify?: VerifyResult;
+    /** Set when the finding was classified deterministically (pre-classify)
+     *  rather than by the LLM critic. Absent means the LLM classified it. */
+    preClassification?: PreClassification;
   }>;
   /** Findings without an LLM review (model didn't return one for them). */
   missing: Finding[];
@@ -268,6 +273,10 @@ export interface ReviewInput {
    *  likely findings. Skipped entirely if undefined (e.g. the standalone
    *  review CLI without an authenticated browser session). */
   verify?: VerifyContext;
+  /** Application model from Phase 0. When provided, the deterministic
+   *  pre-classifier uses it to suppress known-normal patterns (server-side
+   *  sort, expected empty states) before sending findings to the critic. */
+  appModel?: ApplicationModel;
 }
 
 const SYSTEM_PROMPT = `You are a senior QA triager reviewing automated regression-scan findings.
@@ -376,7 +385,22 @@ function extractJsonObject(text: string): unknown {
   return JSON.parse(body);
 }
 
-/** Inline (synchronous) path — delegates to the backend abstraction. */
+/** Build the submit_review tool definition for structured output. Reuses the
+ *  ReviewResponseSchema to guarantee the model's output matches our Zod types
+ *  exactly — no more fragile JSON-from-text parsing. */
+function buildReviewTool(): Anthropic.Tool {
+  const jsonSchema = z.toJSONSchema(ReviewResponseSchema) as Record<string, unknown>;
+  return {
+    name: 'submit_review',
+    description:
+      'Submit your complete review. Call this tool with ALL findings reviews, clusters, and overall notes.',
+    input_schema: jsonSchema as Anthropic.Tool['input_schema'],
+  };
+}
+
+/** Inline (synchronous) path — delegates to the backend abstraction.
+ *  Uses tool_choice to force structured output via the submit_review tool,
+ *  guaranteeing schema compliance without fragile JSON parsing. */
 async function runCriticInline(
   backend: LlmBackend,
   model: string,
@@ -387,8 +411,9 @@ async function runCriticInline(
     maxTokens: 8192,
     systemPrompt: SYSTEM_PROMPT,
     messages: [{ role: 'user', content: payload }],
-    tools: [],
+    tools: [buildReviewTool()],
     cacheSystem: true, // The system prompt is large + static across calls — caching is the point
+    toolChoice: { type: 'tool', name: 'submit_review' },
   });
 }
 
@@ -400,6 +425,7 @@ async function runCriticBatch(
   payload: string,
   logger: Logger,
 ): Promise<LlmCallResult> {
+  const reviewTool = buildReviewTool();
   const batch = await client.messages.batches.create({
     requests: [
       {
@@ -411,6 +437,8 @@ async function runCriticBatch(
             { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
           ],
           messages: [{ role: 'user', content: payload }],
+          tools: [reviewTool],
+          tool_choice: { type: 'tool', name: 'submit_review' },
         },
       },
     ],
@@ -481,95 +509,177 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
     };
   }
 
-  const payload = buildReviewPayload(findings, journeys);
-  logger.info('review.start', {
-    runDir,
-    findings: findings.length,
-    journeys: journeys.length,
-    model,
-    payloadChars: payload.length,
-  });
+  // --- Deterministic pre-classification --------------------------------
+  // Split findings into those we can classify mechanically (no LLM cost)
+  // and those that need the critic. Pre-classified findings get synthetic
+  // ReviewItems; only the 'needs_review' bucket goes to the LLM.
+  const deterministicResults: Array<{
+    finding: Finding;
+    review: ReviewItem;
+    preClassification: PreClassification;
+  }> = [];
+  const needsReview: Finding[] = [];
 
-  // Emit critic.start before the API call.
-  await events?.write({
-    type: 'critic.start',
-    findingCount: findings.length,
-    model,
-  });
+  for (const f of findings) {
+    const pc = preClassifyFinding(f, input.appModel);
+    if (pc.classification !== 'needs_review') {
+      deterministicResults.push({
+        finding: f,
+        review: {
+          id: f.id,
+          classification: pc.classification,
+          reasoning: `[pre-classify] ${pc.reason}`,
+        },
+        preClassification: pc.classification,
+      });
+    } else {
+      needsReview.push(f);
+    }
+  }
 
-  const reviewStartedAt = Date.now();
-
-  const inputCharsApprox = payload.length;
-  const useBatch =
-    backend.kind === 'api' &&
-    (batchMode === 'force_batch' || (batchMode === 'auto' && inputCharsApprox > 16_000));
-
-  if (batchMode === 'force_batch' && backend.kind !== 'api') {
-    logger.warn('review.batch.unsupported', {
-      reason: 'subscription mode does not support the Batch API; falling back to inline',
+  if (deterministicResults.length > 0) {
+    logger.info('review.pre-classify', {
+      total: findings.length,
+      deterministic: deterministicResults.length,
+      needsReview: needsReview.length,
     });
   }
 
-  const response: LlmCallResult = useBatch
-    ? await runCriticBatch((backend as ApiLlmBackend).getRawClient(), model, payload, logger)
-    : await runCriticInline(backend, model, payload);
-
-  // Aggregate token usage and cost for telemetry.
-  const tokenUsage = {
-    input: response.usage.inputTokens,
-    output: response.usage.outputTokens,
-    cacheRead: response.usage.cacheReadTokens,
-    cacheWrite: response.usage.cacheWriteTokens,
-  };
+  // --- LLM critic call (only for needsReview findings) -----------------
+  let tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   let costUsd = 0;
-  try {
-    costUsd = computeCostUsd(model, tokenUsage);
-  } catch {
-    // Unknown model price — ignore; reviewer still works.
-  }
+  let parsedClusters: ReviewCluster[] = [];
+  let parsedOverallNotes = '';
+  const llmReviewsById = new Map<string, ReviewItem>();
 
-  const savedUsd = computeCacheSavingsUsd(model, tokenUsage.cacheRead);
-  logger.info('review.cache.savings', {
-    cacheReadTokens: tokenUsage.cacheRead,
-    cacheWriteTokens: tokenUsage.cacheWrite,
-    savedUsd,
-    ratioOfInput: tokenUsage.input > 0 ? tokenUsage.cacheRead / tokenUsage.input : 0,
-  });
+  const reviewStartedAt = Date.now();
 
-  // Pull the assistant's first text block. The prompt instructs JSON-only.
-  const textBlock = response.content.find((b) => b.type === 'text');
-  if (!textBlock || textBlock.type !== 'text') {
-    throw new Error(`Reviewer returned no text content (stopReason=${response.stopReason})`);
-  }
+  if (needsReview.length > 0) {
+    const payload = buildReviewPayload(needsReview, journeys);
+    logger.info('review.start', {
+      runDir,
+      findings: needsReview.length,
+      journeys: journeys.length,
+      model,
+      payloadChars: payload.length,
+    });
 
-  let parsedRaw: unknown;
-  try {
-    parsedRaw = extractJsonObject(textBlock.text);
-  } catch (err) {
-    throw new Error(
-      `Reviewer returned non-JSON: ${err instanceof Error ? err.message : String(err)}\n\n--- raw output (first 500 chars) ---\n${textBlock.text.slice(0, 500)}`,
+    // Emit critic.start before the API call.
+    await events?.write({
+      type: 'critic.start',
+      findingCount: needsReview.length,
+      model,
+    });
+
+    const inputCharsApprox = payload.length;
+    const useBatch =
+      backend.kind === 'api' &&
+      (batchMode === 'force_batch' || (batchMode === 'auto' && inputCharsApprox > 16_000));
+
+    if (batchMode === 'force_batch' && backend.kind !== 'api') {
+      logger.warn('review.batch.unsupported', {
+        reason: 'subscription mode does not support the Batch API; falling back to inline',
+      });
+    }
+
+    const response: LlmCallResult = useBatch
+      ? await runCriticBatch((backend as ApiLlmBackend).getRawClient(), model, payload, logger)
+      : await runCriticInline(backend, model, payload);
+
+    // Aggregate token usage and cost for telemetry.
+    tokenUsage = {
+      input: response.usage.inputTokens,
+      output: response.usage.outputTokens,
+      cacheRead: response.usage.cacheReadTokens,
+      cacheWrite: response.usage.cacheWriteTokens,
+    };
+    try {
+      costUsd = computeCostUsd(model, tokenUsage);
+    } catch {
+      // Unknown model price — ignore; reviewer still works.
+    }
+
+    const savedUsd = computeCacheSavingsUsd(model, tokenUsage.cacheRead);
+    logger.info('review.cache.savings', {
+      cacheReadTokens: tokenUsage.cacheRead,
+      cacheWriteTokens: tokenUsage.cacheWrite,
+      savedUsd,
+      ratioOfInput: tokenUsage.input > 0 ? tokenUsage.cacheRead / tokenUsage.input : 0,
+    });
+
+    // Structured output: with tool_choice forcing submit_review, the response
+    // contains a tool_use block with schema-compliant data. Falls back to
+    // text-based JSON extraction for backwards compatibility.
+    const toolUse = response.content.find(
+      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === 'submit_review',
     );
+
+    let parsed: z.infer<typeof ReviewResponseSchema>;
+    if (toolUse) {
+      parsed = ReviewResponseSchema.parse(toolUse.input);
+    } else {
+      // Fallback: text-based extraction (batch API or unexpected response shape).
+      const textBlock = response.content.find((b) => b.type === 'text');
+      if (!textBlock || textBlock.type !== 'text') {
+        throw new Error(`Reviewer returned no text content (stopReason=${response.stopReason})`);
+      }
+      let parsedRaw: unknown;
+      try {
+        parsedRaw = extractJsonObject(textBlock.text);
+      } catch (err) {
+        throw new Error(
+          `Reviewer returned non-JSON: ${err instanceof Error ? err.message : String(err)}\n\n--- raw output (first 500 chars) ---\n${textBlock.text.slice(0, 500)}`,
+        );
+      }
+      parsed = ReviewResponseSchema.parse(parsedRaw);
+    }
+    for (const r of parsed.reviews) llmReviewsById.set(r.id, r);
+    parsedClusters = parsed.clusters;
+    parsedOverallNotes = parsed.overallNotes;
+  } else {
+    logger.info('review.skip-critic', {
+      reason: 'all findings pre-classified deterministically',
+    });
+    parsedOverallNotes = 'All findings were classified deterministically (no LLM critic needed).';
   }
 
-  const parsed = ReviewResponseSchema.parse(parsedRaw);
-
-  // Stitch reviews back to the original findings, by id.
+  // --- Merge deterministic + LLM results into a single ordered list ----
   const findingsById = new Map(findings.map((f) => [f.id, f]));
-  const reviewsById = new Map(parsed.reviews.map((r) => [r.id, r]));
-  const reviews: Array<{ finding: Finding; review: ReviewItem; verify?: VerifyResult }> = [];
+  const deterministicById = new Map(deterministicResults.map((d) => [d.finding.id, d]));
+  const reviews: Array<{
+    finding: Finding;
+    review: ReviewItem;
+    verify?: VerifyResult;
+    preClassification?: PreClassification;
+  }> = [];
   const missing: Finding[] = [];
   for (const f of findings) {
-    const r = reviewsById.get(f.id);
-    if (r) {
-      reviews.push({ finding: f, review: r });
-      // Emit critic.verdict per finding.
+    const det = deterministicById.get(f.id);
+    if (det) {
+      reviews.push({
+        finding: det.finding,
+        review: det.review,
+        preClassification: det.preClassification,
+      });
+      // Emit critic.verdict for deterministic findings too.
       await events?.write({
         type: 'critic.verdict',
         findingId: f.id,
-        verdict: r.classification,
+        verdict: det.review.classification,
       });
     } else {
-      missing.push(f);
+      const r = llmReviewsById.get(f.id);
+      if (r) {
+        reviews.push({ finding: f, review: r });
+        // Emit critic.verdict per finding.
+        await events?.write({
+          type: 'critic.verdict',
+          findingId: f.id,
+          verdict: r.classification,
+        });
+      } else {
+        missing.push(f);
+      }
     }
   }
 
@@ -605,7 +715,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   // Critic-with-browser verification, if a verify context was provided.
   let verifyCostUsd = 0;
   if (input.verify) {
-    const skipCertain = input.verify.verifyOnlyUncertain !== false;
+    const skipCertain = input.verify.verifyOnlyUncertain === true;
     const candidates = reviews.filter((r) => {
       if (r.review.classification !== 'confirmed_bug' && r.review.classification !== 'likely_bug') {
         return false;
@@ -649,7 +759,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   for (const entry of reviews) counts[entry.review.classification] += 1;
 
   // Drop cluster IDs that don't exist (model occasionally invents).
-  const clusters = parsed.clusters
+  const clusters = parsedClusters
     .map((c) => ({ ...c, findingIds: c.findingIds.filter((id) => findingsById.has(id)) }))
     .filter((c) => c.findingIds.length > 0);
 
@@ -678,7 +788,7 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
     reviews,
     missing,
     clusters,
-    overallNotes: parsed.overallNotes,
+    overallNotes: parsedOverallNotes,
     counts,
     verifyCostUsd,
   };

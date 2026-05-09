@@ -86,6 +86,11 @@ export interface SpawnAgentInput {
    *  agents know they're already logged in and don't burn turns re-firing
    *  try_login against the inherited storageState. */
   sessionInfo?: { username: string; role?: string };
+  /** Rendered Application Model context for the system prompt. Describes what
+   *  "normal" looks like for this app so agents avoid filing expected behavior. */
+  appModelContext?: string;
+  /** Cross-run learning context: known findings, new routes, regression hints. */
+  learningContext?: string;
   /** 2-3 sentence plain-English description of the site. Rendered in the
    *  system prompt for agent orientation. */
   siteSummary?: string;
@@ -316,9 +321,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
         // unwind cleanly between the abort and the reject below.
         abortController.abort();
         reject(
-          new Error(
-            `agent loop hard-deadline exceeded after ${(limitMs / 1000).toFixed(0)}s`,
-          ),
+          new Error(`agent loop hard-deadline exceeded after ${(limitMs / 1000).toFixed(0)}s`),
         );
       }, limitMs);
     });
@@ -336,6 +339,9 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     skillsBundle,
     siteSummary: input.siteSummary,
     siteShape: input.siteShape,
+    appModelContext: input.appModelContext,
+    learningContext: input.learningContext,
+    sessionInfo: input.sessionInfo,
   });
 
   // 6. Per-agent summary memory — the loop pushes one entry per playbook
@@ -495,6 +501,9 @@ function buildSystemPrompt(args: {
   skillsBundle: SkillsBundle;
   siteSummary?: string;
   siteShape?: string;
+  appModelContext?: string;
+  learningContext?: string;
+  sessionInfo?: { username: string; role?: string };
 }): string {
   const { targetUrl, agent, memoryEnabled, skillsBundle } = args;
 
@@ -536,7 +545,13 @@ function buildSystemPrompt(args: {
     'Drive the app the way YOUR PERSONA would drive it. Use the browser primitives directly. The primitives ARE your hands. Click things, type into fields, navigate, read the page, observe what happens. The persona below tells you WHAT KIND of user you are; the app tells you what to do.',
     '',
     'BROWSER PRIMITIVES (`mcp__browser__*`) — your default action vocabulary:',
-    '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`.',
+    ...(ATTACKER_PROFILES.has(agent.profileName)
+      ? [
+          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`, `fetch_resource`, `request_with_session`, `decode_jwt`.',
+        ]
+      : [
+          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`.',
+        ]),
     '',
     "PRIMITIVES — `snapshot` is the full PageModel (forms, tables, modals, locators); `ax_snapshot` is a cheaper text outline of the accessibility tree (use when you just need to know what's on the page).",
     '',
@@ -555,6 +570,14 @@ function buildSystemPrompt(args: {
     '4. The user message you receive each turn lists unvisited routes / untested forms / untested tables / untested modals. Pick something from that list (or invent your own).',
     '5. If a [SUPERVISOR INTERVENTION] line appears at the top of your prompt, treat it as the next thing to do.',
     ...siteBriefBlock,
+    ...(args.appModelContext ? ['', args.appModelContext] : []),
+    ...(args.learningContext ? ['', args.learningContext] : []),
+    ...(args.sessionInfo
+      ? [
+          '',
+          `[session: AUTHENTICATED as ${args.sessionInfo.username}${args.sessionInfo.role ? ` (role=${args.sessionInfo.role})` : ''}] You are already logged in via inherited storageState (cookies + localStorage carry a valid session token). DO NOT call try_login. DO NOT log out under ANY circumstances. DO NOT navigate to /logout, /signout, /sign-out, or click any "Logout"/"Sign out" link — even by accident. If team intelligence credentials match this session, ignore them. Spend your turns exercising authenticated functionality.`,
+        ]
+      : []),
     '',
     'YOUR CHARACTER (this is who you ARE — embody them, do not narrate them):',
     agent.personality,

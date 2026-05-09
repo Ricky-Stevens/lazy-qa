@@ -136,7 +136,7 @@ export function buildCoverageReport(inputs: CoverageInputs): CoverageReport {
     },
     wizards: {
       found: wizardsFound,
-      walkthroughAttempted: uniqueTargetsFor(playbookOutcomes, 'wizard_full_walkthrough'),
+      walkthroughAttempted: uniqueTargetsFor(playbookOutcomes, 'walk_wizard'),
     },
     playbooks,
     perAgent,

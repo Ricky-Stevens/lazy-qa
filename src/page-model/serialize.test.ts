@@ -1,13 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { serializeForAgent } from './serialize.ts';
-import type {
-  ActionRef,
-  FormSpec,
-  ModalSpec,
-  PageModel,
-  TableSpec,
-  WizardSpec,
-} from './types.ts';
+import type { ActionRef, FormSpec, ModalSpec, PageModel, TableSpec, WizardSpec } from './types.ts';
 
 function ref(label: string, locator: string): ActionRef {
   return { label, locator, type: 'button', disabled: false, intent: 'unknown' };
@@ -125,9 +118,7 @@ describe('serializeForAgent', () => {
   it('includes signal section when network/console anomalies present', () => {
     const model = makePageModel({
       bareInteractives: [ref('Click', '#x')],
-      network: [
-        { ts: 1, status: 500, method: 'GET', url: '/api/x', resourceType: 'fetch' },
-      ],
+      network: [{ ts: 1, status: 500, method: 'GET', url: '/api/x', resourceType: 'fetch' }],
       console: [{ ts: '1', level: 'error', text: 'Uncaught error' }],
     });
     const out = serializeForAgent(model);

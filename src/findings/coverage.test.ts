@@ -178,7 +178,7 @@ describe('coverage', () => {
       },
       {
         agentId: 'completionist',
-        playbookName: 'wizard_full_walkthrough',
+        playbookName: 'walk_wizard',
         route: '/onboarding',
         targetId: 'wiz-onb',
         status: 'ok',
@@ -230,7 +230,7 @@ describe('coverage', () => {
     expect(report.playbooks.form_fuzz_validation).toEqual({ ok: 0, failed: 0, suspicious: 1 });
     expect(report.playbooks.table_sort_each_column).toEqual({ ok: 1, failed: 0, suspicious: 0 });
     expect(report.playbooks.modal_lifecycle).toEqual({ ok: 1, failed: 0, suspicious: 0 });
-    expect(report.playbooks.wizard_full_walkthrough).toEqual({
+    expect(report.playbooks.walk_wizard).toEqual({
       ok: 1,
       failed: 0,
       suspicious: 0,

@@ -53,12 +53,12 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => {
   return {
     query: vi.fn().mockImplementation(() => fakeQuery()),
     createSdkMcpServer: vi.fn().mockReturnValue({ name: 'mock-auth', version: '1.0.0', tools: [] }),
-    tool: vi.fn().mockImplementation(
-      (name: string, _desc: string, _shape: unknown, handler: ToolHandler) => {
+    tool: vi
+      .fn()
+      .mockImplementation((name: string, _desc: string, _shape: unknown, handler: ToolHandler) => {
         registeredHandlers.set(name, handler);
         return { name, handler };
-      },
-    ),
+      }),
   };
 });
 
@@ -81,8 +81,8 @@ vi.mock('../logging/logger.ts', () => ({
 
 import { launchBrowser } from '../auth/login.ts';
 import { SdkLlmBackend } from '../llm/sdk-backend.ts';
-import { runAuthAgentSdk } from './auth-agent-sdk.ts';
 import type { AuthAgentInput } from './auth-agent.ts';
+import { runAuthAgentSdk } from './auth-agent-sdk.ts';
 
 function makeMockPage() {
   return {

@@ -1,3 +1,5 @@
+import { sanitizeForLlm } from '../safety/sanitize.ts';
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -75,8 +77,9 @@ const DEFAULT_LLM_RESULT_BYTES = 8 * 1024;
 export function redactForLlm(value: unknown, maxBytes: number = DEFAULT_LLM_RESULT_BYTES): string {
   const redacted =
     typeof value === 'string' ? value : (JSON.stringify(deepRedact(value)) ?? 'undefined');
-  if (Buffer.byteLength(redacted, 'utf8') <= maxBytes) return redacted;
-  const truncated = redacted.slice(0, maxBytes);
+  const sanitized = sanitizeForLlm(redacted);
+  if (Buffer.byteLength(sanitized, 'utf8') <= maxBytes) return sanitized;
+  const truncated = sanitized.slice(0, maxBytes);
   return `${truncated}\n[truncated at ${maxBytes} bytes]`;
 }
 

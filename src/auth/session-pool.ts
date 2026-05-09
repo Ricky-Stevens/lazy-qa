@@ -142,7 +142,9 @@ export async function acquireSession(input: AcquireInput): Promise<AcquireResult
             key: redactedKey(key),
             refCount: 'unknown',
             stack: err.stack,
-            browserPid: (result.browser as unknown as { process?: () => { pid?: number } }).process?.()?.pid ?? 'unknown',
+            browserPid:
+              (result.browser as unknown as { process?: () => { pid?: number } }).process?.()
+                ?.pid ?? 'unknown',
           });
           sessions.delete(key);
         });

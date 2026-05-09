@@ -12,7 +12,9 @@ export type TerminationReason =
   | 'sdk-end'
   /** Terminated early by the rebalancer — unproductive agent whose budget
    *  was redistributed to higher-performing agents. */
-  | 'rebalanced';
+  | 'rebalanced'
+  /** Agent completed all items in its task queue. */
+  | 'scope-complete';
 
 /**
  * Token usage for a journey.

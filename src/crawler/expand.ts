@@ -9,6 +9,7 @@
 import type { Page } from 'playwright';
 import type { Logger } from '../logging/logger.ts';
 import { parsePage } from '../page-model/parser.ts';
+import { deriveRoute } from '../util/route.ts';
 import { probeAffordances } from './affordance-probe.ts';
 import { buildRouteEntry } from './sitemap.ts';
 import type { RouteEntry, SiteMapAccessor } from './types.ts';
@@ -23,17 +24,6 @@ export interface ExpandRouteOptions {
   /** Forwarded to the affordance probe so it can skip navigation to off-host
    * URLs discovered behind buttons/menus. Empty array = no restriction. */
   allowedHosts?: string[];
-}
-
-function deriveRoute(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const isSpaHash = /^#!?\//.test(u.hash);
-    if (isSpaHash) return `${u.origin}/${u.hash}`;
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return rawUrl;
-  }
 }
 
 /**

@@ -80,10 +80,7 @@ const AUTH_GATED_ATTACKERS = new Set([
  *
  * Each agent gets its SKILL.md defaultBudget verbatim — no pool-splitting.
  */
-export function buildAgentQueues(
-  cfg: Config,
-  skillsBundle: SkillsBundle,
-): AgentQueues {
+export function buildAgentQueues(cfg: Config, skillsBundle: SkillsBundle): AgentQueues {
   const sel = cfg.agent_selection;
   const credentials = resolveTargetCredentials(cfg);
   const isAuth = cfg.target.auth.type === 'form';
@@ -99,7 +96,9 @@ export function buildAgentQueues(
 
     if (isAttacker && !isAuth && AUTH_GATED_ATTACKERS.has(name)) continue;
 
-    const defaultModel = isAttacker ? sel.attacker_model : (sel.qa_model ?? cfg.anthropic.default_model);
+    const defaultModel = isAttacker
+      ? sel.attacker_model
+      : (sel.qa_model ?? cfg.anthropic.default_model);
     const model = persona.model ?? defaultModel;
     const thinkingTokens = isAttacker ? sel.attacker_thinking_tokens : sel.qa_thinking_tokens;
 

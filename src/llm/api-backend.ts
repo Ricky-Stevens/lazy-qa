@@ -51,6 +51,7 @@ export class ApiLlmBackend implements LlmBackend {
       ...(typeof input.thinkingBudgetTokens === 'number' && input.thinkingBudgetTokens > 0
         ? { thinking: { type: 'enabled' as const, budget_tokens: input.thinkingBudgetTokens } }
         : {}),
+      ...(input.toolChoice ? { tool_choice: input.toolChoice } : {}),
     });
 
     return {

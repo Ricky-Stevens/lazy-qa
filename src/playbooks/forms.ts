@@ -676,6 +676,8 @@ export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
 
     // Also run field-type-aware vectors for each fuzzable field (Bug 5).
     // These run after generic vectors so they don't interfere with earlier runs.
+    // Re-register the response listener removed by the generic-vector finally block.
+    ctx.page.on('response', responseHandler);
     try {
       const model = await ctx.pageModel();
       const form = model.forms.find((f) => f.id === input.formId);
@@ -705,8 +707,13 @@ export const formFuzzValidation: Playbook<FormFuzzValidationInput> = {
                 continue;
               }
               fillsAttempted += 1;
+              // Fill the target field with the vector; fill other fuzzable
+              // fields with valid placeholder text so required-field validation
+              // doesn't mask the vector-under-test's behaviour.
               const targetValue =
-                f.label.toLowerCase() === field.label.toLowerCase() ? vector.value : '';
+                f.label.toLowerCase() === field.label.toLowerCase()
+                  ? vector.value
+                  : 'QA Test Value';
               const r = await fillField(ctx.page, freshForm, f.label, targetValue);
               if (r.ok) fillsSucceeded += 1;
             }

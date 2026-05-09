@@ -19,6 +19,7 @@
  * layered on later without changing this module's public types.
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { Page } from 'playwright';
 import { z } from 'zod';
 import type { LlmBackend } from '../llm/backend.ts';
@@ -355,14 +356,26 @@ export async function verifyFinding(input: VerifyInput): Promise<VerifyResult> {
   let detail = '';
   let costUsd = 0;
 
+  // Structured output via tool_choice — guarantees schema compliance and
+  // eliminates the fragile JSON-from-text parsing path. The model is forced
+  // to call submit_verdict with exactly the fields VerifyResponseSchema
+  // describes. Falls back to text-parsing if the backend doesn't support
+  // tool_choice (SDK mode).
+  const verdictToolSchema = z.toJSONSchema(VerifyResponseSchema) as Record<string, unknown>;
+  const verdictTool: Anthropic.Tool = {
+    name: 'submit_verdict',
+    description: 'Submit your verification verdict. You MUST call this tool with your assessment.',
+    input_schema: verdictToolSchema as Anthropic.Tool['input_schema'],
+  };
   try {
     const response = await backend.call({
       model,
       maxTokens: 512,
       systemPrompt: VERIFIER_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userMessage }],
-      tools: [],
+      tools: [verdictTool],
       cacheSystem: true,
+      toolChoice: { type: 'tool', name: 'submit_verdict' },
     });
     const usage = response.usage;
     try {
@@ -375,13 +388,26 @@ export async function verifyFinding(input: VerifyInput): Promise<VerifyResult> {
     } catch {
       // Unknown model — leave costUsd at 0 rather than fail verification.
     }
-    const textBlock = response.content.find((b) => b.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') {
-      throw new Error(`verifier returned no text content (stopReason=${response.stopReason})`);
+    // With tool_choice forcing submit_verdict, the response contains a
+    // tool_use block with the structured verdict. Fall back to text parsing
+    // if the tool_use block is missing (defensive).
+    const toolUse = response.content.find(
+      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === 'submit_verdict',
+    );
+    if (toolUse) {
+      const parsed = VerifyResponseSchema.parse(toolUse.input);
+      verdict = parsed.verdict;
+      detail = parsed.detail;
+    } else {
+      // Fallback: text-based extraction (shouldn't happen with tool_choice).
+      const textBlock = response.content.find((b) => b.type === 'text');
+      if (!textBlock || textBlock.type !== 'text') {
+        throw new Error(`verifier returned no text content (stopReason=${response.stopReason})`);
+      }
+      const parsed = VerifyResponseSchema.parse(extractJsonObject(textBlock.text));
+      verdict = parsed.verdict;
+      detail = parsed.detail;
     }
-    const parsed = VerifyResponseSchema.parse(extractJsonObject(textBlock.text));
-    verdict = parsed.verdict;
-    detail = parsed.detail;
   } catch (err) {
     // On verifier failure, fall back to "intermittent" — neither confirming
     // nor rejecting the finding. Surface the error in detail so a human

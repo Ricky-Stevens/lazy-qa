@@ -43,7 +43,11 @@ function blankModel(extra: Partial<PageModel> = {}): PageModel {
   };
 }
 
-function actionRef(label: string, locator: string, intent: ActionRef['intent'] = 'action'): ActionRef {
+function actionRef(
+  label: string,
+  locator: string,
+  intent: ActionRef['intent'] = 'action',
+): ActionRef {
   return { label, locator, type: 'button', disabled: false, intent };
 }
 

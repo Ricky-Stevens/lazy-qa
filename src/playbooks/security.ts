@@ -1,8 +1,9 @@
 /**
- * Security playbooks — 3 probes:
+ * Security playbooks — 4 probes:
  *   - `idor_probe`: walk a numeric resource ID range and detect access to records the agent shouldn't see.
  *   - `header_audit`: fetch paths and inspect security-related response headers.
  *   - `sensitive_path_audit`: probe well-known sensitive paths (e.g. /admin, /.env, /api/keys) with the agent's session and flag 200 OK responses.
+ *   - `rate_limit_probe`: send rapid requests and check for 429 rate-limiting responses.
  *
  * All probes resolve candidate URLs via `resolveOnOrigin(candidate, currentUrl, allowedHosts)` so they cannot drift to off-allowlist hosts even if a redirect lands the agent there.
  */
@@ -36,11 +37,30 @@ const DEFAULT_SENSITIVE_PATHS = [
   '/api/users',
   '/api/swagger',
   '/.git/HEAD',
+  '/.git/config',
   '/robots.txt',
   '/sitemap.xml',
   '/api/admin',
   '/.env',
   '/backup',
+  '/graphql',
+  '/.well-known/',
+  '/server-status',
+  '/server-info',
+  '/console',
+  '/trace',
+  '/__debug__',
+  '/wp-admin',
+  '/phpmyadmin',
+  '/elmah.axd',
+  '/.htaccess',
+  '/web.config',
+  '/crossdomain.xml',
+  '/.svn/entries',
+  '/.hg/',
+  '/WEB-INF/web.xml',
+  '/dump',
+  '/status',
 ];
 
 /** Resolve a candidate URL/path against the run's allowed hosts. Returns
@@ -136,6 +156,10 @@ const NICE_TO_HAVE_HEADERS = [
   'x-content-type-options',
   'referrer-policy',
   'content-security-policy',
+  'permissions-policy',
+  'cross-origin-opener-policy',
+  'cross-origin-embedder-policy',
+  'cross-origin-resource-policy',
 ];
 
 function auditHeaders(
@@ -167,6 +191,30 @@ function auditHeaders(
 
   const missingNiceToHave = NICE_TO_HAVE_HEADERS.filter((h) => !lc[h]);
   return { missingCritical, missingNiceToHave };
+}
+
+function auditCookieFlags(headers: Record<string, string>, isHttps: boolean): { issues: string[] } {
+  const issues: string[] = [];
+  const cookieHeaders: string[] = [];
+  for (const [k, v] of Object.entries(headers)) {
+    // Playwright joins multiple Set-Cookie headers with '\n'. Split them
+    // so each cookie is audited individually — otherwise flag checks bleed
+    // across cookies (e.g. one cookie's HttpOnly satisfies ALL cookies).
+    if (k.toLowerCase() === 'set-cookie') {
+      for (const part of v.split('\n')) {
+        const trimmed = part.trim();
+        if (trimmed) cookieHeaders.push(trimmed);
+      }
+    }
+  }
+  for (const cookie of cookieHeaders) {
+    const name = cookie.split('=')[0]?.trim() ?? 'unknown';
+    const lower = cookie.toLowerCase();
+    if (!lower.includes('httponly')) issues.push(`${name}: missing HttpOnly`);
+    if (isHttps && !lower.includes('secure')) issues.push(`${name}: missing Secure`);
+    if (!lower.includes('samesite')) issues.push(`${name}: missing SameSite`);
+  }
+  return { issues };
 }
 
 // -----------------------------------------------------------------------------
@@ -301,6 +349,7 @@ const headerAudit: Playbook<HeaderAuditInput> = {
       status: number | null;
       missingCritical: string[];
       missingNiceToHave: string[];
+      cookieIssues?: string[];
       skipped?: 'off-allowlist' | 'fetch-failed';
     }>;
 
@@ -325,7 +374,15 @@ const headerAudit: Playbook<HeaderAuditInput> = {
         const headers = resp.headers();
         const isHttps = url.startsWith('https://');
         const { missingCritical, missingNiceToHave } = auditHeaders(headers, isHttps);
-        results.push({ path, url, status: resp.status(), missingCritical, missingNiceToHave });
+        const { issues: cookieIssues } = auditCookieFlags(headers, isHttps);
+        results.push({
+          path,
+          url,
+          status: resp.status(),
+          missingCritical,
+          missingNiceToHave,
+          cookieIssues,
+        });
         steps.push({
           label: `${path} → ${resp.status()}; missing critical: [${missingCritical.join(', ') || 'none'}]`,
           ok: missingCritical.length === 0,
@@ -348,13 +405,18 @@ const headerAudit: Playbook<HeaderAuditInput> = {
     }
 
     const anyMissing = results.some((r) => r.missingCritical.length > 0);
-    if (anyMissing) {
-      return suspicious(
-        headerAudit.name,
-        `Missing critical security headers on ${results.filter((r) => r.missingCritical.length > 0).length}/${results.length} path(s).`,
-        evidence,
-        steps,
-      );
+    const anyCookieIssues = results.some((r) => (r.cookieIssues?.length ?? 0) > 0);
+    if (anyMissing || anyCookieIssues) {
+      const parts: string[] = [];
+      if (anyMissing)
+        parts.push(
+          `missing critical headers on ${results.filter((r) => r.missingCritical.length > 0).length}/${results.length} path(s)`,
+        );
+      if (anyCookieIssues)
+        parts.push(
+          `cookie flag issues on ${results.filter((r) => (r.cookieIssues?.length ?? 0) > 0).length} path(s)`,
+        );
+      return suspicious(headerAudit.name, parts.join('; ') + '.', evidence, steps);
     }
     return ok(
       headerAudit.name,
@@ -436,10 +498,116 @@ const sensitivePathAudit: Playbook<SensitiveAuditInput> = {
 };
 
 // -----------------------------------------------------------------------------
+// 4. rate_limit_probe
+// -----------------------------------------------------------------------------
+
+interface RateLimitProbeInput {
+  route: string;
+  method?: 'GET' | 'POST';
+}
+
+export const rateLimitProbeShape = {
+  route: z.string(),
+  method: z.enum(['GET', 'POST']).default('GET'),
+} satisfies z.ZodRawShape;
+
+const RATE_LIMIT_REQUEST_COUNT = 15;
+
+const rateLimitProbe: Playbook<RateLimitProbeInput> = {
+  name: 'rate_limit_probe',
+  description:
+    'Send 15 rapid identical requests to a route and check whether rate limiting (HTTP 429) kicks in. ' +
+    'Returns `suspicious` if no 429 is received (no rate limiting detected). ' +
+    'Returns `ok` if any response is 429 (rate limiting is active). ' +
+    'Input: `route` (URL to probe), `method` (GET or POST, default GET).',
+  categories: ['security'],
+  estimatedDurationMs: 6_000,
+  // Speculative probe — rapid requests are expected to trigger 4xx/5xx.
+  // Excluded from storm-detection counter.
+  speculative: true,
+  inputShape: rateLimitProbeShape,
+  async run(input, ctx): Promise<PlaybookOutcome> {
+    const steps: PlaybookStep[] = [];
+    const method = input.method ?? 'GET';
+    const evidence: Record<string, unknown> = {
+      route: input.route,
+      method,
+      requestCount: RATE_LIMIT_REQUEST_COUNT,
+    };
+
+    const targetUrl = resolveOnOrigin(input.route, ctx.page.url(), ctx.allowedHosts);
+    if (!targetUrl) {
+      steps.push({
+        label: 'skip — route is off-allowlist',
+        ok: true,
+        detail: `resolved ${input.route} against allowed hosts — refused`,
+      });
+      return ok(rateLimitProbe.name, 'Route is off-allowlist, skipped.', evidence, steps);
+    }
+
+    const statusCodes: number[] = [];
+    const errors: string[] = [];
+
+    // Fire all requests as fast as possible
+    const promises = Array.from({ length: RATE_LIMIT_REQUEST_COUNT }, async (_, i) => {
+      try {
+        const resp =
+          method === 'POST'
+            ? await ctx.page.request.post(targetUrl, {
+                timeout: 10_000,
+                failOnStatusCode: false,
+              })
+            : await ctx.page.request.get(targetUrl, {
+                timeout: 10_000,
+                failOnStatusCode: false,
+              });
+        statusCodes.push(resp.status());
+        steps.push({
+          label: `request ${i + 1}: ${resp.status()}`,
+          ok: true,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(message);
+        steps.push({
+          label: `request ${i + 1}: failed`,
+          ok: true,
+          detail: message,
+        });
+      }
+    });
+
+    await Promise.all(promises);
+
+    evidence.statusCodes = statusCodes;
+    evidence.errors = errors;
+
+    const has429 = statusCodes.includes(429);
+    evidence.rateLimitDetected = has429;
+
+    if (has429) {
+      return ok(
+        rateLimitProbe.name,
+        `Rate limiting detected on ${input.route} — received 429 response.`,
+        evidence,
+        steps,
+      );
+    }
+
+    return suspicious(
+      rateLimitProbe.name,
+      `No rate limiting detected on ${input.route} after ${RATE_LIMIT_REQUEST_COUNT} rapid requests`,
+      evidence,
+      steps,
+    );
+  },
+};
+
+// -----------------------------------------------------------------------------
 // Registration
 // -----------------------------------------------------------------------------
 
-export { headerAudit, idorProbe, resolveOnOrigin, sensitivePathAudit };
+export { headerAudit, idorProbe, rateLimitProbe, resolveOnOrigin, sensitivePathAudit };
 
 /** Internal helpers exported only for tests. */
 export const __internal = {

@@ -94,7 +94,7 @@ export function renderReviewMarkdown(review: ReviewResult): string {
   lines.push('| Classification | Count |');
   lines.push('|---|---|');
   for (const c of CLASSIFICATION_ORDER) {
-    lines.push(`| ${c.replace('_', ' ')} | ${review.counts[c]} |`);
+    lines.push(`| ${c.replaceAll('_', ' ')} | ${review.counts[c]} |`);
   }
   if (review.missing.length > 0) {
     lines.push(`| _missing from reviewer output_ | ${review.missing.length} |`);
@@ -142,7 +142,7 @@ export function renderReviewMarkdown(review: ReviewResult): string {
       .filter(({ review: r }) => r.classification === cls)
       .sort(bySeverityThenTitle);
     if (entries.length === 0) continue;
-    lines.push(`## ${cls.replace('_', ' ')} (${entries.length})`);
+    lines.push(`## ${cls.replaceAll('_', ' ')} (${entries.length})`);
     lines.push('');
     for (const entry of entries) {
       lines.push(...findingBlock(entry, findingsById));

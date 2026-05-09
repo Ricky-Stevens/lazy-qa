@@ -15,15 +15,15 @@ describe('cost utilities', () => {
       expect(cost).toBe(10.5);
     });
 
-    it('should throw for unknown model', () => {
-      expect(() =>
-        computeCostUsd('claude-unknown-99', {
-          input: 1_000_000,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-        }),
-      ).toThrow(/unknown model/);
+    it('should return conservative estimate for unknown model', () => {
+      const cost = computeCostUsd('claude-unknown-99', {
+        input: 1_000_000,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      });
+      // Conservative fallback: all tokens × $15/Mt
+      expect(cost).toBe(15);
     });
 
     it('should factor in cache read and write tokens', () => {
@@ -33,10 +33,10 @@ describe('cost utilities', () => {
         cacheRead: 500_000,
         cacheWrite: 250_000,
       });
-      // Haiku: input $0.8, output $4, cacheRead $0.08, cacheWrite $1
-      // 1M input @ $0.8 + 0.5M output @ $4 + 0.5M cacheRead @ $0.08 + 0.25M cacheWrite @ $1
-      // = $0.8 + $2 + $0.04 + $0.25 = $3.09
-      expect(cost).toBeCloseTo(3.09, 2);
+      // Haiku: input $1.0, output $5.0, cacheRead $0.10, cacheWrite $2.0
+      // 1M input @ $1.0 + 0.5M output @ $5.0 + 0.5M cacheRead @ $0.10 + 0.25M cacheWrite @ $2.0
+      // = $1.0 + $2.5 + $0.05 + $0.5 = $4.05
+      expect(cost).toBeCloseTo(4.05, 2);
     });
   });
 
@@ -59,10 +59,10 @@ describe('cost utilities', () => {
     });
 
     it('should scale savings proportionally with cache tokens', () => {
-      // For Haiku: input $0.8/Mt, cacheRead $0.08/Mt = $0.72 savings per Mt
+      // For Haiku: input $1.0/Mt, cacheRead $0.10/Mt = $0.90 savings per Mt
       const savings = computeCacheSavingsUsd('claude-haiku-4-5-20251001', 100_000);
-      // 0.1M tokens * $0.72 per M = $0.072
-      expect(savings).toBeCloseTo(0.072, 3);
+      // 0.1M tokens * $0.90 per M = $0.09
+      expect(savings).toBeCloseTo(0.09, 3);
     });
 
     it('should use Math.max to never return negative savings', () => {

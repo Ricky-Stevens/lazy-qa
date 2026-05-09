@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { redactFinding } from '../safety/redact.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 
@@ -26,7 +27,8 @@ export async function persistJourney(runDir: string, journey: Journey): Promise<
 
 export async function persistFindings(runDir: string, findings: Finding[]): Promise<void> {
   await mkdir(runDir, { recursive: true });
-  await writeFile(path.join(runDir, 'findings.json'), JSON.stringify(findings, null, 2), 'utf8');
+  const redacted = findings.map(redactFinding);
+  await writeFile(path.join(runDir, 'findings.json'), JSON.stringify(redacted, null, 2), 'utf8');
 }
 
 export async function writeRunManifest(runDir: string, manifest: RunManifest): Promise<void> {
@@ -40,8 +42,9 @@ export async function writeSummaryMarkdown(
   findings: Finding[],
 ): Promise<void> {
   const sevOrder = ['critical', 'major', 'minor', 'cosmetic'] as const;
+  const redacted = findings.map(redactFinding);
   const bySev: Record<string, Finding[]> = Object.fromEntries(sevOrder.map((s) => [s, []]));
-  for (const f of findings) bySev[f.severity]?.push(f);
+  for (const f of redacted) bySev[f.severity]?.push(f);
 
   const lines: string[] = [];
   lines.push(`# Run summary`);

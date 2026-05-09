@@ -449,7 +449,12 @@ export class EventWriter {
     }
     this.queue = this.queue.then(async () => {
       if (!this.fd) throw new Error('EventWriter not open');
-      await this.fd.write(line);
+      try {
+        await this.fd.write(line);
+      } catch {
+        // Swallow individual write failures so one bad write doesn't
+        // poison the queue chain for all subsequent writes.
+      }
     });
     return this.queue;
   }

@@ -27,6 +27,7 @@ export interface Finding {
   route?: string;
   confidence: 'certain' | 'likely' | 'maybe-flake';
   source: 'agent' | 'heuristic';
+  agentId?: string;
   /** Set when source='heuristic'. Currently unused — heuristic finder was retired
    * with note_step. Kept on the type so persisted findings from older runs still parse. */
   ruleName?: string;
@@ -36,4 +37,14 @@ export interface Finding {
   /** Optional list of tool calls the agent recommends a reviewer (or replay
    * tool) execute to reproduce the finding. */
   reproductionActions?: Array<{ tool: string; args: Record<string, unknown> }>;
+  httpStatus?: number;
+  httpMethod?: string;
+  requestUrl?: string;
+  consoleErrors?: string[];
+  /** URL of the page at the moment the finding was filed. Auto-captured by
+   *  the harness — agents do not set this directly. */
+  filedAtUrl?: string;
+  /** First N bytes of the HTTP response body at the time the finding was
+   *  filed (when available). Auto-captured by the harness. */
+  responseBodySample?: string;
 }

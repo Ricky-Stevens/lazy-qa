@@ -25,7 +25,9 @@ export type PlaybookCategory =
   | 'search'
   | 'file'
   | 'async'
-  | 'discovery';
+  | 'discovery'
+  | 'performance'
+  | 'responsive';
 
 /** Runtime context available to every playbook. Supplied by the caller (the
  * browser MCP server's handler-builder). */
@@ -91,6 +93,8 @@ export interface RawToolDef {
  * inside the playbook. URL-guessing probes always trip 4xx/5xx — that's the
  * point — and shouldn't poison the "is the backend sick?" detector.
  */
+const PLAYBOOK_TIMEOUT_MS = 60_000;
+
 export async function runPlaybook<I>(
   pb: Playbook<I>,
   input: I,
@@ -98,9 +102,24 @@ export async function runPlaybook<I>(
 ): Promise<PlaybookOutcome> {
   const start = Date.now();
   try {
-    const outcome = pb.speculative
-      ? await withProbeMode(ctx.agentId, () => pb.run(input, ctx))
-      : await pb.run(input, ctx);
+    const runFn = pb.speculative
+      ? () => withProbeMode(ctx.agentId, () => pb.run(input, ctx))
+      : () => pb.run(input, ctx);
+
+    const timeoutMs = pb.estimatedDurationMs
+      ? Math.max(PLAYBOOK_TIMEOUT_MS, pb.estimatedDurationMs * 3)
+      : PLAYBOOK_TIMEOUT_MS;
+
+    const outcome = await Promise.race([
+      runFn(),
+      new Promise<never>((_, reject) => {
+        const t = setTimeout(
+          () => reject(new Error(`playbook timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+        if (typeof t === 'object' && 'unref' in t) (t as { unref: () => void }).unref();
+      }),
+    ]);
     outcome.durationMs = Date.now() - start;
     return outcome;
   } catch (err) {

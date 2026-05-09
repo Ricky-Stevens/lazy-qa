@@ -271,22 +271,25 @@ export async function loadSkills(rootDir?: string): Promise<SkillsBundle> {
       // Use a URL-form import so Node/tsx can resolve the TypeScript file.
       handlerMod = (await import(/* @vite-ignore */ `file://${handlerPath}`)) as HandlerModule;
     } catch (err) {
-      throw new Error(
+      console.error(
         `Skills loader: failed to import handler for playbook '${fm.name}' at ${handlerPath}: ${
           err instanceof Error ? err.message : String(err)
-        }`,
+        }. Skipping this playbook.`,
       );
+      continue;
     }
 
     if (typeof handlerMod.handler !== 'function') {
-      throw new Error(
-        `Skills loader: handler.ts for playbook '${fm.name}' must export a 'handler' function`,
+      console.error(
+        `Skills loader: handler.ts for playbook '${fm.name}' must export a 'handler' function. Skipping.`,
       );
+      continue;
     }
     if (handlerMod.inputShape == null || typeof handlerMod.inputShape !== 'object') {
-      throw new Error(
-        `Skills loader: handler.ts for playbook '${fm.name}' must export an 'inputShape' object`,
+      console.error(
+        `Skills loader: handler.ts for playbook '${fm.name}' must export an 'inputShape' object. Skipping.`,
       );
+      continue;
     }
 
     const skill: Skill = {

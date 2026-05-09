@@ -31,30 +31,83 @@ export interface SitePlaybookResult {
 // ─── Keyword sets for heuristic classification ───────────────────────────────
 
 const ECOMMERCE_KEYWORDS = [
-  'cart', 'basket', 'checkout', 'payment', 'order', 'shop', 'product',
-  'price', 'buy', 'purchase', 'shipping', 'delivery', 'coupon', 'discount',
-  'add-to-cart', 'add-to-basket', 'wallet',
+  'cart',
+  'basket',
+  'checkout',
+  'payment',
+  'order',
+  'shop',
+  'product',
+  'price',
+  'buy',
+  'purchase',
+  'shipping',
+  'delivery',
+  'coupon',
+  'discount',
+  'add-to-cart',
+  'add-to-basket',
+  'wallet',
 ];
 
 const ADMIN_KEYWORDS = [
-  'admin', 'dashboard', 'manage', 'settings', 'config', 'users',
-  'create', 'edit', 'delete', 'update', 'crud', 'panel', 'console',
-  'permissions', 'roles',
+  'admin',
+  'dashboard',
+  'manage',
+  'settings',
+  'config',
+  'users',
+  'create',
+  'edit',
+  'delete',
+  'update',
+  'crud',
+  'panel',
+  'console',
+  'permissions',
+  'roles',
 ];
 
 const CONTENT_KEYWORDS = [
-  'blog', 'article', 'post', 'news', 'page', 'content', 'media',
-  'gallery', 'archive', 'category', 'tag', 'publish',
+  'blog',
+  'article',
+  'post',
+  'news',
+  'page',
+  'content',
+  'media',
+  'gallery',
+  'archive',
+  'category',
+  'tag',
+  'publish',
 ];
 
 const SOCIAL_KEYWORDS = [
-  'profile', 'feed', 'follow', 'message', 'chat', 'comment', 'like',
-  'share', 'notification', 'friend', 'group', 'community',
+  'profile',
+  'feed',
+  'follow',
+  'message',
+  'chat',
+  'comment',
+  'like',
+  'share',
+  'notification',
+  'friend',
+  'group',
+  'community',
 ];
 
 const API_KEYWORDS = [
-  'api', 'rest', 'graphql', 'swagger', 'openapi', 'endpoint',
-  'api-docs', 'v1', 'v2',
+  'api',
+  'rest',
+  'graphql',
+  'swagger',
+  'openapi',
+  'endpoint',
+  'api-docs',
+  'v1',
+  'v2',
 ];
 
 function countKeywordHits(text: string, keywords: string[]): number {
@@ -113,7 +166,9 @@ function buildSiteSummary(sitemap: SiteMap, siteShape: string): string {
     unknown: 'a web application',
   };
 
-  const parts = [`This is ${shapeLabel[siteShape] ?? 'a web application'} with ${routeCount} discovered routes.`];
+  const parts = [
+    `This is ${shapeLabel[siteShape] ?? 'a web application'} with ${routeCount} discovered routes.`,
+  ];
   const features: string[] = [];
   if (formCount > 0) features.push(`${formCount} form${formCount > 1 ? 's' : ''}`);
   if (tableCount > 0) features.push(`${tableCount} table${tableCount > 1 ? 's' : ''}`);

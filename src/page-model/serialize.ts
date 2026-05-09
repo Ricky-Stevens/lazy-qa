@@ -9,6 +9,7 @@
 import type {
   ActionRef,
   BareFieldRef,
+  DiscoveredAffordance,
   FormSpec,
   ModalSpec,
   PageModel,
@@ -224,6 +225,26 @@ export function serializeForAgent(model: PageModel): string {
     body: model.bareFields.slice(0, 20).map(fmtBareField),
   };
 
+  const discoveredLines: string[] = [];
+  if (model.discovered && model.discovered.length > 0) {
+    for (const d of model.discovered.slice(0, 10)) {
+      const outcome = d.outcome.kind;
+      if (outcome === 'inert') continue;
+      let detail = '';
+      if (d.outcome.kind === 'modal')
+        detail = ` → modal "${d.outcome.modalName}"${d.outcome.hasForm ? ' (has form)' : ''}`;
+      else if (d.outcome.kind === 'menu') detail = ` → menu (${d.outcome.items.length} items)`;
+      else if (d.outcome.kind === 'inline-form') detail = ` → inline form "${d.outcome.formName}"`;
+      else if (d.outcome.kind === 'navigation') detail = ` → navigates to ${d.outcome.toRoute}`;
+      else if (d.outcome.kind === 'error') detail = ` → error: ${d.outcome.detail}`;
+      discoveredLines.push(`  - "${d.trigger.label}" [${d.context}]${detail}`);
+    }
+  }
+  const discoveredSection: Section = {
+    header: discoveredLines.length > 0 ? `Discovered affordances (${discoveredLines.length}):` : '',
+    body: discoveredLines,
+  };
+
   const signalLines: string[] = [];
   if (model.network.length > 0 || model.console.length > 0) {
     signalLines.push('⚠️ since last action:');
@@ -259,6 +280,7 @@ export function serializeForAgent(model: PageModel): string {
     navSection,
     bareSection,
     bareFieldsSection,
+    discoveredSection,
     signalsSection,
   ];
   let output = joinSections(sections);
@@ -279,6 +301,7 @@ export function serializeForAgent(model: PageModel): string {
     navSection,
     bareSection,
     bareFieldsSection,
+    discoveredSection,
   ];
   const totalBodyLen = trimmable.reduce((acc, s) => acc + s.body.join('\n').length, 0);
   if (totalBodyLen === 0) {

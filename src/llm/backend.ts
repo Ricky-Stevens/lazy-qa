@@ -15,6 +15,10 @@ export interface LlmCallInput {
   cacheSystem?: boolean;
   cacheLastTool?: boolean;
   cacheLastMessage?: boolean;
+  /** Force the model to call a specific tool (structured output) or any tool.
+   *  API backend maps this to the `tool_choice` request param; SDK backend
+   *  ignores it (the SDK controls tool dispatch internally). */
+  toolChoice?: Anthropic.ToolChoice;
 }
 
 /** Normalised response across backends. */

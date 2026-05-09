@@ -25,12 +25,15 @@ export const MODEL_PRICING: Record<string, PricePerMillion> = {
   },
   // CHECK: verify against current anthropic pricing; update as needed
   'claude-haiku-4-5-20251001': {
-    input: 0.8,
-    output: 4,
-    cacheRead: 0.08,
-    cacheWrite: 1.0,
+    input: 1.0,
+    output: 5.0,
+    cacheRead: 0.1,
+    cacheWrite: 2.0,
   },
 };
+
+// Alias: short model name → canonical pricing
+MODEL_PRICING['claude-haiku-4-5'] = MODEL_PRICING['claude-haiku-4-5-20251001']!;
 
 export function computeCostUsd(
   model: string,
@@ -38,9 +41,9 @@ export function computeCostUsd(
 ): number {
   const pricing = MODEL_PRICING[model];
   if (!pricing) {
-    throw new Error(
-      `computeCostUsd: unknown model '${model}'. Add it to MODEL_PRICING in src/orchestrator/cost.ts`,
-    );
+    const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    const conservativePerMillion = 15;
+    return (totalTokens * conservativePerMillion) / 1_000_000;
   }
   return (
     (usage.input * pricing.input +

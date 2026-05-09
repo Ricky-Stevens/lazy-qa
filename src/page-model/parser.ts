@@ -25,6 +25,7 @@
 import { createHash } from 'node:crypto';
 import type { Page } from 'playwright';
 import YAML from 'yaml';
+import { deriveRoute } from '../util/route.ts';
 import type {
   ActionRef,
   BareFieldRef,
@@ -1084,17 +1085,6 @@ function computeTextHash(text: string): string {
   return createHash('sha1').update(text).digest('hex').slice(0, 16);
 }
 
-function deriveRoute(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const isSpaHash = /^#!?\//.test(u.hash);
-    if (isSpaHash) return `${u.origin}/${u.hash}`;
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return rawUrl;
-  }
-}
-
 /** Locate a DOM form skeleton matching the AX form node by name, then by
  *  presence of the aria-label, then by index. Returns the first unconsumed
  *  match. */
@@ -1983,7 +1973,7 @@ export async function parsePage(
     network: signals?.network ?? [],
     console: signals?.console ?? [],
     textHash: computeTextHash(dom.bodyText || ''),
-    looksBroken: dom.interactiveCount < 8,
+    looksBroken: dom.interactiveCount < 3,
     interactiveCount: dom.interactiveCount,
     capturedAt: new Date().toISOString(),
   };

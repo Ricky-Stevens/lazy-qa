@@ -35,12 +35,16 @@ const walkWizardShape = {
   wizardId: z.string(),
   stepInputs: z.array(z.record(z.string(), z.string())),
   expectFinish: z.boolean().optional(),
+  testBackNav: z.boolean().optional(),
 } satisfies z.ZodRawShape;
 
 export interface WalkWizardInput {
   wizardId: string;
   stepInputs: Record<string, string>[];
   expectFinish?: boolean;
+  /** When true, after completing step 2+ click Back and verify that the
+   * previous step's values are still present. Default: false. */
+  testBackNav?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +88,32 @@ async function fillByLabel(
 }
 
 /**
+ * Read a field value by label for back-navigation verification. Tries the
+ * same multi-strategy locators as fillByLabel.
+ */
+async function readFieldValue(page: Page, label: string): Promise<{ ok: boolean; value: string }> {
+  const attempts: Array<() => Promise<string>> = [
+    () => page.getByLabel(label, { exact: false }).first().inputValue({ timeout: FILL_TIMEOUT_MS }),
+    () => page.locator(`[name="${label}"]`).first().inputValue({ timeout: FILL_TIMEOUT_MS }),
+    () =>
+      page
+        .getByPlaceholder(label, { exact: false })
+        .first()
+        .inputValue({ timeout: FILL_TIMEOUT_MS }),
+    () => page.locator(`[aria-label="${label}"]`).first().inputValue({ timeout: FILL_TIMEOUT_MS }),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const value = await attempt();
+      return { ok: true, value };
+    } catch {
+      // try next strategy
+    }
+  }
+  return { ok: false, value: '' };
+}
+
+/**
  * Fill all key/value pairs for one step. Records one sub-step per field.
  * Returns counts of filled vs missed fields.
  */
@@ -118,7 +148,7 @@ async function fillStepInputs(
 export const walkWizard: Playbook<WalkWizardInput> = {
   name: 'walk_wizard',
   description:
-    'Step through a multi-step wizard. `stepInputs[i]` is the field-values map for step i+1 (keys are field labels, values are strings to fill). Clicks Next between steps and Finish on the last step when `expectFinish` is true (the default). Status: `ok` on completion, `suspicious` if stuck mid-walk (no Next button at a non-final step, or Finish required but missing/failed), `failed` if `wizardId` is unknown.',
+    "Step through a multi-step wizard. `stepInputs[i]` is the field-values map for step i+1 (keys are field labels, values are strings to fill). Clicks Next between steps and Finish on the last step when `expectFinish` is true (the default). Set `testBackNav: true` to verify that navigating Back from the last step preserves the previous step's field values (catches state-loss bugs). Status: `ok` on completion, `suspicious` if stuck mid-walk, back-nav loses state, or Finish missing/failed; `failed` if `wizardId` is unknown.",
   categories: ['wizard'],
   estimatedDurationMs: 12_000,
   inputShape: walkWizardShape,
@@ -243,6 +273,89 @@ export const walkWizard: Playbook<WalkWizardInput> = {
     evidence.stepResults = stepResults;
 
     // ------------------------------------------------------------------
+    // Back-navigation test: after completing at least 2 steps, click Back
+    // and verify the previous step's field values are preserved.
+    // ------------------------------------------------------------------
+    const backNavResults: Array<{ step: number; preserved: boolean; detail: string }> = [];
+    if (input.testBackNav && stuckAt === null && stepResults.length >= 2) {
+      const backRef = wizard.back;
+      if (backRef && !backRef.disabled) {
+        const backCount = await ctx.page
+          .locator(backRef.locator)
+          .count()
+          .catch(() => 0);
+        if (backCount > 0) {
+          // We're currently on the last step; go back one step and verify
+          // the previous step's values persisted.
+          const prevStepIndex = stepResults.length - 2;
+          const prevInputs = input.stepInputs[prevStepIndex];
+          try {
+            await ctx.page.locator(backRef.locator).first().click({ timeout: STEP_TIMEOUT_MS });
+            await ctx.page
+              .waitForLoadState('networkidle', { timeout: STEP_TIMEOUT_MS })
+              .catch(() => {});
+
+            // Read back each value and compare
+            let allPreserved = true;
+            const mismatches: string[] = [];
+            for (const [label, expected] of Object.entries(prevInputs)) {
+              const readResult = await readFieldValue(ctx.page, label);
+              if (readResult.ok && readResult.value !== expected) {
+                allPreserved = false;
+                mismatches.push(`'${label}': expected='${expected}' actual='${readResult.value}'`);
+              }
+            }
+            backNavResults.push({
+              step: prevStepIndex + 1,
+              preserved: allPreserved,
+              detail: allPreserved
+                ? 'all values preserved after back-nav'
+                : `mismatches: ${mismatches.join('; ')}`,
+            });
+            steps.push({
+              label: `back-nav to step ${prevStepIndex + 1}: ${allPreserved ? 'values preserved' : 'values lost'}`,
+              ok: allPreserved,
+              detail: allPreserved ? undefined : mismatches.join('; '),
+            });
+
+            // Re-advance to the last step so Finish can proceed
+            const nextRef = wizard.next;
+            if (nextRef && !nextRef.disabled) {
+              try {
+                await ctx.page.locator(nextRef.locator).first().click({ timeout: STEP_TIMEOUT_MS });
+                await ctx.page
+                  .waitForLoadState('networkidle', { timeout: STEP_TIMEOUT_MS })
+                  .catch(() => {});
+              } catch {
+                steps.push({
+                  label: 'back-nav: failed to re-advance after back test',
+                  ok: false,
+                });
+              }
+            }
+          } catch (err) {
+            steps.push({
+              label: 'back-nav: Back click failed',
+              ok: false,
+              detail: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } else {
+          steps.push({
+            label: 'back-nav: Back button not found in DOM — skipped',
+            ok: true,
+          });
+        }
+      } else {
+        steps.push({
+          label: `back-nav: Back button ${backRef ? 'disabled' : 'not in page model'} — skipped`,
+          ok: true,
+        });
+      }
+    }
+    evidence.backNavResults = backNavResults;
+
+    // ------------------------------------------------------------------
     // Click Finish on the last step (when expectFinish is true)
     // ------------------------------------------------------------------
     let finishClicked = false;
@@ -339,9 +452,23 @@ export const walkWizard: Playbook<WalkWizardInput> = {
       );
     }
 
+    // Back-nav state-loss is suspicious even if the forward walk succeeded.
+    const backNavFailed = backNavResults.some((r) => !r.preserved);
+    if (backNavFailed) {
+      return suspicious(
+        walkWizard.name,
+        `Wizard '${input.wizardId}' completed forward walk, but back-navigation lost field state: ${backNavResults
+          .filter((r) => !r.preserved)
+          .map((r) => `step ${r.step}: ${r.detail}`)
+          .join('; ')}`,
+        evidence,
+        steps,
+      );
+    }
+
     return ok(
       walkWizard.name,
-      `Walked ${stepResults.length} step(s) of '${input.wizardId}'${finishClicked ? ' and clicked Finish' : ''}.`,
+      `Walked ${stepResults.length} step(s) of '${input.wizardId}'${finishClicked ? ' and clicked Finish' : ''}${backNavResults.length > 0 ? '; back-nav state preserved' : ''}.`,
       evidence,
       steps,
     );

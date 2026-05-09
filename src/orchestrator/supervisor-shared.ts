@@ -36,6 +36,7 @@ export interface SupervisorInput {
    *  applicable playbooks have completed) so the supervisor can steer agents
    *  away from already-tested pages. */
   siteMap?: import('../crawler/types.ts').SiteMapAccessor;
+  testPlan?: import('./test-plan.ts').TestPlan;
 }
 
 export interface SupervisorResult {
@@ -106,6 +107,8 @@ ${stormRule}
        Also nudge the SHARING agent: "You just shared credentials with the team — IMMEDIATELY call try_login(<X>, <Y>) yourself before continuing."
    → NEW AUTH-REQUIRED ROUTE: broadcast_to_team({message: "New authenticated route discovered: <URL> (note: <Z>). Once you've logged in via try_login, navigate there to explore."}) — only broadcast if not previously broadcast.
    → DO NOT spam broadcasts. One broadcast per credential set, one per significant route. The harness watermarks per-agent so messages aren't re-shown, but excessive broadcasts crowd out your other directives.
+
+5. COVERAGE TRACKING — if check_plan_coverage is available, call it every 2-3 cycles (not every cycle — let agents work). If items remain uncovered and agents are idle or finishing, nudge the most appropriate active agent toward the uncovered item. Reference the specific uncovered item in your nudge: "The test plan item [form-validation on /clients] hasn't been covered yet — navigate there and run form_fuzz_validation on the form."
 
 WHEN TO STOP:
 - All agents have status='finished' or 'errored' → call end_session({reason: "all explorers done"}).
