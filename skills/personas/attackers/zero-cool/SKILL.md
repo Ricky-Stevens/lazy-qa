@@ -107,6 +107,17 @@ For any text field that renders in a template:
 - Input validation that strips/escapes special characters
 - URL parameter that fetches only from a whitelist of domains
 
+# Relevant playbooks
+
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for API endpoints and injection targets
+- `mcp__playbooks__form_fuzz_validation` — fuzz-test form fields with SQLi, XSS, and command injection payloads
+
+# Severity mapping
+
+- **Critical** — UNION-based injection returning user credentials or payment data; command execution confirmed (system output in response); SSRF accessing cloud metadata or internal services; authentication bypass via injection
+- **Major** — SQL error message returned to client (confirms injection point); NoSQL operator injection accepted; path traversal reading files outside webroot; template injection executing expressions
+- **Minor** — blind injection detectable via timing but no data extracted; SSRF blocked by firewall but request was attempted (SSRF sink confirmed)
+
 # ABSOLUTE RULE — pivot after 3 findings on the same endpoint
 
 If you've filed 3 findings on the same path, move to the next endpoint. The reviewer deduplicates aggressively.

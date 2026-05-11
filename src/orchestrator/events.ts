@@ -144,6 +144,16 @@ export type Event =
       finding: Finding;
     }
   | {
+      type: 'finding.suppressed';
+      ts: string;
+      seq: number;
+      runId: string;
+      agentId: string;
+      reason: string;
+      title: string;
+      route?: string;
+    }
+  | {
       type: 'playbook.outcome';
       ts: string;
       seq: number;
@@ -324,15 +334,31 @@ export function capToolResultContent(content: string): string {
   return capString(content, TOOL_RESULT_CONTENT_CAP);
 }
 
-/** JSON-stringify tool.call input and cap at 4 KB. */
+/** JSON-stringify tool.call input and cap at 4 KB. Redacts sensitive fields
+ *  (password, secret, token) to prevent credential leakage into events.jsonl. */
 export function capToolCallInput(input: unknown): string {
   let s: string;
   try {
-    s = JSON.stringify(input) ?? 'null';
+    const safe = redactToolInput(input);
+    s = JSON.stringify(safe) ?? 'null';
   } catch {
     s = '[unserializable]';
   }
   return capString(s, TOOL_CALL_INPUT_CAP);
+}
+
+function redactToolInput(input: unknown): unknown {
+  if (!input || typeof input !== 'object') return input;
+  const obj = input as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (/password|secret|token|api_key/i.test(key) && typeof value === 'string') {
+      result[key] = '[REDACTED]';
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 // ─── EventWriter ─────────────────────────────────────────────────────────────
@@ -372,6 +398,8 @@ export function formatEventLine(e: Event): string | null {
     }
     case 'finding.report':
       return `  ★ finding   ${e.agentId}  ${e.finding.severity}  ${e.finding.title.slice(0, 80)}`;
+    case 'finding.suppressed':
+      return `  ⊘ suppressed ${e.agentId}  ${e.reason}  ${e.title.slice(0, 60)}`;
     case 'playbook.outcome':
       return `  ${e.agentId} playbook ${e.playbookName} → ${e.status}`;
     case 'supervisor.intervention':
@@ -411,6 +439,7 @@ export class EventWriter {
   private seq = 0;
   private fd: FileHandle | null = null;
   private queue: Promise<void> = Promise.resolve();
+  private writeFailures = 0;
   /** Optional tap: when set, every event is also fed to this consumer in
    *  addition to being persisted. Used by `bin/regress.ts` to print a
    *  human-readable audit log to stderr while the run is in progress. */
@@ -451,9 +480,13 @@ export class EventWriter {
       if (!this.fd) throw new Error('EventWriter not open');
       try {
         await this.fd.write(line);
-      } catch {
-        // Swallow individual write failures so one bad write doesn't
-        // poison the queue chain for all subsequent writes.
+      } catch (err) {
+        this.writeFailures = (this.writeFailures ?? 0) + 1;
+        if (this.writeFailures === 1) {
+          process.stderr.write(
+            `[events] write failed (${err instanceof Error ? err.message : String(err)}); subsequent failures will be silent\n`,
+          );
+        }
       }
     });
     return this.queue;
@@ -473,10 +506,16 @@ export class EventWriter {
 export async function readEvents(filepath: string): Promise<Event[]> {
   const { readFile } = await import('node:fs/promises');
   const content = await readFile(filepath, 'utf8');
-  return content
-    .split('\n')
-    .filter((l) => l.length > 0)
-    .map((l) => JSON.parse(l) as Event);
+  const events: Event[] = [];
+  for (const line of content.split('\n')) {
+    if (line.length === 0) continue;
+    try {
+      events.push(JSON.parse(line) as Event);
+    } catch {
+      // Skip corrupt/truncated lines rather than crashing the entire replay.
+    }
+  }
+  return events;
 }
 
 // ─── Replayer ─────────────────────────────────────────────────────────────────
@@ -584,4 +623,79 @@ export function replayRun(events: Event[]): ReplayResult {
   const findings = Array.from(findingsById.values());
 
   return { runId, journeys, findings };
+}
+
+// ─── Event Stats (moved from run.ts) ────────────────────────────────────────
+
+import type { PlaybookOutcomeRecord } from '../findings/coverage.ts';
+
+/** Read the run's events.jsonl and reconstruct PlaybookOutcomeRecords from
+ *  every `playbook.outcome` event. Source of truth for "which playbooks did
+ *  the agents actually execute?" — used by the coverage builder. */
+export async function collectEventStats(eventsPath: string): Promise<{
+  playbookOutcomes: PlaybookOutcomeRecord[];
+  primitiveActivity: Array<{
+    agentId: string;
+    fillForm: number;
+    click: number;
+    type: number;
+    navigate: number;
+    reportFinding: number;
+  }>;
+}> {
+  const { readFile } = await import('node:fs/promises');
+  let raw: string;
+  try {
+    raw = await readFile(eventsPath, 'utf8');
+  } catch {
+    return { playbookOutcomes: [], primitiveActivity: [] };
+  }
+  const playbookOutcomes: PlaybookOutcomeRecord[] = [];
+  const toolMap = new Map<
+    string,
+    { fillForm: number; click: number; type: number; navigate: number; reportFinding: number }
+  >();
+  function bucket(agentId: string) {
+    let b = toolMap.get(agentId);
+    if (!b) {
+      b = { fillForm: 0, click: 0, type: 0, navigate: 0, reportFinding: 0 };
+      toolMap.set(agentId, b);
+    }
+    return b;
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let e: Record<string, unknown>;
+    try {
+      e = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (e.type === 'playbook.outcome') {
+      const status = e.status as string;
+      if (status === 'ok' || status === 'failed' || status === 'suspicious') {
+        playbookOutcomes.push({
+          agentId: String(e.agentId ?? ''),
+          playbookName: String(e.playbookName ?? ''),
+          route: typeof e.route === 'string' ? e.route : '',
+          targetId: typeof e.targetId === 'string' ? e.targetId : null,
+          status,
+        });
+      }
+    } else if (e.type === 'tool.call') {
+      const agentId = String(e.agentId ?? '');
+      if (!agentId) continue;
+      const name = String(e.name ?? '');
+      if (name === 'fill_form') bucket(agentId).fillForm += 1;
+      else if (name === 'click' || name === 'find_and_click') bucket(agentId).click += 1;
+      else if (name === 'type') bucket(agentId).type += 1;
+      else if (name === 'navigate') bucket(agentId).navigate += 1;
+      else if (name === 'report_finding' || name === 'mcp__harness__report_finding')
+        bucket(agentId).reportFinding += 1;
+    }
+  }
+  const primitiveActivity = Array.from(toolMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([agentId, counts]) => ({ agentId, ...counts }));
+  return { playbookOutcomes, primitiveActivity };
 }

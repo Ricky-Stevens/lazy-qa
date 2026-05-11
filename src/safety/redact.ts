@@ -28,6 +28,21 @@ const REDACTION_RULES: RedactionRule[] = [
   // digit (2-7) so we don't redact normal uppercase words like
   // "APPLICATIONCONTEXT" or "UNCAUGHTEXCEPTION".
   { pattern: /\b(?=[A-Z2-7]{16,32}\b)(?=[A-Z]*[2-7])[A-Z2-7]{16,32}\b/g, label: '[TOTP-REDACTED]' },
+  // Provider-prefixed API keys (Stripe, OpenAI, GitHub, Anthropic, AWS)
+  { pattern: /\b(?:sk|pk)[-_](?:live|test)_[a-zA-Z0-9]{10,}\b/g, label: '[APIKEY-REDACTED]' },
+  { pattern: /\bghp_[A-Za-z0-9]{36,}\b/g, label: '[GITHUB-TOKEN-REDACTED]' },
+  { pattern: /\bsk-[a-zA-Z0-9]{20,}\b/g, label: '[APIKEY-REDACTED]' },
+  { pattern: /\bAKIA[A-Z0-9]{16}\b/g, label: '[AWS-KEY-REDACTED]' },
+  { pattern: /\bxox[bpras]-[a-zA-Z0-9-]{10,}\b/g, label: '[SLACK-TOKEN-REDACTED]' },
+  // Credentials in URLs: https://user:pass@host
+  { pattern: /:\/\/[^:\/\s]+:[^@\/\s]+@/g, label: '://[CREDS-REDACTED]@' },
+  // Key-value pairs with sensitive keys (password=..., secret=..., api_key=...)
+  {
+    pattern: /\b(password|secret|api[_-]?key|token|authorization)\s*[:=]\s*\S+/gi,
+    label: '$1=[REDACTED]',
+  },
+  // PEM private keys
+  { pattern: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----/g, label: '[PRIVATE-KEY-REDACTED]' },
 ];
 
 export function redactSensitiveData(text: string): string {

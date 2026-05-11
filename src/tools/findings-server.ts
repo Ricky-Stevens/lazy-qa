@@ -7,6 +7,7 @@ import type { EventWriter } from '../orchestrator/events.ts';
 import type { FindingCache } from '../orchestrator/finding-cache.ts';
 import type { SharedKnowledge } from '../orchestrator/shared-knowledge.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
+import { redactFinding } from '../safety/redact.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 import { captureScreenshot } from './screenshot.ts';
@@ -155,6 +156,13 @@ export function createHarnessMcpServer(
               windowMs: FINDINGS_RATE_WINDOW_MS,
               droppedTitle: args.title,
             });
+            await events?.write({
+              type: 'finding.suppressed',
+              agentId: journey.agentId,
+              reason: 'rate-limit',
+              title: args.title,
+              route: args.route,
+            });
             return {
               content: [
                 {
@@ -296,7 +304,7 @@ export function createHarnessMcpServer(
           await events?.write({
             type: 'finding.report',
             agentId: journey.agentId,
-            finding,
+            finding: redactFinding(finding),
           });
           logger.info('finding.reported', {
             agentId: journey.agentId,
@@ -389,7 +397,7 @@ export function createHarnessMcpServer(
               foundBy: journey.agentId,
               foundAt: ts,
             });
-            summary = `credentials ${args.username}:${args.password.slice(0, 2)}*** (role=${args.role ?? 'unknown'})`;
+            summary = `credentials ${args.username}:**** (role=${args.role ?? 'unknown'})`;
           } else if (args.kind === 'route') {
             if (!args.url) {
               return {

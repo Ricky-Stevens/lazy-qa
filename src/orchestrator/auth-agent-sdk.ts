@@ -12,32 +12,41 @@
  *     (the SDK iterates it, requesting a new user message between each turn)
  *   - AbortController is bridged from input.abortSignal (same as loop-sdk.ts)
  *
- * NOTE: Pre-loop browser launch (launchBrowser, page.goto, dismissPersistentBanners)
- * is copied from auth-agent.ts. If the launch logic changes, update both.
- *
  * Shared helpers (AUTH_AGENT_SYSTEM_PROMPT, captureSessionInfo, safeSnapshot,
- * makeNoopLogger, AuthAgentInput, AuthAgentResult) are imported from
- * auth-agent-shared.ts — not from auth-agent.ts — to avoid a runtime circular
- * import (auth-agent.ts imports runAuthAgentSdk from this file).
+ * makeNoopLogger, launchAuthBrowser, handle*, AuthAgentInput, AuthAgentResult)
+ * are imported from auth-agent-shared.ts — not from auth-agent.ts — to avoid a
+ * runtime circular import (auth-agent.ts imports runAuthAgentSdk from this file).
  */
 
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
-import type { Page } from 'playwright';
-import { z } from 'zod';
-import { dismissPersistentBanners, launchBrowser } from '../auth/login.ts';
 import { resolveClaudeBinaryPath } from '../llm/sdk-binary.ts';
-import type { Logger } from '../logging/logger.ts';
-import { isHostAllowed } from '../safety/guards.ts';
 import {
   AUTH_AGENT_SYSTEM_PROMPT,
+  AUTH_TOOL_DESCRIPTIONS,
+  AUTH_TOOL_SHAPES,
   type AuthAgentInput,
   type AuthAgentResult,
   captureSessionInfo,
   DEFAULT_MAX_TURNS,
-  makeNoopLogger,
+  handleAuthFailed,
+  handleAuthSuccess,
+  handleClick,
+  handleFillForm,
+  handleNavigate,
+  handlePressKey,
+  handleSnapshot,
+  handleType,
+  launchAuthBrowser,
   safeSnapshot,
 } from './auth-agent-shared.ts';
 import { computeCostUsd } from './cost.ts';
+
+/** Wrap a plain text string as an MCP CallToolResult content block array.
+ *  The SDK's `tool()` expects `content` to be `ContentBlock[]` (MCP spec),
+ *  not a plain string. */
+function textResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
+  return { content: [{ type: 'text', text }] };
+}
 
 export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentResult> {
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
@@ -49,51 +58,107 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     username: input.credentials.username,
   });
 
-  // 1. Launch a browser. Copied verbatim from auth-agent.ts; see file header
-  //    comment for why this is intentional duplication rather than a helper.
-  const browser = await launchBrowser(input.stealth, {
-    headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-    channel: 'chrome',
-  }).catch(async () =>
-    launchBrowser(input.stealth, { headless: process.env.PLAYWRIGHT_HEADLESS !== 'false' }),
-  );
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  // 1. Launch browser using the shared helper.
+  const { browser, context, page } = await launchAuthBrowser(input);
 
-  // 2. Initial navigation + best-effort banner dismiss before the agent
-  //    even sees the page. Saves a turn or two.
-  const startUrl = input.loginUrl ?? input.targetUrl;
-  try {
-    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-    await dismissPersistentBanners(page, input.logger.child({ phase: 'auth-agent-sdk.warmup' }));
-  } catch (err) {
-    input.logger.warn('auth-agent-sdk.goto.failed', {
-      url: startUrl,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // 3. Shared closure state. Mutated by auth_success / auth_failed tool handlers.
+  // 2. Shared closure state. Mutated by auth_success / auth_failed tool handlers.
   let terminalSignal: 'success' | 'failed' | null = null;
   let terminalDetail = '';
   let totalCostUsd = 0;
   let turn = 0;
   let lastFinalUrl = page.url();
 
-  // 4. Build MCP tools (same 8 as auth-agent.ts buildAuthTools, using SDK tool()).
-  const authTools = buildSdkAuthTools({
-    page,
-    allowedHosts: input.allowedHosts,
-    logger: input.logger,
-    onSuccess: (detail) => {
-      terminalSignal = 'success';
-      terminalDetail = detail;
-    },
-    onFailed: (reason) => {
-      terminalSignal = 'failed';
-      terminalDetail = reason;
-    },
-  });
+  const onSuccess = (detail: string) => {
+    terminalSignal = 'success';
+    terminalDetail = detail;
+  };
+  const onFailed = (reason: string) => {
+    terminalSignal = 'failed';
+    terminalDetail = reason;
+  };
+
+  // 3. Build MCP tools using SDK tool() — handlers delegate to shared functions.
+  const authTools = [
+    tool(
+      'snapshot',
+      AUTH_TOOL_DESCRIPTIONS.snapshot,
+      AUTH_TOOL_SHAPES.snapshot,
+      async () => {
+        const r = await handleSnapshot(page);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'navigate',
+      AUTH_TOOL_DESCRIPTIONS.navigate,
+      AUTH_TOOL_SHAPES.navigate,
+      async ({ url }: { url: string }) => {
+        const r = await handleNavigate(page, input.allowedHosts, url);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'click',
+      AUTH_TOOL_DESCRIPTIONS.click,
+      AUTH_TOOL_SHAPES.click,
+      async ({ locator }: { locator: string }) => {
+        const r = await handleClick(page, locator);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'type',
+      AUTH_TOOL_DESCRIPTIONS.type,
+      AUTH_TOOL_SHAPES.type,
+      async ({ locator, value }: { locator: string; value: string }) => {
+        const r = await handleType(page, locator, value);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'fill_form',
+      AUTH_TOOL_DESCRIPTIONS.fill_form,
+      AUTH_TOOL_SHAPES.fill_form,
+      async ({ fields }: { fields: Array<{ locator: string; value: string }> }) => {
+        const r = await handleFillForm(page, fields);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'press_key',
+      AUTH_TOOL_DESCRIPTIONS.press_key,
+      AUTH_TOOL_SHAPES.press_key,
+      async ({ key, locator }: { key: string; locator?: string }) => {
+        const r = await handlePressKey(page, key, locator);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'auth_success',
+      AUTH_TOOL_DESCRIPTIONS.auth_success,
+      AUTH_TOOL_SHAPES.auth_success,
+      async ({ detail }: { detail?: string }) => {
+        const r = handleAuthSuccess(page, onSuccess, detail ? String(detail) : undefined);
+        return textResult(r.text);
+      },
+    ),
+
+    tool(
+      'auth_failed',
+      AUTH_TOOL_DESCRIPTIONS.auth_failed,
+      AUTH_TOOL_SHAPES.auth_failed,
+      async ({ reason }: { reason: string }) => {
+        const r = handleAuthFailed(onFailed, String(reason));
+        return textResult(r.text);
+      },
+    ),
+  ];
 
   const AUTH_SERVER_NAME = 'auth';
   const authServer = createSdkMcpServer({
@@ -108,7 +173,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     (t) => `mcp__${AUTH_SERVER_NAME}__${(t as { name: string }).name}`,
   );
 
-  // 5. AbortController bridging — same pattern as loop-sdk.ts.
+  // 4. AbortController bridging — same pattern as loop-sdk.ts.
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   if (input.abortSignal?.aborted) {
@@ -117,7 +182,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     input.abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
-  // 6. Per-turn snapshot injection via async generator.
+  // 5. Per-turn snapshot injection via async generator.
   //    The SDK iterates this, pulling a new user message before each assistant turn.
   //
   //    Lockstep gate: see loop-sdk.ts for the full explanation. The SDK's
@@ -163,10 +228,6 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     };
     await turnGatePromise;
     // Subsequent turns — yield a fresh snapshot between each assistant reply.
-    // Stop yielding when terminal (tool called success/failed), aborted, or
-    // max turns reached. The SDK will also stop iterating once it decides the
-    // conversation is complete, so we don't need to count exactly — the guard
-    // here is belt-and-braces.
     while (!terminalSignal && !input.abortSignal?.aborted && turn < maxTurns) {
       const snap = await safeSnapshot(page);
       armTurnGate();
@@ -277,7 +338,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     void startedAt;
   }
 
-  // 7. If the loop ended without a terminal signal, set a fallback reason.
+  // 6. If the loop ended without a terminal signal, set a fallback reason.
   if (!terminalSignal) {
     if (controller.signal.aborted || input.abortSignal?.aborted) {
       terminalSignal = 'failed';
@@ -288,7 +349,7 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     }
   }
 
-  // 8. On success, capture storage state + derive sessionInfo.
+  // 7. On success, capture storage state + derive sessionInfo.
   //    Cast away TS narrowing — the closure can mutate terminalSignal
   //    during awaited tool handlers, exactly like the API-mode version.
   try {
@@ -350,144 +411,4 @@ export async function runAuthAgentSdk(input: AuthAgentInput): Promise<AuthAgentR
     await context.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
   }
-}
-
-/** Wrap a plain text string as an MCP CallToolResult content block array.
- *  The SDK's `tool()` expects `content` to be `ContentBlock[]` (MCP spec),
- *  not a plain string. */
-function textResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
-  return { content: [{ type: 'text', text }] };
-}
-
-/** Build the 8-tool set as SDK tool() objects.
- *  Bodies match the handlers in auth-agent.ts buildAuthTools exactly. */
-function buildSdkAuthTools(deps: {
-  page: Page;
-  allowedHosts: string[];
-  logger: Logger;
-  onSuccess: (detail: string) => void;
-  onFailed: (reason: string) => void;
-}) {
-  const { page, allowedHosts, onSuccess, onFailed } = deps;
-
-  return [
-    tool(
-      'snapshot',
-      'Re-take a structured snapshot of the current page. Use after any action whose effect you need to observe.',
-      {},
-      async () => {
-        const snap = await safeSnapshot(page);
-        return textResult(snap);
-      },
-    ),
-
-    tool(
-      'navigate',
-      'Navigate to a URL. Use only if the login flow takes you off the current page (e.g. you need to retry from a different starting point).',
-      { url: z.string().url() },
-      async ({ url }) => {
-        if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
-          return textResult(`navigate refused: ${url} not in allowed_hosts.`);
-        }
-        try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-          await dismissPersistentBanners(page, makeNoopLogger());
-          return textResult(`navigated to ${page.url()}`);
-        } catch (err) {
-          return textResult(`navigate failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      },
-    ),
-
-    tool(
-      'click',
-      'Click an element by Playwright locator (e.g. `role=button[name="Log in"]`, `#loginButton`, `a.cc-dismiss`).',
-      { locator: z.string().min(1) },
-      async ({ locator }) => {
-        try {
-          await page.locator(locator).first().click({ timeout: 5_000 });
-          await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-          return textResult(`clicked ${locator}; now on ${page.url()}`);
-        } catch (err) {
-          return textResult(`click failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      },
-    ),
-
-    tool(
-      'type',
-      'Fill a text input by locator. Replaces existing value.',
-      { locator: z.string().min(1), value: z.string() },
-      async ({ locator, value }) => {
-        try {
-          await page.locator(locator).first().fill(value, { timeout: 5_000 });
-          return textResult(`filled ${locator} (${value.length} chars)`);
-        } catch (err) {
-          return textResult(`type failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      },
-    ),
-
-    tool(
-      'fill_form',
-      'Fill multiple inputs in one call. Each entry is { locator, value }. More efficient than several `type` calls.',
-      {
-        fields: z.array(z.object({ locator: z.string().min(1), value: z.string() })).min(1),
-      },
-      async ({ fields }) => {
-        const lines: string[] = [];
-        for (const f of fields) {
-          try {
-            await page.locator(f.locator).first().fill(f.value, { timeout: 5_000 });
-            lines.push(`  ✓ ${f.locator}`);
-          } catch (err) {
-            lines.push(`  ✗ ${f.locator}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-        return textResult(`fill_form (${fields.length} field(s)):\n${lines.join('\n')}`);
-      },
-    ),
-
-    tool(
-      'press_key',
-      'Press a key on the focused element (or document). Useful for submitting via Enter when no submit button exists.',
-      { key: z.string().min(1), locator: z.string().optional() },
-      async ({ key, locator }) => {
-        try {
-          if (locator) {
-            await page.locator(locator).first().press(key, { timeout: 5_000 });
-          } else {
-            await page.keyboard.press(key);
-          }
-          await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-          return textResult(`pressed ${key}; now on ${page.url()}`);
-        } catch (err) {
-          return textResult(
-            `press_key failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      },
-    ),
-
-    tool(
-      'auth_success',
-      'Call this once you have verified the login succeeded (URL changed, logged-in UI visible, no error). Terminal — the auth agent stops after this.',
-      { detail: z.string().optional() },
-      async ({ detail }) => {
-        const msg = detail ? String(detail) : `logged in successfully (final URL: ${page.url()})`;
-        onSuccess(msg);
-        return textResult(`auth_success acknowledged: ${msg}`);
-      },
-    ),
-
-    tool(
-      'auth_failed',
-      'Call this if you cannot log in (wrong credentials, captcha required, login form unreachable, etc.). Terminal.',
-      { reason: z.string().min(1) },
-      async ({ reason }) => {
-        onFailed(String(reason));
-        return textResult(`auth_failed acknowledged: ${String(reason)}`);
-      },
-    ),
-  ];
 }

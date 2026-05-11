@@ -99,13 +99,38 @@ export function assertAllowedTarget(url: string, allowedHosts: string[]): void {
 }
 
 /**
- * Reject if `host` does not look like a non-prod host. Replaces the previous
+ * Reject if a host does not look like a non-prod host. Replaces the previous
  * fail-open `\bprod\b` regex.
  *
  * Defaults match common non-prod prefixes (staging./dev./qa./test./preview./
  * loopback). Operator can override the list via REGRESS_NONPROD_HOST_PATTERNS,
  * which fully replaces the default set when present (a non-empty value means
  * "I am taking responsibility for this list").
+ */
+function assertSingleHostNonProd(host: string): void {
+  if (isLoopback(host)) return;
+
+  const overrides = parseHostList(process.env[NONPROD_PATTERNS_ENV]);
+  if (overrides.length > 0) {
+    if (overrides.includes(host)) return;
+    throw new Error(
+      `Host '${host}' is not in ${NONPROD_PATTERNS_ENV} (${overrides.join(', ')}). ` +
+        `If this is a non-prod host with an unusual name, add it to ${NONPROD_PATTERNS_ENV}.`,
+    );
+  }
+
+  const matches = DEFAULT_NONPROD_PREFIXES.some((p) => host.startsWith(p));
+  if (!matches) {
+    throw new Error(
+      `Host '${host}' does not match any default non-prod prefix ` +
+        `(${DEFAULT_NONPROD_PREFIXES.join(', ')}) and ${NONPROD_PATTERNS_ENV} is unset. ` +
+        `If '${host}' is genuinely non-prod, set ${NONPROD_PATTERNS_ENV}='${host}' (or a list).`,
+    );
+  }
+}
+
+/**
+ * Reject if the target URL does not look like a non-prod host.
  */
 export function assertNonProdHost(url: string): void {
   let host: string;
@@ -114,25 +139,16 @@ export function assertNonProdHost(url: string): void {
   } catch {
     throw new Error(`target.url is not a valid URL: ${url}`);
   }
+  assertSingleHostNonProd(host);
+}
 
-  if (isLoopback(host)) return;
-
-  const overrides = parseHostList(process.env[NONPROD_PATTERNS_ENV]);
-  if (overrides.length > 0) {
-    if (overrides.includes(host)) return;
-    throw new Error(
-      `Target host '${host}' is not in ${NONPROD_PATTERNS_ENV} (${overrides.join(', ')}). ` +
-        `If this is a non-prod host with an unusual name, add it to ${NONPROD_PATTERNS_ENV}.`,
-    );
-  }
-
-  const matches = DEFAULT_NONPROD_PREFIXES.some((p) => host.startsWith(p));
-  if (!matches) {
-    throw new Error(
-      `Target host '${host}' does not match any default non-prod prefix ` +
-        `(${DEFAULT_NONPROD_PREFIXES.join(', ')}) and ${NONPROD_PATTERNS_ENV} is unset. ` +
-        `If '${host}' is genuinely non-prod, set ${NONPROD_PATTERNS_ENV}='${host}' (or a list).`,
-    );
+/**
+ * Reject if ANY host in allowed_hosts is not non-prod. Prevents a config
+ * that pairs a staging frontend URL with a production API domain.
+ */
+export function assertAllHostsNonProd(allowedHosts: string[]): void {
+  for (const host of allowedHosts) {
+    assertSingleHostNonProd(host);
   }
 }
 
@@ -147,10 +163,14 @@ type PlaywrightRoute = {
  * Match rules (in order):
  *   1. exact `host:port` match against any allowed entry
  *   2. exact `hostname` match against any allowed entry (port-stripped both sides)
- *   3. subdomain match — `cdn.staging.example.com` matches `staging.example.com`
  * Returns false for invalid URLs. Port-stripping mirrors the crawler's
  * isAllowedHost so a config entry like `localhost:3000` permits the
  * agent-tool navigate path even though `URL.hostname` drops the port.
+ *
+ * NOTE: subdomain matching was removed (2026-05-10). `allowed_hosts:
+ * ['staging.example.com']` previously permitted `evil.staging.example.com`
+ * via suffix match. This was a wider aperture than operators intended.
+ * Operators who need subdomain access should list each subdomain explicitly.
  */
 export function isHostAllowed(url: string, allowedHosts: string[]): boolean {
   let host: string;
@@ -164,10 +184,12 @@ export function isHostAllowed(url: string, allowedHosts: string[]): boolean {
   }
   for (const allowed of allowedHosts) {
     if (host === allowed) return true;
-    if (hostname === allowed) return true;
-    const allowedHostname = allowed.split(':')[0] ?? allowed;
-    if (hostname === allowedHostname) return true;
-    if (hostname.endsWith(`.${allowedHostname}`)) return true;
+    // Only do port-stripped comparison when the allowed entry has no port.
+    // If the operator listed "localhost:3050", only port 3050 is permitted —
+    // port-stripping would allow any port on localhost.
+    if (!allowed.includes(':')) {
+      if (hostname === allowed) return true;
+    }
   }
   return false;
 }
@@ -184,16 +206,9 @@ export function isPathBanned(url: string, bannedPrefixes: string[]): boolean {
 }
 
 export function createNetworkAllowlistRoute(allowedHosts: string[]) {
-  const set = new Set(allowedHosts);
   return async (route: PlaywrightRoute) => {
-    let host: string;
-    try {
-      host = new URL(route.request().url()).host;
-    } catch {
-      await route.abort();
-      return;
-    }
-    if (!set.has(host)) {
+    const url = route.request().url();
+    if (!isHostAllowed(url, allowedHosts)) {
       await route.abort();
       return;
     }

@@ -123,6 +123,9 @@ export interface BrowserServerInput {
    *  credentials as verified after a successful login attempt — other agents
    *  on their next turn see the [verified] tag and trust the creds. */
   sharedKnowledge?: SharedKnowledge;
+  /** Per-host rate limiter. When set, browser actions (navigate, click,
+   *  fill_form, request_with_session) await a token before proceeding. */
+  rateLimiter?: import('../safety/rate-limiter.ts').RateLimiter;
 }
 
 /** Accessibility node interface for rendering the AX tree. */
@@ -353,6 +356,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
     bannedPathPrefixes = [],
     events,
     selectorCache,
+    rateLimiter,
   } = input;
 
   // Console + network buffers. Drained into PageModel.signals on each parse,
@@ -726,6 +730,14 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
         const page = ensureListeners();
         const fromUrl = page.url();
         await awaitPauseIfNeeded();
+        if (rateLimiter) {
+          try {
+            const host = new URL(url).host;
+            await rateLimiter.acquire(host);
+          } catch {
+            // Invalid URL or limiter stopped — proceed without throttling.
+          }
+        }
         invalidateModelCache();
 
         // Loop-detection: count this URL's recurrence in the recent ring.
@@ -1207,14 +1219,24 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           return textResult(`fetch_resource refused: path is in banned_path_prefixes.`);
         }
         onAction?.({ url, toolName: 'fetch_resource', authWalled: false });
+        if (rateLimiter) {
+          try {
+            const host = new URL(url).host;
+            await rateLimiter.acquire(host);
+          } catch { /* proceed */ }
+        }
         const startedAt = Date.now();
+        const fetchAbort = new AbortController();
+        const fetchTimeout = setTimeout(() => fetchAbort.abort(), 30_000);
         try {
           const resp = await fetch(url, {
             method: method ?? 'GET',
             headers: headers ?? {},
             body: body ?? undefined,
             redirect: 'manual',
+            signal: fetchAbort.signal,
           });
+          clearTimeout(fetchTimeout);
           const respHeaders: Record<string, string> = {};
           resp.headers.forEach((v, k) => {
             respHeaders[k] = v;
@@ -1232,6 +1254,7 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
             ].join('\n'),
           );
         } catch (err) {
+          clearTimeout(fetchTimeout);
           return textResult(
             `fetch_resource failed: ${err instanceof Error ? err.message : String(err)}`,
           );
@@ -1258,6 +1281,12 @@ export function createBrowserMcpServer(input: BrowserServerInput): {
           return textResult(`request_with_session refused: path is in banned_path_prefixes.`);
         }
         onAction?.({ url, toolName: 'request_with_session', authWalled: false });
+        if (rateLimiter) {
+          try {
+            const host = new URL(url).host;
+            await rateLimiter.acquire(host);
+          } catch { /* proceed */ }
+        }
         const page = ensureListeners();
         const startedAt = Date.now();
         try {

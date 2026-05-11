@@ -38,7 +38,8 @@ export class SiteMapImpl implements SiteMapAccessor {
   }
 
   getPageModel(route: string): PageModel | undefined {
-    return this.pageModels.get(route);
+    const model = this.pageModels.get(route);
+    return model ? { ...model } : undefined;
   }
 
   listAllRoutes(): RouteEntry[] {
@@ -130,7 +131,7 @@ export class SiteMapImpl implements SiteMapAccessor {
     const routes: Record<string, RouteEntry> = {};
     for (const [k, v] of this.routes.entries()) routes[k] = { ...v };
     const pageModels: Record<string, PageModel> = {};
-    for (const [k, v] of this.pageModels.entries()) pageModels[k] = v;
+    for (const [k, v] of this.pageModels.entries()) pageModels[k] = { ...v };
     return {
       startedAt: this.startedAt,
       rootUrl: this.rootUrl,

@@ -2,7 +2,7 @@
  * Memory storage path resolution for the agent Memory tool.
  *
  * Strategy: per-target persistence at
- *   <homedir>/.regress-harness/memory/<sha1(targetUrl).slice(0,16)>/
+ *   <homedir>/.lazy-qa/memory/<sha1(targetUrl).slice(0,16)>/
  *
  * Multiple runs against the same target share the directory — cross-run
  * learning is the point. The SHA1 truncation gives a stable 16-char directory
@@ -25,5 +25,5 @@ export function resolveMemoryPath(targetUrl: string, override?: string): string 
     return path.resolve(override);
   }
   const hash = createHash('sha1').update(targetUrl).digest('hex').slice(0, 16);
-  return path.join(homedir(), '.regress-harness', 'memory', hash);
+  return path.join(homedir(), '.lazy-qa', 'memory', hash);
 }

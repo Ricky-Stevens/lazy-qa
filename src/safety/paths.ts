@@ -38,3 +38,44 @@ export function assertAbsoluteWithinRoot(
     `${label} escapes allowed root: '${absoluteCandidate}' not under '${resolvedRoot}'`,
   );
 }
+
+/** Sensitive path patterns that mechanically indicate a security exposure when
+ *  returning HTTP 200 with non-trivial content. Shared between:
+ *  - pre-classify.ts (auto-classifies as confirmed_bug before LLM critic)
+ *  - review.ts rule-floor (prevents critic from downgrading below likely_bug)
+ *
+ *  Intentionally conservative: only paths whose 200 with non-shell body is
+ *  mechanically a real bug regardless of app shape. */
+export const SENSITIVE_PATH_PATTERNS: ReadonlyArray<RegExp> = [
+  /\/\.git\/HEAD\b/,
+  /\/\.git\/config\b/,
+  /\/\.env(?:[/?#]|$)/,
+  /\/\.htaccess\b/,
+  /\/web\.config\b/,
+  /\/WEB-INF\/web\.xml\b/,
+  /\/server-status\b/,
+  /\/server-info\b/,
+  /\/api-docs\b/,
+  /\/swagger\.json\b/,
+  /\/swagger-ui\b/,
+  /\/metrics\b/,
+  /\/actuator\/(?:env|heapdump|threaddump|mappings)\b/,
+  /\/ftp\/?(?:[?#]|$)/,
+];
+
+/** Simple path-string list for pre-classify exact-match checks. */
+export const SENSITIVE_PATHS: ReadonlyArray<string> = [
+  '/.git/HEAD',
+  '/.git/config',
+  '/.env',
+  '/.htaccess',
+  '/web.config',
+  '/WEB-INF/web.xml',
+  '/server-status',
+  '/server-info',
+  '/api-docs',
+  '/swagger.json',
+  '/swagger-ui',
+  '/metrics',
+  '/ftp',
+];

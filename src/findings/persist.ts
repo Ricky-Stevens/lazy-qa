@@ -1,8 +1,16 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { redactFinding } from '../safety/redact.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
+
+/** Write JSON atomically: write to a temp file then rename. Prevents
+ *  truncated/corrupt files if the process crashes mid-write. */
+async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
+  const tmp = `${filePath}.tmp.${Date.now()}`;
+  await writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+  await rename(tmp, filePath);
+}
 
 export interface RunManifest {
   runId: string;
@@ -18,22 +26,22 @@ export interface RunManifest {
 export async function persistJourney(runDir: string, journey: Journey): Promise<void> {
   const journeysDir = path.join(runDir, 'journeys');
   await mkdir(journeysDir, { recursive: true });
-  await writeFile(
-    path.join(journeysDir, `${journey.agentId}.meta.json`),
-    JSON.stringify(journey, null, 2),
-    'utf8',
-  );
+  const redactedJourney = {
+    ...journey,
+    findings: journey.findings.map(redactFinding),
+  };
+  await writeJsonAtomic(path.join(journeysDir, `${journey.agentId}.meta.json`), redactedJourney);
 }
 
 export async function persistFindings(runDir: string, findings: Finding[]): Promise<void> {
   await mkdir(runDir, { recursive: true });
   const redacted = findings.map(redactFinding);
-  await writeFile(path.join(runDir, 'findings.json'), JSON.stringify(redacted, null, 2), 'utf8');
+  await writeJsonAtomic(path.join(runDir, 'findings.json'), redacted);
 }
 
 export async function writeRunManifest(runDir: string, manifest: RunManifest): Promise<void> {
   await mkdir(runDir, { recursive: true });
-  await writeFile(path.join(runDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  await writeJsonAtomic(path.join(runDir, 'manifest.json'), manifest);
 }
 
 export async function writeSummaryMarkdown(

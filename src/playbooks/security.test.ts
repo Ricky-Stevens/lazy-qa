@@ -388,10 +388,16 @@ describe('resolveOnOrigin', () => {
     expect(resolveOnOrigin('/admin', 'https://attacker.example/x', allowed)).toBeNull();
   });
 
-  it('subdomain of allowed host passes', () => {
-    expect(resolveOnOrigin('/x', 'https://api.staging.example.com/y', allowed)).toBe(
-      'https://api.staging.example.com/x',
-    );
+  it('subdomain of allowed host is blocked (strict matching)', () => {
+    expect(resolveOnOrigin('/x', 'https://api.staging.example.com/y', allowed)).toBeNull();
+  });
+  it('subdomain passes when explicitly listed', () => {
+    expect(
+      resolveOnOrigin('/x', 'https://api.staging.example.com/y', [
+        ...allowed,
+        'api.staging.example.com',
+      ]),
+    ).toBe('https://api.staging.example.com/x');
   });
 
   it('invalid base URL returns null', () => {

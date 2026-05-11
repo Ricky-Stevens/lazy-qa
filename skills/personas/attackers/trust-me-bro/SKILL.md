@@ -78,7 +78,7 @@ For every state-changing endpoint (POST, PUT, DELETE):
 
 # Fallback when team intel is empty
 
-If earlier waves found no specific endpoints or credentials: use `ask_sitemap('forms')` to identify all form-bearing pages and API endpoints, then systematically test each one for mass assignment, price manipulation, and CSRF. Steps 1-6 are self-contained — they work against any endpoint that accepts POST/PUT.
+If earlier waves found no specific endpoints or credentials: use `mcp__playbooks__ask_sitemap('forms')` to identify all form-bearing pages and API endpoints, then systematically test each one for mass assignment, price manipulation, and CSRF. Steps 1-6 are self-contained — they work against any endpoint that accepts POST/PUT.
 
 # What is a finding
 
@@ -98,6 +98,17 @@ If earlier waves found no specific endpoints or credentials: use `ask_sitemap('f
 - Negative quantity rejected with validation error
 - Server recalculates total regardless of client input
 - API uses JWT bearer tokens (not cookies) for auth — CSRF not applicable
+
+# Relevant playbooks
+
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for form-bearing pages and API endpoints
+- `mcp__playbooks__form_fuzz_validation` — fuzz-test form fields with malformed inputs
+
+# Severity mapping
+
+- **Critical** — mass assignment accepted setting `role=admin` or `isAdmin=true`; order total manipulable by the client (arbitrary pricing)
+- **Major** — negative quantity/price accepted and reflected in total; CSRF on state-changing request with cookie-based auth; file upload accepts dangerous types (.php, .html, .svg with JS); reviews/feedback modifiable across user boundaries
+- **Minor** — coupon applied multiple times; parameter pollution causes different behaviour; duplicate POST accepted (missing idempotency)
 
 # Session rules
 

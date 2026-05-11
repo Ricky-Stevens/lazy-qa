@@ -9,7 +9,8 @@ import type { Logger } from '../logging/logger.ts';
 import type { ApplicationModel } from '../orchestrator/app-model.ts';
 import { computeCacheSavingsUsd, computeCostUsd } from '../orchestrator/cost.ts';
 import type { EventWriter } from '../orchestrator/events.ts';
-import type { Finding } from '../types/finding.ts';
+import { SENSITIVE_PATH_PATTERNS } from '../safety/paths.ts';
+import { FindingSchema, type Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
 import { type PreClassification, preClassifyFinding } from './pre-classify.ts';
 import { type VerifyResult, type VerifyVerdict, verifyFinding } from './verify.ts';
@@ -93,22 +94,6 @@ export interface ReviewResult {
   verifyCostUsd: number;
 }
 
-/** Patterns recognised by the critic rule-floor. A finding whose route
- *  matches AND whose body/title looks like real exposure cannot be flipped
- *  below `likely_bug` by the critic — verifier still re-checks. Patterns
- *  are intentionally conservative: only paths whose 200 with non-trivial
- *  body is mechanically a real bug regardless of app shape. */
-const RULE_FLOOR_PATTERNS: ReadonlyArray<RegExp> = [
-  /\/\.git\/HEAD\b/,
-  /\/\.git\/config\b/,
-  /\/\.env(?:[/?#]|$)/,
-  /\/api-docs\b/,
-  /\/swagger\.json\b/,
-  /\/swagger-ui\b/,
-  /\/metrics\b/,
-  /\/actuator\/(?:env|heapdump|threaddump|mappings)\b/,
-  /\/ftp\/?(?:[?#]|$)/,
-];
 
 /** Apply the critic rule-floor. If the finding's route matches a high-signal
  *  pattern AND the agent's report indicates real exposure (mention of 200 /
@@ -116,7 +101,7 @@ const RULE_FLOOR_PATTERNS: ReadonlyArray<RegExp> = [
 function applyRuleFloor(finding: Finding, current: ReviewClassification): ReviewClassification {
   if (current === 'confirmed_bug' || current === 'likely_bug') return current;
   const route = finding.route ?? '';
-  const matches = RULE_FLOOR_PATTERNS.some((re) => re.test(route));
+  const matches = SENSITIVE_PATH_PATTERNS.some((re) => re.test(route));
   if (!matches) return current;
   // Sanity-check against the finding text — agents sometimes file findings
   // that MENTION these paths but aren't about exposure (e.g. "/ftp link in
@@ -133,9 +118,9 @@ function applyRuleFloor(finding: Finding, current: ReviewClassification): Review
 }
 
 /** Apply a verify verdict to a review item. Returns a (possibly new) review
- *  item with classification adjusted per the merge rules. The verifier never
- *  *upgrades* a finding — it only confirms or downgrades — so this is a safe
- *  one-way merge. */
+ *  item with classification adjusted per the merge rules. The verifier can
+ *  both downgrade (not_reproducible → not_a_bug) and upgrade (confirmed
+ *  reproducible on a not_a_bug → likely_bug rescue). */
 function applyVerifyVerdict(
   review: ReviewItem,
   verdict: VerifyVerdict,
@@ -145,21 +130,22 @@ function applyVerifyVerdict(
   const reasoning = `${review.reasoning}\n\n${note}`;
   switch (verdict) {
     case 'confirmed_reproducible':
+      // Rescue: if the critic said not_a_bug but the live browser confirms the
+      // issue reproduces, upgrade to likely_bug. The verifier saw real evidence.
+      if (review.classification === 'not_a_bug') {
+        return { ...review, classification: 'likely_bug', reasoning };
+      }
       return { ...review, reasoning };
     case 'intermittent':
-      // Downgrade confirmed → likely; leave likely as-is.
-      return {
-        ...review,
-        classification:
-          review.classification === 'confirmed_bug' ? 'likely_bug' : review.classification,
-        reasoning,
-      };
+      if (review.classification === 'confirmed_bug') {
+        return { ...review, classification: 'likely_bug', reasoning };
+      }
+      return { ...review, reasoning };
     case 'not_reproducible':
       return { ...review, classification: 'not_a_bug', reasoning };
     case 'environmental':
       return { ...review, classification: 'environmental', reasoning };
     case 'different_bug':
-      // Keep at likely_bug — there's something here, but it's not the claimed bug.
       return { ...review, classification: 'likely_bug', reasoning };
   }
 }
@@ -325,7 +311,18 @@ async function loadFindings(runDir: string): Promise<Finding[]> {
   if (!Array.isArray(parsed)) {
     throw new Error(`Expected ${findingsPath} to be an array; got ${typeof parsed}`);
   }
-  return parsed as Finding[];
+  const findings: Finding[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const result = FindingSchema.safeParse(parsed[i]);
+    if (result.success) {
+      findings.push(result.data);
+    } else {
+      process.stderr.write(
+        `[review] Skipping invalid finding at index ${i} in ${findingsPath}: ${result.error.message}\n`,
+      );
+    }
+  }
+  return findings;
 }
 
 async function loadJourneys(runDir: string): Promise<Journey[]> {
@@ -716,13 +713,32 @@ export async function reviewRun(input: ReviewInput): Promise<ReviewResult> {
   let verifyCostUsd = 0;
   if (input.verify) {
     const skipCertain = input.verify.verifyOnlyUncertain === true;
-    const candidates = reviews.filter((r) => {
+
+    // Primary candidates: confirmed/likely bugs.
+    const bugCandidates = reviews.filter((r) => {
       if (r.review.classification !== 'confirmed_bug' && r.review.classification !== 'likely_bug') {
         return false;
       }
       if (skipCertain && r.finding.confidence === 'certain') return false;
       return true;
     });
+
+    // Rescue candidates: sample of not_a_bug findings with a route to navigate
+    // to. Catches false negatives the critic dismissed but a live browser check
+    // would contradict (e.g. page actually shows the claimed error). Cap at 5
+    // to keep verification cost bounded.
+    const NOT_A_BUG_VERIFY_SAMPLE = 5;
+    const rescueCandidates = reviews
+      .filter(
+        (r) =>
+          r.review.classification === 'not_a_bug' &&
+          !r.preClassification &&
+          r.finding.route &&
+          r.finding.route.length > 0,
+      )
+      .slice(0, NOT_A_BUG_VERIFY_SAMPLE);
+
+    const candidates = [...bugCandidates, ...rescueCandidates];
     if (candidates.length > 0) {
       logger.info('verify.start', {
         candidates: candidates.length,

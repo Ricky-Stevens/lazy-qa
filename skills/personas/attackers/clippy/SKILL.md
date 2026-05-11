@@ -21,7 +21,7 @@ Use `fetch_resource` for everything. You work without authentication.
 Use `fetch_resource` only. Do NOT use `navigate`, `snapshot`, or any browser tool. Fire requests back-to-back. Do NOT summarise between calls.
 
 **Step 1 — Security header audit:**
-- Call `header_audit` to run an automated security header check.
+- Call `mcp__playbooks__header_audit` to run an automated security header check.
 - Manually check `fetch_resource` responses for: `Server`, `X-Powered-By`, `X-Framework`, `X-AspNet-Version`, `X-Generator`.
 - Check for MISSING headers: `Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`.
 - Check CORS: send `fetch_resource` with `headers: {"Origin": "https://evil.com"}` and check `Access-Control-Allow-Origin` in response.
@@ -54,6 +54,16 @@ Use `fetch_resource` only. Do NOT use `navigate`, `snapshot`, or any browser too
 - Generic "Not Found" or "Internal Server Error" page with no details
 - Correctly configured CORS for the application's own domain
 - Security headers present and correctly configured
+
+# Relevant playbooks
+
+- `mcp__playbooks__header_audit` — automated security header check against a list of paths
+
+# Severity mapping
+
+- **Critical** — none expected from recon (report what you find; exploitation agents assign final severity)
+- **Major** — overly permissive CORS (`Access-Control-Allow-Origin: *`); stack trace exposing file paths or database type; raw SQL error message returned to client
+- **Minor** — `Server` or `X-Powered-By` header leaking exact version; missing security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options); verbose 404/500 pages with internal path information
 
 # Session rules
 

@@ -68,7 +68,7 @@ For each stored payload, navigate to the rendering page and use `ax_snapshot` to
 
 # Fallback when team intel is empty
 
-If earlier waves found no specific endpoints or credentials: use `ask_sitemap('forms')` to identify all pages with text input fields. Steps 1-4 are self-contained — any text field that stores and renders user input is an XSS candidate regardless of team intel.
+If earlier waves found no specific endpoints or credentials: use `mcp__playbooks__ask_sitemap('forms')` to identify all pages with text input fields. Steps 1-4 are self-contained — any text field that stores and renders user input is an XSS candidate regardless of team intel.
 
 # What is a finding
 
@@ -85,6 +85,17 @@ If earlier waves found no specific endpoints or credentials: use `ask_sitemap('f
 - XSS payload rejected by input validation
 - Content Security Policy blocks inline script execution (note CSP as mitigating factor but still report the unescaped rendering)
 - Self-XSS only (payload visible only to the user who submitted it, not to other users)
+
+# Relevant playbooks
+
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for pages with text input fields
+- `mcp__playbooks__form_fuzz_validation` — fuzz-test form fields with XSS payloads and malformed inputs
+
+# Severity mapping
+
+- **Critical** — stored XSS payload executes in another user's browser (e.g., admin views feedback containing `<script>`); framework template expression evaluated from user input (RCE potential)
+- **Major** — reflected XSS in search results or error messages; DOM-based XSS via URL hash or query parameter; SVG with embedded script rendered inline
+- **Minor** — XSS payload stored and rendered unescaped but blocked by CSP; self-XSS only visible to the submitting user
 
 # Session rules
 

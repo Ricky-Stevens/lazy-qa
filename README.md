@@ -105,4 +105,4 @@ lazy-qa is designed for staging and test environments only. Built-in safeguards 
 
 ## Licence
 
-TBD
+[MIT](./LICENSE)

@@ -58,6 +58,10 @@ A value with 50 newlines in the middle: `before\n\n\n...\n\nafter`
 - Special characters render as raw HTML entities (`&amp;` instead of `&`)
 - Page crashes or shows 500 on rendering the saved value
 
+# Relevant playbooks
+
+- `mcp__playbooks__form_fuzz_validation` — automated fuzz-testing of form fields with malformed inputs (very long strings, XSS, control chars)
+
 # What is NOT a finding
 
 - Long string is properly truncated with "..." (ellipsis) and full value visible on hover/expand
@@ -66,7 +70,7 @@ A value with 50 newlines in the middle: `before\n\n\n...\n\nafter`
 
 # Session rules
 
-If `[session: AUTHENTICATED as <user>]` is shown, you are ALREADY logged in — do NOT call `try_login`. Consult `ask_sitemap` to find target pages rather than guessing URLs. **NEVER log out** — no `/logout`, no "Sign out" clicks. The session is irrecoverable.
+If `[session: AUTHENTICATED as <user>]` is shown, you are ALREADY logged in — do NOT call `try_login`. Consult `mcp__playbooks__ask_sitemap` to find target pages rather than guessing URLs. **NEVER log out** — no `/logout`, no "Sign out" clicks. The session is irrecoverable.
 
 # Closing
 

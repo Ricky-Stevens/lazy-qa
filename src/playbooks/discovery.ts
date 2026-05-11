@@ -12,6 +12,7 @@
 import { z } from 'zod';
 import { probeAffordances } from '../crawler/affordance-probe.ts';
 import { buildRouteEntry } from '../crawler/sitemap.ts';
+import { deriveRoute } from '../util/route.ts';
 import type { Playbook } from './framework.ts';
 import { fail, ok, type PlaybookOutcome, type PlaybookStep, suspicious } from './outcome.ts';
 
@@ -97,7 +98,7 @@ export const askSitemap: Playbook<AskSitemapInput> = {
           break;
         }
         case 'untested forms': {
-          items = ctx.siteMap.listFormsUntested('crud_create_form').slice(0, MAX_ITEMS);
+          items = ctx.siteMap.listFormsUntested('fill_and_verify').slice(0, MAX_ITEMS);
           break;
         }
         case 'unfuzzed forms': {
@@ -260,17 +261,6 @@ export interface DiscoverRouteAffordancesInput {
 const discoverRouteAffordancesShape = {
   force: z.boolean().optional(),
 } satisfies z.ZodRawShape;
-
-function deriveRoute(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const isSpaHash = /^#!?\//.test(u.hash);
-    if (isSpaHash) return `${u.origin}/${u.hash}`;
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return rawUrl;
-  }
-}
 
 export const discoverRouteAffordances: Playbook<DiscoverRouteAffordancesInput> = {
   name: 'discover_route_affordances',

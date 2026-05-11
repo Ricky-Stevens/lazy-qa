@@ -120,7 +120,7 @@ export function buildCoverageReport(inputs: CoverageInputs): CoverageReport {
     },
     forms: {
       found: formsFound,
-      crudCreateAttempted: uniqueTargetsFor(playbookOutcomes, 'crud_create_form'),
+      crudCreateAttempted: uniqueTargetsFor(playbookOutcomes, 'fill_and_verify'),
       crudEditAttempted: uniqueTargetsFor(playbookOutcomes, 'crud_edit_first_row'),
       fuzzAttempted: uniqueTargetsFor(playbookOutcomes, 'form_fuzz_validation'),
     },
@@ -132,7 +132,7 @@ export function buildCoverageReport(inputs: CoverageInputs): CoverageReport {
     },
     modals: {
       found: modalsFound,
-      lifecycleTested: uniqueTargetsFor(playbookOutcomes, 'modal_lifecycle'),
+      lifecycleTested: uniqueTargetsFor(playbookOutcomes, 'fill_and_verify'),
     },
     wizards: {
       found: wizardsFound,

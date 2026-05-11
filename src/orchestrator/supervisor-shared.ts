@@ -5,9 +5,19 @@
  * runtime cycle.
  */
 
+import { recoverAllSessions } from '../auth/session-pool.ts';
+import type { SiteMapAccessor } from '../crawler/types.ts';
 import type { LlmBackend } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import type { EventWriter } from './events.ts';
+import {
+  count4xxIn,
+  count5xxIn,
+  getGlobalPauseSnapshot,
+  pushNudge,
+  setGlobalPause,
+  snapshotAll,
+} from './registry.ts';
 import type { SharedKnowledge } from './shared-knowledge.ts';
 
 export interface SupervisorInput {
@@ -117,3 +127,283 @@ WHEN TO STOP:
 
 BE SPECIFIC IN NUDGES. Reference what the agent was actually doing. A vague nudge is wasted; a nudge that names their currentUrl + recentTools and points to a concrete next step is what unblocks them.`;
 }
+
+// ─── Supervisor Tracker ─────────────────────────────────────────────────────
+
+/** Mutable counters for supervisor interventions and cost tracking. Both
+ *  supervisor.ts and supervisor-sdk.ts create one at the start and pass it
+ *  into the shared handler functions. */
+export class SupervisorTracker {
+  reloginCount = 0;
+  nudgeCount = 0;
+  pauseCount = 0;
+  broadcastCount = 0;
+  selfEnded = false;
+  endedReason: SupervisorResult['endedReason'] = 'max-turns';
+
+  toResult(turns: number, costUsd: number): SupervisorResult {
+    return {
+      turns,
+      costUsd,
+      endedReason: this.endedReason,
+      reloginCount: this.reloginCount,
+      nudgeCount: this.nudgeCount,
+      pauseCount: this.pauseCount,
+      broadcastCount: this.broadcastCount,
+    };
+  }
+}
+
+// ─── Shared Tool Handlers ───────────────────────────────────────────────────
+// Pure-logic handler bodies extracted from supervisor.ts / supervisor-sdk.ts.
+// Both variants wrap these in their respective tool definitions (RawToolDef
+// for API mode, tool() for SDK mode). The wrappers pass `input`, `tracker`,
+// and `events` from their outer closure.
+
+/** Canonical MCP CallToolResult shape — both API-mode and SDK-mode return this. */
+export type ToolResult = { content: Array<{ type: 'text'; text: string }> };
+function textResult(text: string): ToolResult {
+  return { content: [{ type: 'text', text }] };
+}
+
+export async function handleListAgents(
+  input: SupervisorInput,
+): Promise<ToolResult> {
+  const all = snapshotAll();
+  const now = Date.now();
+  const globalPause = getGlobalPauseSnapshot();
+  const lines = all.map((a) => {
+    const lastActionAgo = a.lastActionAt ? Math.round((now - a.lastActionAt) / 1000) : null;
+    const lastTurnAgo = a.lastTurnAt ? Math.round((now - a.lastTurnAt) / 1000) : null;
+    const recent4xx = count4xxIn(a.agentId, 30_000);
+    const recent5xx = count5xxIn(a.agentId, 30_000);
+    const agentPauseRemainingSec =
+      a.pauseUntil && a.pauseUntil > now ? Math.round((a.pauseUntil - now) / 1000) : 0;
+    return JSON.stringify({
+      agentId: a.agentId,
+      profile: a.profileName,
+      status: a.status,
+      authWalled: a.authWalled,
+      currentUrl: a.currentUrl,
+      lastActionSecondsAgo: lastActionAgo,
+      lastTurnSecondsAgo: lastTurnAgo,
+      turns: a.turnsCompleted,
+      findings: a.findingsCount,
+      recentTools: a.recentTools,
+      recent4xxCount: recent4xx,
+      recent5xxCount: recent5xx,
+      agentPauseRemainingSec,
+      hasPendingNudge: a.pendingNudge !== null,
+    });
+  });
+  const globalPauseRemainingSec =
+    globalPause.until > now ? Math.round((globalPause.until - now) / 1000) : 0;
+  const header =
+    globalPauseRemainingSec > 0
+      ? `Global pause: ${globalPauseRemainingSec}s remaining (reason: ${globalPause.reason}).\n`
+      : '';
+
+  let intelText = '';
+  if (input.sharedKnowledge) {
+    const snap = input.sharedKnowledge.snapshot();
+    if (snap.credentials.length > 0 || snap.routes.length > 0) {
+      const intelLines: string[] = ['Team intelligence:'];
+      if (snap.credentials.length > 0) {
+        intelLines.push(`  Credentials (${snap.credentials.length}):`);
+        for (const c of snap.credentials.slice(0, 8)) {
+          const ver = c.loginVerified ? ' [verified]' : '';
+          intelLines.push(
+            `    ${c.username}:${c.password.slice(0, 3)}***${ver} (by ${c.foundBy}, source: ${c.source})`,
+          );
+        }
+      }
+      if (snap.routes.length > 0) {
+        intelLines.push(`  Discovered routes (${snap.routes.length}):`);
+        for (const r of snap.routes.slice(0, 10)) {
+          intelLines.push(
+            `    ${r.url} ${r.requiresAuth ? '[auth]' : ''} status=${r.lastStatus} (by ${r.foundBy})`,
+          );
+        }
+      }
+      intelText = `${intelLines.join('\n')}\n\n`;
+    }
+  }
+
+  let exhaustedText = '';
+  if (input.siteMap) {
+    exhaustedText = renderExhaustedRoutes(input.siteMap);
+  }
+
+  const text =
+    lines.length === 0
+      ? `${intelText}No agents registered yet. Wait and check again.`
+      : `${header}${intelText}${exhaustedText}Agents (${lines.length}):\n${lines.join('\n')}`;
+  return textResult(text);
+}
+
+/** Compute the exhausted-routes block for list_agents output. Extracted so
+ *  both API and SDK handlers stay clean. */
+function renderExhaustedRoutes(siteMap: SiteMapAccessor): string {
+  const untestedForms = new Set(
+    siteMap.listFormsUntested('form_fuzz_validation').map((f) => f.route),
+  );
+  const untestedTables = new Set(
+    siteMap.listTablesUntested('table_sort_each_column').map((t) => t.route),
+  );
+  const untestedModals = new Set(
+    siteMap.listModalsUntested('modal_lifecycle').map((m) => m.route),
+  );
+  const untestedWizards = new Set(
+    siteMap.listWizardsUntested('walk_wizard').map((w) => w.route),
+  );
+  const allRoutes = siteMap.listAllRoutes();
+  const exhausted = allRoutes
+    .filter((r) => {
+      if (!r.visited) return false;
+      const hasAffordances =
+        r.formIds.length > 0 ||
+        r.tableIds.length > 0 ||
+        r.modalIds.length > 0 ||
+        r.wizardIds.length > 0;
+      if (!hasAffordances) return false;
+      return (
+        !untestedForms.has(r.route) &&
+        !untestedTables.has(r.route) &&
+        !untestedModals.has(r.route) &&
+        !untestedWizards.has(r.route)
+      );
+    })
+    .map((r) => r.route);
+  if (exhausted.length === 0) return '';
+  return `\nExhausted routes (fully tested — agents should AVOID these):\n  ${exhausted.slice(0, 30).join('\n  ')}\n`;
+}
+
+export async function handleBroadcast(
+  input: SupervisorInput,
+  tracker: SupervisorTracker,
+  args: { message: string; for_profile?: string },
+): Promise<ToolResult> {
+  const { message, for_profile } = args;
+  if (!input.sharedKnowledge) {
+    return textResult(
+      'broadcast_to_team is unavailable in this run (no SharedKnowledge instance). Use nudge_agent instead.',
+    );
+  }
+  input.sharedKnowledge.addBroadcast({
+    message,
+    forProfile: for_profile,
+    issuedBy: 'supervisor',
+    issuedAt: new Date().toISOString(),
+  });
+  tracker.broadcastCount += 1;
+  input.logger.info('supervisor.broadcast', {
+    forProfile: for_profile,
+    preview: message.slice(0, 200),
+  });
+  await input.events?.write({
+    type: 'team.broadcast',
+    message,
+    forProfile: for_profile,
+  });
+  return textResult(
+    `Broadcast queued${for_profile ? ` for profile=${for_profile}` : ' for all agents'}. Each agent will see the message exactly once on their next turn.`,
+  );
+}
+
+export async function handleRelogin(
+  input: SupervisorInput,
+  tracker: SupervisorTracker,
+): Promise<ToolResult> {
+  const result = await recoverAllSessions();
+  tracker.reloginCount += 1;
+  const text = `relogin_session result: ok=${result.ok} recovered=${result.recovered} failed=${result.failed} | ${result.detail}`;
+  input.logger.info('supervisor.relogin', {
+    ok: result.ok,
+    recovered: result.recovered,
+    failed: result.failed,
+    detail: result.detail,
+  });
+  await input.events?.write({
+    type: 'supervisor.intervention',
+    kind: 'auth-walled',
+    detail: `relogin: ok=${result.ok} recovered=${result.recovered} failed=${result.failed} — ${result.detail}`,
+  });
+  return textResult(text);
+}
+
+export async function handleNudge(
+  input: SupervisorInput,
+  tracker: SupervisorTracker,
+  args: { agentId: string; message: string },
+): Promise<ToolResult> {
+  const { agentId, message } = args;
+  const ok = pushNudge(agentId, message);
+  if (ok) tracker.nudgeCount += 1;
+  const text = ok
+    ? `Nudge queued for ${agentId}. They will read it at the start of their next chunk (≤30s).`
+    : `Failed: no agent registered with id '${agentId}'. Call list_agents to see valid IDs.`;
+  input.logger.info('supervisor.nudge', { agentId, ok, preview: message.slice(0, 200) });
+  if (ok) {
+    await input.events?.write({
+      type: 'supervisor.intervention',
+      kind: 'no-progress',
+      detail: `nudge → ${agentId}: ${message.slice(0, 200)}`,
+    });
+  }
+  return textResult(text);
+}
+
+export async function handlePause(
+  input: SupervisorInput,
+  tracker: SupervisorTracker,
+  args: { duration_seconds: number; reason: string },
+): Promise<ToolResult> {
+  const { duration_seconds, reason } = args;
+  const clamped = Math.max(10, Math.min(180, duration_seconds));
+  const until = Date.now() + clamped * 1000;
+  setGlobalPause(until, reason);
+  tracker.pauseCount += 1;
+  input.logger.info('supervisor.pause_agents', { durationSec: clamped, reason });
+  await input.events?.write({
+    type: 'supervisor.intervention',
+    kind: 'backend-storm',
+    detail: `pause_agents ${clamped}s: ${reason}`,
+  });
+  return textResult(
+    `pause_agents: all agents will sleep until ~${clamped}s from now. Reason: ${reason}. Their next browser action will block; nudges and finding reports continue to work.`,
+  );
+}
+
+export async function handleWait(args: { seconds: number }): Promise<ToolResult> {
+  const clamped = Math.max(10, Math.min(120, args.seconds));
+  await new Promise((r) => setTimeout(r, clamped * 1000));
+  return textResult(`Waited ${clamped}s.`);
+}
+
+export async function handleEndSession(
+  input: SupervisorInput,
+  tracker: SupervisorTracker,
+  args: { reason: string },
+): Promise<ToolResult> {
+  tracker.selfEnded = true;
+  input.logger.info('supervisor.end_session', { reason: args.reason });
+  return textResult(`Supervisor ending: ${args.reason}`);
+}
+
+/** Tool descriptions — shared across both API-mode (as part of RawToolDef) and
+ *  SDK-mode (as tool() description arg). Avoids the twin copies drifting. */
+export const SUPERVISOR_TOOL_DESCRIPTIONS = {
+  list_agents:
+    'Return live runtime state for every explorer agent: id, profileName, status (starting | active | auth_walled | finished | errored), currentUrl, last action timestamp, last turn timestamp, findings count, turns completed, recent tool names, pending nudge. Call this at the start of each cycle to decide who needs help.',
+  broadcast_to_team:
+    'Push a directive to ALL agents (or all agents matching a profile). Distinct from nudge_agent which targets ONE agent — broadcasts go to every explorer. Use for team-wide intelligence: "credentials X:Y are available, log in now", "admin panel discovered at /admin/users, prioritise it", "target backend is down for everyone, switch to read-only exploration". The harness watermarks per-agent so each broadcast renders exactly once per agent. Cap broadcasts at one per significant team event — repeated broadcasts on the same topic are noise.',
+  relogin_session:
+    'Re-authenticate every active shared browser session. Use this when ANY agent is auth_walled. The harness opens a recovery tab on each shared context, fills the login form, and closes the tab. Cookies are context-scoped so all agents on that session immediately see the new auth. Deduplicates concurrent calls — calling more than once per minute is harmless but wasteful.',
+  nudge_agent:
+    "Queue a directive message for a specific agent. The message is delivered as a [SUPERVISOR INTERVENTION] line at the top of that agent's next chunk's user prompt (≤30s latency). Be specific: name what they were doing, what to try instead. A vague nudge is wasted. ONE pending nudge per agent — calling again before consumption overwrites the previous nudge.",
+  pause_agents:
+    "Pause ALL explorer agents for the given duration. Agents' next browser action will sleep until the pause expires (capped at 30s per call, but the pause persists across calls — they re-sleep on each subsequent action). Use when the backend is unhealthy (multi-agent 4xx storm, global outage) so agents stop burning budget thrashing on errors. Calling again before the previous pause expires extends it. Clamped to [10, 180] seconds.",
+  wait: 'Pause for the specified number of seconds before your next turn. The harness sleeps real time — do not poll faster than every 30 seconds. Clamped to [10, 120].',
+  end_session:
+    'Stop the supervisor loop. Use ONLY when all agents have status=finished or status=errored. NEVER use while any agent is still active or auth_walled.',
+} as const;

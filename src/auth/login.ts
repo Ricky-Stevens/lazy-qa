@@ -5,6 +5,7 @@ import { chromium as playwrightChromium } from 'playwright';
 import type { AuthConfig } from '../config/types.ts';
 import type { Logger } from '../logging/logger.ts';
 import { createNetworkAllowlistRoute, isHostAllowed } from '../safety/guards.ts';
+import { assertWithinRoot } from '../safety/paths.ts';
 
 /**
  * Fill an Auth0-style login form on an already-navigated page and verify the
@@ -112,6 +113,7 @@ export async function launchBrowser(
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
+    '--disable-extensions',
   ];
   const mergedOptions = {
     ...options,
@@ -168,20 +170,43 @@ export async function performLogin(input: LoginInput): Promise<LoginResult> {
   await chmod(authDir, 0o700).catch(() => undefined);
   const storageStatePath = path.join(authDir, 'storage-state.json');
 
-  const headless = process.env.PLAYWRIGHT_HEADLESS !== 'false';
+  const headless = process.env.PLAYWRIGHT_HEADLESS !== 'false' && process.env.PLAYWRIGHT_HEADED !== 'true';
 
   // ── auth.type === 'none' ──────────────────────────────────────────────────
   if (auth.type === 'none') {
     logger.info('login.none.launching', { agentId });
     const browser = await launchBrowser(stealth, { headless });
     logger.info('login.none.launched', { agentId });
-    const context = auth.storage_state_path
-      ? await browser.newContext({
-          storageState: path.isAbsolute(auth.storage_state_path)
-            ? auth.storage_state_path
-            : path.resolve(process.cwd(), auth.storage_state_path),
-        })
+
+    let resolvedStorageState: string | undefined;
+    if (auth.storage_state_path) {
+      resolvedStorageState = assertWithinRoot(
+        path.isAbsolute(auth.storage_state_path)
+          ? auth.storage_state_path
+          : path.resolve(process.cwd(), auth.storage_state_path),
+        process.cwd(),
+        'storage_state_path',
+      );
+    }
+
+    const context = resolvedStorageState
+      ? await browser.newContext({ storageState: resolvedStorageState })
       : await browser.newContext();
+
+    // Network allowlist — blocks in-page script-initiated requests (fetch, XHR)
+    // to off-allowlist hosts. Without this, an XSS payload on the target could
+    // exfiltrate session cookies to an attacker domain.
+    await context.route('**/*', async (route) => {
+      const req = route.request();
+      const type = req.resourceType();
+      if (type !== 'document' && type !== 'xhr' && type !== 'fetch') {
+        return route.continue();
+      }
+      if (isHostAllowed(req.url(), allowedHosts)) return route.continue();
+      logger.warn('browser.route.blocked', { url: req.url(), type });
+      return route.abort('blockedbyclient');
+    });
+
     const page = await context.newPage();
     // Always land on the target — the crawler reads page.url() to derive
     // rootUrl, and the agent's first browser tool would otherwise have to

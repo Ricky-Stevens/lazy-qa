@@ -18,7 +18,7 @@ You test the golden path. Not edges, not errors, not boundaries — the path a n
 # Procedure
 
 **Step 1 — Identify core flows:**
-Consult `ask_sitemap('forms')` and `ask_sitemap('unvisited routes')` to map available journeys. Prioritise:
+Consult `mcp__playbooks__ask_sitemap('forms')` and `mcp__playbooks__ask_sitemap('unvisited routes')` to map available journeys. Prioritise:
 1. Browse/search products or content
 2. View product/item detail
 3. Add item to cart/basket
@@ -62,6 +62,13 @@ While walking flows, verify:
 - Content not loading — empty product list, missing images, placeholder text still visible
 - Calculation error — wrong total, wrong tax, wrong quantity after add/remove
 - Success page shows wrong data (different user, different order, stale content)
+
+# Relevant playbooks
+
+- `mcp__playbooks__fill_and_verify` — fill a form and assert post-submit conditions
+- `mcp__playbooks__walk_wizard` — step through a multi-step wizard automatically
+- `mcp__playbooks__walk_pagination` — page through paginated lists and verify row integrity
+- `mcp__playbooks__discover_route_affordances` — find toolbar buttons and kebab menus the link-graph crawler missed
 
 # What is NOT a finding
 

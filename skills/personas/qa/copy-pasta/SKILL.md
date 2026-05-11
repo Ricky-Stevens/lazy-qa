@@ -54,7 +54,7 @@ You are a QA tester. Target any submit button, save button, "Add to cart" button
 
 # Session rules
 
-If `[session: AUTHENTICATED as <user>]` is shown, you are ALREADY logged in — do NOT call `try_login`. Consult `ask_sitemap` to find target pages rather than guessing URLs. **NEVER log out** — no `/logout`, no "Sign out" clicks. The session is irrecoverable.
+If `[session: AUTHENTICATED as <user>]` is shown, you are ALREADY logged in — do NOT call `try_login`. Consult `mcp__playbooks__ask_sitemap` to find target pages rather than guessing URLs. **NEVER log out** — no `/logout`, no "Sign out" clicks. The session is irrecoverable.
 
 # Closing
 

@@ -6,11 +6,14 @@
  * supervisor-shared.ts).
  */
 
-import type { BrowserContext, Page } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
+import { z } from 'zod';
+import { dismissPersistentBanners, launchBrowser } from '../auth/login.ts';
 import type { LlmBackend } from '../llm/backend.ts';
 import type { Logger } from '../logging/logger.ts';
 import { redactForLlm } from '../logging/logger.ts';
 import { parsePage } from '../page-model/parser.ts';
+import { isHostAllowed } from '../safety/guards.ts';
 import { serializeForAgent } from '../page-model/serialize.ts';
 import type { EventWriter } from './events.ts';
 
@@ -166,3 +169,180 @@ export function makeNoopLogger(): Logger {
     child: () => makeNoopLogger(),
   } as unknown as Logger;
 }
+
+// ─── Browser Launch ─────────────────────────────────────────────────────────
+
+/** Launch a browser, open a page, navigate to the start URL, and dismiss
+ *  persistent banners. Both auth-agent.ts and auth-agent-sdk.ts duplicated
+ *  this exact sequence; now they call this instead. */
+export async function launchAuthBrowser(input: AuthAgentInput): Promise<{
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+}> {
+  const browser = await launchBrowser(input.stealth, {
+    headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+    channel: 'chrome',
+  }).catch(async () =>
+    launchBrowser(input.stealth, { headless: process.env.PLAYWRIGHT_HEADLESS !== 'false' }),
+  );
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  const startUrl = input.loginUrl ?? input.targetUrl;
+  const logPhase = input.backend.kind === 'sdk' ? 'auth-agent-sdk.warmup' : 'auth-agent.warmup';
+  try {
+    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await dismissPersistentBanners(page, input.logger.child({ phase: logPhase }));
+  } catch (err) {
+    input.logger.warn(`${input.backend.kind === 'sdk' ? 'auth-agent-sdk' : 'auth-agent'}.goto.failed`, {
+      url: startUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return { browser, context, page };
+}
+
+// ─── Shared Auth Tool Handlers ──────────────────────────────────────────────
+// Pure-logic handler bodies for the 8 auth tools. Both auth-agent.ts and
+// auth-agent-sdk.ts wrap these in their respective tool definition formats.
+
+/** Return type for auth tool handlers — compatible with both API-mode
+ *  `{ content: string }` and SDK-mode `{ content: [{type:'text',text}] }`.
+ *  The API-mode wrapper reads `.text`, the SDK-mode wrapper returns the full
+ *  shape. */
+export interface AuthToolResult {
+  text: string;
+}
+
+export async function handleSnapshot(page: Page): Promise<AuthToolResult> {
+  const snap = await safeSnapshot(page);
+  return { text: snap };
+}
+
+export async function handleNavigate(
+  page: Page,
+  allowedHosts: string[],
+  url: string,
+): Promise<AuthToolResult> {
+  if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
+    return { text: `navigate refused: ${url} not in allowed_hosts.` };
+  }
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await dismissPersistentBanners(page, makeNoopLogger());
+    return { text: `navigated to ${page.url()}` };
+  } catch (err) {
+    return { text: `navigate failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+export async function handleClick(page: Page, locator: string): Promise<AuthToolResult> {
+  try {
+    await page.locator(locator).first().click({ timeout: 5_000 });
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+    return { text: `clicked ${locator}; now on ${page.url()}` };
+  } catch (err) {
+    return { text: `click failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+export async function handleType(
+  page: Page,
+  locator: string,
+  value: string,
+): Promise<AuthToolResult> {
+  try {
+    await page.locator(locator).first().fill(value, { timeout: 5_000 });
+    return { text: `filled ${locator} (${value.length} chars)` };
+  } catch (err) {
+    return { text: `type failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+export async function handleFillForm(
+  page: Page,
+  fields: Array<{ locator: string; value: string }>,
+): Promise<AuthToolResult> {
+  const lines: string[] = [];
+  for (const f of fields) {
+    try {
+      await page.locator(f.locator).first().fill(f.value, { timeout: 5_000 });
+      lines.push(`  ✓ ${f.locator}`);
+    } catch (err) {
+      lines.push(`  ✗ ${f.locator}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { text: `fill_form (${fields.length} field(s)):\n${lines.join('\n')}` };
+}
+
+export async function handlePressKey(
+  page: Page,
+  key: string,
+  locator?: string,
+): Promise<AuthToolResult> {
+  try {
+    if (locator) {
+      await page.locator(locator).first().press(key, { timeout: 5_000 });
+    } else {
+      await page.keyboard.press(key);
+    }
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+    return { text: `pressed ${key}; now on ${page.url()}` };
+  } catch (err) {
+    return { text: `press_key failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+export function handleAuthSuccess(
+  page: Page,
+  onSuccess: (detail: string) => void,
+  detail?: string,
+): AuthToolResult {
+  const msg = detail ?? `logged in successfully (final URL: ${page.url()})`;
+  onSuccess(msg);
+  return { text: `auth_success acknowledged: ${msg}` };
+}
+
+export function handleAuthFailed(
+  onFailed: (reason: string) => void,
+  reason: string,
+): AuthToolResult {
+  onFailed(reason);
+  return { text: `auth_failed acknowledged: ${reason}` };
+}
+
+/** Tool descriptions — shared across both API-mode and SDK-mode. */
+export const AUTH_TOOL_DESCRIPTIONS = {
+  snapshot:
+    'Re-take a structured snapshot of the current page. Use after any action whose effect you need to observe.',
+  navigate:
+    'Navigate to a URL. Use only if the login flow takes you off the current page (e.g. you need to retry from a different starting point).',
+  click:
+    'Click an element by Playwright locator (e.g. `role=button[name="Log in"]`, `#loginButton`, `a.cc-dismiss`).',
+  type: 'Fill a text input by locator. Replaces existing value.',
+  fill_form:
+    'Fill multiple inputs in one call. Each entry is { locator, value }. More efficient than several `type` calls.',
+  press_key:
+    'Press a key on the focused element (or document). Useful for submitting via Enter when no submit button exists.',
+  auth_success:
+    'Call this once you have verified the login succeeded (URL changed, logged-in UI visible, no error). Terminal — the auth agent stops after this.',
+  auth_failed:
+    'Call this if you cannot log in (wrong credentials, captcha required, login form unreachable, etc.). Terminal.',
+} as const;
+
+/** Zod shapes for auth tools — shared so both API and SDK modes use
+ *  identical validation. */
+export const AUTH_TOOL_SHAPES = {
+  snapshot: {},
+  navigate: { url: z.string().url() },
+  click: { locator: z.string().min(1) },
+  type: { locator: z.string().min(1), value: z.string() },
+  fill_form: {
+    fields: z.array(z.object({ locator: z.string().min(1), value: z.string() })).min(1),
+  },
+  press_key: { key: z.string().min(1), locator: z.string().optional() },
+  auth_success: { detail: z.string().optional() },
+  auth_failed: { reason: z.string().min(1) },
+} as const;

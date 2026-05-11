@@ -24,7 +24,7 @@ For each API endpoint that takes a numeric or string ID (from team intel or the 
 - Try GET with IDs that aren't yours: ID 1, 2, 3, and IDs from other known users.
 - Target patterns: `/api/{resource}/{id}` — users, profiles, baskets, orders, cards, addresses, complaints, payments, reviews, messages.
 - For each: `request_with_session({url, method: "GET"})`. If you get data belonging to a different user → `report_finding`.
-- Use `idor_probe` for systematic scanning when you've identified a pattern.
+- Use `mcp__playbooks__idor_probe` for systematic scanning when you've identified a pattern.
 
 # Step 2 — Write IDOR (modify other users' data)
 
@@ -56,7 +56,7 @@ Test whether sensitive endpoints work without any authentication:
 
 # Fallback when team intel is empty
 
-If earlier waves found no credentials, JWT tokens, or specific endpoints: use `ask_sitemap` to identify all API endpoints, then systematically test each one for IDOR and unauthenticated access. Steps 1, 2, 4, and 5 do not depend on team intel — they work with any ID-bearing endpoint you discover yourself.
+If earlier waves found no credentials, JWT tokens, or specific endpoints: use `mcp__playbooks__ask_sitemap` to identify all API endpoints, then systematically test each one for IDOR and unauthenticated access. Steps 1, 2, 4, and 5 do not depend on team intel — they work with any ID-bearing endpoint you discover yourself.
 
 # What is a finding
 
@@ -68,6 +68,17 @@ If earlier waves found no credentials, JWT tokens, or specific endpoints: use `a
 - User list/data accessible without authentication
 - Order tracking accessible via guessable IDs without auth
 - Email enumeration via different responses for valid/invalid emails
+
+# Relevant playbooks
+
+- `mcp__playbooks__idor_probe` — systematic IDOR scanning by navigating to guessed IDs on a route
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for unvisited routes and API endpoints
+
+# Severity mapping
+
+- **Critical** — read IDOR accessing another user's payment cards, credentials, or PII; write IDOR modifying another user's data or role; mass assignment setting `role=admin` on registration
+- **Major** — read IDOR on non-PII resources (baskets, complaints); admin endpoints accessible to regular users; user list/data accessible without authentication; delete IDOR removing another user's data
+- **Minor** — email enumeration via differing error responses; order tracking accessible via guessable IDs without auth (no PII in response)
 
 # What is NOT a finding
 

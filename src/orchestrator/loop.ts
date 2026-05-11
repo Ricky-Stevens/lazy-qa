@@ -25,11 +25,13 @@ import { redactForLlm } from '../logging/logger.ts';
 import type { PlaybookOutcome } from '../playbooks/outcome.ts';
 import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
-import { computeCostUsd } from './cost.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
 import {
+  accumulateTurnCost,
   buildTaskQueue,
   buildUserMessage,
+  checkScopeComplete,
+  createTurnTracker,
   extractPersonaTagline,
   extractRoute,
   extractTargetId,
@@ -37,7 +39,9 @@ import {
   type LoopInput,
   oneLineSummary,
   PLAYBOOK_TOOL_PREFIX,
+  resolveTerminationReason,
   tryParsePlaybookOutcome,
+  updateTurnTracking,
 } from './loop-shared.ts';
 import { consumeNudge, getAgentState, updateOnTurn } from './registry.ts';
 import type { MemoryEntry, SummaryMemory } from './summary-memory.ts';
@@ -52,9 +56,14 @@ export type { LoopInput };
  * elided head with a single synthetic "summary" user message. KEEP_TAIL = 12
  * is roughly six (assistant, tool_result) turn pairs.
  */
-const KEEP_TAIL = 12;
-/** Compact when the conversation grows beyond this many messages. */
-const COMPACT_THRESHOLD = 14;
+const KEEP_TAIL = 16;
+/** Compact when the conversation grows beyond this many messages. Bumped from
+ *  14 to 22 to reduce compaction frequency — each compaction invalidates the
+ *  per-turn message cache and (when plannerModel is set) triggers a Sonnet
+ *  turn that costs 3x more than Haiku. With 22, compaction fires every ~3-4
+ *  turns instead of every ~1-2, significantly reducing cache churn and
+ *  planner-turn cost. */
+const COMPACT_THRESHOLD = 22;
 
 /** Anthropic SDK request hard cap for assistant output. */
 const MAX_OUTPUT_TOKENS = 4096;
@@ -120,16 +129,14 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
   // re-orient to the elided context with a smarter model. All other turns
   // use agent.model (typically Haiku).
   let nextTurnIsPlanning = false;
-  let lastFindingTurn = 0;
-  let previousFindingsCount = 0;
-  let turnsOnSameUrl = 0;
-  let previousUrl: string | undefined;
+  const turnTracker = createTurnTracker();
 
   while (
     journey.turns < agent.budget.max_turns &&
     !input.abortSignal.aborted &&
     !journey.terminationReason &&
-    journey.costUsd < agent.budget.max_usd
+    journey.costUsd < agent.budget.max_usd &&
+    Date.now() - new Date(journey.startedAt).getTime() < agent.budget.max_minutes * 60_000
   ) {
     // Drain any supervisor-issued nudge — rendezvous point with
     // runSupervisor's pushNudge() calls. The nudge prepends to the next user
@@ -156,16 +163,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const isAttacker = ATTACKER_PROFILES.has(agent.profileName);
     const agentState = getAgentState(agent.id);
     const currentAgentUrl = agentState?.currentUrl ?? undefined;
-    if (currentAgentUrl && currentAgentUrl === previousUrl) {
-      turnsOnSameUrl += 1;
-    } else {
-      turnsOnSameUrl = 0;
-      previousUrl = currentAgentUrl;
-    }
-    if (journey.findings.length > previousFindingsCount) {
-      lastFindingTurn = journey.turns;
-      previousFindingsCount = journey.findings.length;
-    }
+    updateTurnTracking(turnTracker, currentAgentUrl, journey);
 
     const userContent = buildUserMessage({
       isFirstTurn: journey.turns === 0,
@@ -186,8 +184,8 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       personaTagline,
       personaName: agent.profileName,
       currentUrl: currentAgentUrl,
-      turnsOnSameUrl,
-      lastFindingTurn,
+      turnsOnSameUrl: turnTracker.turnsOnSameUrl,
+      lastFindingTurn: turnTracker.lastFindingTurn,
     });
 
     messages.push({ role: 'user', content: userContent });
@@ -246,17 +244,14 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
     const modelForThisTurn =
       nextTurnIsPlanning && agent.plannerModel ? agent.plannerModel : agent.model;
 
-    if (!isAttacker && journey.turns >= 8) {
-      const queue = buildTaskQueue(agent.profileName, siteMap, fuzzedFormIds);
-      if (queue.length === 0) {
-        journey.terminationReason = 'scope-complete';
-        logger.info('loop.scope-complete', {
-          agentId: agent.id,
-          turns: journey.turns,
-          findings: journey.findings.length,
-        });
-        break;
-      }
+    if (checkScopeComplete(agent, siteMap, fuzzedFormIds, journey, isAttacker)) {
+      journey.terminationReason = 'scope-complete';
+      logger.info('loop.scope-complete', {
+        agentId: agent.id,
+        turns: journey.turns,
+        findings: journey.findings.length,
+      });
+      break;
     }
 
     await events?.write({
@@ -318,7 +313,8 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           status === 503 ||
           /ECONNRESET|ETIMEDOUT|ECONNREFUSED|fetch failed|socket hang up/i.test(errMsg);
         if (isRetryable && apiAttempt < API_RETRIES) {
-          const delayMs = API_RETRY_BASE_MS * 2 ** (apiAttempt - 1);
+          const baseDelay = API_RETRY_BASE_MS * 2 ** (apiAttempt - 1);
+          const delayMs = baseDelay + Math.floor(Math.random() * baseDelay * 0.3);
           logger.warn('loop.api.retry', {
             attempt: apiAttempt,
             status,
@@ -374,21 +370,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
       cacheRead: usage.cache_read_input_tokens ?? 0,
       cacheWrite: usage.cache_creation_input_tokens ?? 0,
     };
-    journey.tokenUsage.input += turnTokenUsage.input;
-    journey.tokenUsage.output += turnTokenUsage.output;
-    journey.tokenUsage.cacheRead += turnTokenUsage.cacheRead;
-    journey.tokenUsage.cacheWrite += turnTokenUsage.cacheWrite;
-    // Per-turn cost: accumulate using the model that was actually called.
-    // Previously this recomputed from all-time token totals × a single model
-    // price, which is wrong once model routing means different turns bill at
-    // different rates. Running sum is correct.
-    let costUsdDelta = 0;
-    try {
-      costUsdDelta = computeCostUsd(modelForThisTurn, turnTokenUsage);
-      journey.costUsd += costUsdDelta;
-    } catch {
-      // Unknown model — keep token totals only (cost will be 0 for this turn).
-    }
+    const costUsdDelta = accumulateTurnCost(journey, modelForThisTurn, turnTokenUsage);
 
     // Emit agent.turn.end with per-turn stats.
     await events?.write({
@@ -465,7 +447,22 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
           };
         }
         try {
-          const result = await handler(use.input as Record<string, unknown>);
+          const TOOL_TIMEOUT_MS = 120_000;
+          let timeoutHandle: ReturnType<typeof setTimeout>;
+          const result = await Promise.race([
+            handler(use.input as Record<string, unknown>).finally(() =>
+              clearTimeout(timeoutHandle),
+            ),
+            new Promise<never>((_, reject) => {
+              timeoutHandle = setTimeout(
+                () => reject(new Error(`Tool '${use.name}' timed out after ${TOOL_TIMEOUT_MS / 1000}s`)),
+                TOOL_TIMEOUT_MS,
+              );
+              if (typeof timeoutHandle === 'object' && timeoutHandle !== null && 'unref' in timeoutHandle) {
+                (timeoutHandle as { unref: () => void }).unref();
+              }
+            }),
+          ]);
           const text = result.content[0]?.text ?? '';
           // Emit tool.result with redacted+capped content.
           await events?.write({
@@ -561,13 +558,7 @@ export async function runAgentLoop(input: LoopInput): Promise<void> {
 
   // Set a graceful termination reason if we exited the while-loop without one.
   if (!journey.terminationReason) {
-    if (input.abortSignal.aborted) {
-      journey.terminationReason = 'signal';
-    } else if (journey.costUsd >= agent.budget.max_usd) {
-      journey.terminationReason = 'budget-hit';
-    } else if (journey.turns >= agent.budget.max_turns) {
-      journey.terminationReason = 'max-turns';
-    }
+    journey.terminationReason = resolveTerminationReason(journey, agent, input.abortSignal);
   }
 }
 

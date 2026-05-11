@@ -87,6 +87,17 @@ If earlier waves found no encryption keys, credentials, or injection points: pro
 - JWT is properly signed and verified
 - 2FA correctly required and enforced
 
+# Relevant playbooks
+
+- `mcp__playbooks__rate_limit_probe` — check whether login and password reset endpoints enforce rate limiting
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for authentication-related endpoints
+
+# Severity mapping
+
+- **Critical** — JWT accepted with `alg=none` (unsigned tokens accepted); login bypass via SQLi returns valid JWT; password reset response leaks password hash or full user object; 2FA bypass via extracted TOTP secret
+- **Major** — password reset with guessable security answer succeeds; password change without current password verification; JWT payload contains sensitive data (password hash, TOTP secret); 2FA only enforced at login, not on API endpoints
+- **Minor** — password change via GET (password in URL); weak password policy (short passwords accepted); user enumeration via login error differences
+
 # Session rules
 
 Check team intel for extracted credentials, TOTP secrets, JWT public keys. **NEVER log out** — no `/logout`, no "Sign out" clicks. The session is irrecoverable.

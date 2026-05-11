@@ -63,7 +63,8 @@ describe('SelectorCache.load', () => {
         '/page::login::button': {
           locator: 'role=button[name="Login"]',
           hits: 3,
-          lastHitAt: '2026-01-01T00:00:00.000Z',
+          lastHitAt: new Date().toISOString(),
+          resolvedAt: new Date().toISOString(),
         },
       },
     };

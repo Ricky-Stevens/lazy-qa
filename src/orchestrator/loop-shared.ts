@@ -22,7 +22,8 @@ import type { Logger } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import type { PlaybookOutcome, PlaybookStep } from '../playbooks/outcome.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
-import type { Journey } from '../types/journey.ts';
+import type { Journey, TerminationReason } from '../types/journey.ts';
+import { computeCostUsd } from './cost.ts';
 import type { EventWriter } from './events.ts';
 import type { FindingCache, KnownFindingRef } from './finding-cache.ts';
 import type {
@@ -156,12 +157,14 @@ export function buildUserMessage(args: {
   if (args.isAttacker) {
     const intel = renderTeamIntel(args.sharedCredentials, args.sharedRoutes);
     if (intel) sections.push(intel);
-  } else if (args.sharedRoutes.length > 0) {
-    const intel = renderTeamIntel([], args.sharedRoutes);
-    if (intel) sections.push(intel);
   }
+  // QA agents don't have try_login or fetch_resource tools, so team-discovered
+  // routes and credentials are not actionable for them. Skip to save tokens.
 
-  const knownBlock = renderKnownFindings(args.knownFindings);
+  // Attackers need fewer known-finding reminders (they don't care about QA dupes).
+  // Cap at 5 for attackers, 15 for QA agents — saves 200-400 tokens per turn.
+  const findingsCap = args.isAttacker ? 5 : 15;
+  const knownBlock = renderKnownFindings(args.knownFindings.slice(0, findingsCap));
   if (knownBlock) sections.push(knownBlock);
 
   // Task queue: directed task list for QA agents, replaces generic exploration.
@@ -236,7 +239,10 @@ export function renderTeamIntel(
     for (const c of credentials.slice(0, 10)) {
       const verified = c.loginVerified ? ' [verified]' : '';
       const role = c.role ? ` role=${c.role}` : '';
-      lines.push(`  - ${c.username} : ${c.password}${role}${verified}  (source: ${c.source})`);
+      const maskedPwd = c.password.length > 2
+        ? `${c.password.slice(0, 2)}${'*'.repeat(Math.min(6, c.password.length - 2))}`
+        : '****';
+      lines.push(`  - ${c.username} : ${maskedPwd}${role}${verified}  (source: ${c.source})`);
     }
     if (credentials.length > 10) {
       lines.push(`  - ... +${credentials.length - 10} more`);
@@ -342,7 +348,7 @@ export function renderSiteMapSnapshot(siteMap: SiteMapAccessor): string {
   // For "untested" we use a representative playbook per category. This is a
   // heuristic — the playbooks really track per-(playbook,target) attempts but
   // surfacing one bucket per category is enough for the agent to pick.
-  const formsUntested = siteMap.listFormsUntested('crud_create_form').slice(0, SITEMAP_TOP_N);
+  const formsUntested = siteMap.listFormsUntested('fill_and_verify').slice(0, SITEMAP_TOP_N);
   if (formsUntested.length > 0) {
     lines.push(
       `- Forms not yet CRUD-tested: ${formsUntested
@@ -747,7 +753,7 @@ export function renderTaskQueue(queue: TaskQueueItem[], personaName?: string): s
     const prefix = i === 0 ? 'NEXT →' : `${i + 1}.`;
     const target = item.targetId ? `${item.route} (${item.targetId})` : item.route;
     lines.push(`  ${prefix} ${item.action} at ${target}`);
-    if (i >= 7) {
+    if (i >= 7 && queue.length > 8) {
       lines.push(`  ... +${queue.length - 8} more`);
       break;
     }
@@ -798,4 +804,109 @@ export function buildStagnationWarning(args: {
   }
 
   return warnings.length > 0 ? `[AUTOMATED PERFORMANCE WARNING]\n${warnings.join('\n')}` : '';
+}
+
+// ─── Turn Tracking ──────────────────────────────────────────────────────────
+
+/** Mutable per-agent state tracked across turns for stagnation detection and
+ *  per-turn user message rendering. Both loop.ts and loop-sdk.ts maintain an
+ *  instance and call `updateTurnTracking` each turn. */
+export interface TurnTracker {
+  turnsOnSameUrl: number;
+  previousUrl: string | undefined;
+  lastFindingTurn: number;
+  previousFindingsCount: number;
+}
+
+export function createTurnTracker(): TurnTracker {
+  return {
+    turnsOnSameUrl: 0,
+    previousUrl: undefined,
+    lastFindingTurn: 0,
+    previousFindingsCount: 0,
+  };
+}
+
+/** Update turn-tracking state from the current agent state and journey.
+ *  Mutates `tracker` in place. */
+export function updateTurnTracking(
+  tracker: TurnTracker,
+  currentUrl: string | undefined,
+  journey: Journey,
+): void {
+  if (currentUrl && currentUrl === tracker.previousUrl) {
+    tracker.turnsOnSameUrl += 1;
+  } else {
+    tracker.turnsOnSameUrl = 0;
+    tracker.previousUrl = currentUrl;
+  }
+  if (journey.findings.length > tracker.previousFindingsCount) {
+    tracker.lastFindingTurn = journey.turns;
+    tracker.previousFindingsCount = journey.findings.length;
+  }
+}
+
+// ─── Scope Completion ───────────────────────────────────────────────────────
+
+/** Check whether a QA agent's task queue is empty (all assigned work done).
+ *  Returns true if the agent should terminate with 'scope-complete'. Attackers
+ *  and agents without a task profile always return false. */
+export function checkScopeComplete(
+  agent: ResolvedAgent,
+  siteMap: SiteMapAccessor,
+  fuzzedFormIds: Set<string>,
+  journey: Journey,
+  isAttacker: boolean,
+): boolean {
+  if (isAttacker) return false;
+  if (journey.turns < 8) return false;
+  const queue = buildTaskQueue(agent.profileName, siteMap, fuzzedFormIds);
+  return queue.length === 0;
+}
+
+// ─── Cost Accumulation ──────────────────────────────────────────────────────
+
+/** Per-turn token usage shape used by both loops. */
+export interface TurnTokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** Accumulate a single turn's token usage and cost onto the journey.
+ *  Returns the USD delta for this turn (0 if the model is unknown). */
+export function accumulateTurnCost(
+  journey: Journey,
+  model: string,
+  usage: TurnTokenUsage,
+): number {
+  journey.tokenUsage.input += usage.input;
+  journey.tokenUsage.output += usage.output;
+  journey.tokenUsage.cacheRead += usage.cacheRead;
+  journey.tokenUsage.cacheWrite += usage.cacheWrite;
+  try {
+    const delta = computeCostUsd(model, usage);
+    journey.costUsd += delta;
+    return delta;
+  } catch {
+    return 0;
+  }
+}
+
+// ─── Termination Reason Resolution ──────────────────────────────────────────
+
+/** Set a graceful termination reason when the loop exits without one.
+ *  Checks abort, budget, and max-turns in priority order. */
+export function resolveTerminationReason(
+  journey: Journey,
+  agent: ResolvedAgent,
+  abortSignal: AbortSignal,
+): TerminationReason {
+  if (abortSignal.aborted) return 'signal';
+  if (journey.costUsd >= agent.budget.max_usd) return 'budget-hit';
+  const elapsedMs = Date.now() - new Date(journey.startedAt).getTime();
+  if (elapsedMs >= agent.budget.max_minutes * 60_000) return 'timeout';
+  if (journey.turns >= agent.budget.max_turns) return 'max-turns';
+  return 'max-turns';
 }

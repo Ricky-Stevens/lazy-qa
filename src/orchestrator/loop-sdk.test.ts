@@ -19,17 +19,19 @@ let mockTurns: Array<{
 }> = [];
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => {
+  // Consume turns from the shared mockTurns array. Each call to fakeQuery
+  // shifts turns off the front, so continuations see an empty array and
+  // immediately yield 'result' (no more turns to produce).
   async function* fakeQuery({ prompt }: { prompt: AsyncIterable<unknown> }) {
     const it = prompt[Symbol.asyncIterator]();
-    for (const turn of mockTurns) {
-      // Pull a user message from the streaming prompt — same as the real SDK
-      // does before each assistant turn. This exercises the streaming-input
-      // pump: a single test turn proves nothing about multi-turn behaviour.
+    while (mockTurns.length > 0) {
+      const turn = mockTurns.shift()!;
       const next = await it.next();
       if (next.done) break;
       yield {
         type: 'assistant',
         message: {
+          id: `msg-${Math.random().toString(36).slice(2, 8)}`,
           content: turn.content,
           stop_reason: turn.stopReason,
           usage: {
@@ -74,7 +76,7 @@ function makeJourney(): Journey {
   } as Journey;
 }
 
-function makeAgent(): ResolvedAgent {
+function makeAgent(overrides: Partial<ResolvedAgent> = {}): ResolvedAgent {
   return {
     id: 'a1',
     profileName: 'tester',
@@ -82,6 +84,7 @@ function makeAgent(): ResolvedAgent {
     personality: 'a tester',
     budget: { max_turns: 5, max_minutes: 5, max_usd: 1 },
     credentials: null,
+    ...overrides,
   } as ResolvedAgent;
 }
 
@@ -130,7 +133,11 @@ describe('runAgentLoopSdk', () => {
       },
     ];
     const journey = makeJourney();
+    // max_turns: 1 prevents the SDK continuation loop from re-launching
+    // query() after the first end_turn. Without this cap, the continuation
+    // loop would yield 5 turns (1 per continuation × MAX_SDK_CONTINUATIONS).
     const input = makeBaseInput(journey);
+    (input.agent as { budget: { max_turns: number } }).budget.max_turns = 1;
 
     await runAgentLoopSdk(input);
 
@@ -150,14 +157,13 @@ describe('runAgentLoopSdk', () => {
     const journey = makeJourney();
     const events = { write: vi.fn().mockResolvedValue(undefined) };
     const input = makeBaseInput(journey, events);
+    (input.agent as { budget: { max_turns: number } }).budget.max_turns = 1;
 
     await runAgentLoopSdk(input);
 
     const types = events.write.mock.calls.map((c) => (c[0] as { type: string }).type);
     expect(types).toContain('agent.turn.start');
     expect(types).toContain('agent.turn.end');
-    // Exactly one of each for the single mocked assistant turn — proves we
-    // emit per-turn (not just once outside the loop).
     expect(types.filter((t) => t === 'agent.turn.start')).toHaveLength(1);
     expect(types.filter((t) => t === 'agent.turn.end')).toHaveLength(1);
   });

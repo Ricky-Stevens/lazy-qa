@@ -143,14 +143,14 @@ describe('coverage', () => {
     const playbookOutcomes: PlaybookOutcomeRecord[] = [
       {
         agentId: 'power-user',
-        playbookName: 'crud_create_form',
+        playbookName: 'fill_and_verify',
         route: '/clients/new',
         targetId: 'form-client-new',
         status: 'ok',
       },
       {
         agentId: 'power-user',
-        playbookName: 'crud_create_form',
+        playbookName: 'fill_and_verify',
         route: '/',
         targetId: 'form-home',
         status: 'failed',
@@ -171,7 +171,7 @@ describe('coverage', () => {
       },
       {
         agentId: 'chaos',
-        playbookName: 'modal_lifecycle',
+        playbookName: 'fill_and_verify',
         route: '/',
         targetId: 'modal-welcome',
         status: 'ok',
@@ -210,7 +210,7 @@ describe('coverage', () => {
 
     // Forms / tables / modals / wizards counts.
     expect(report.forms.found).toBe(2);
-    expect(report.forms.crudCreateAttempted).toBe(2); // 2 unique form ids
+    expect(report.forms.crudCreateAttempted).toBe(3); // 2 form ids + 1 modal id (all fill_and_verify)
     expect(report.forms.crudEditAttempted).toBe(0);
     expect(report.forms.fuzzAttempted).toBe(1);
 
@@ -220,16 +220,15 @@ describe('coverage', () => {
     expect(report.tables.filtered).toBe(0);
 
     expect(report.modals.found).toBe(1);
-    expect(report.modals.lifecycleTested).toBe(1);
+    expect(report.modals.lifecycleTested).toBe(3);
 
     expect(report.wizards.found).toBe(1);
     expect(report.wizards.walkthroughAttempted).toBe(1);
 
     // Playbook tally.
-    expect(report.playbooks.crud_create_form).toEqual({ ok: 1, failed: 1, suspicious: 0 });
+    expect(report.playbooks.fill_and_verify).toEqual({ ok: 2, failed: 1, suspicious: 0 });
     expect(report.playbooks.form_fuzz_validation).toEqual({ ok: 0, failed: 0, suspicious: 1 });
     expect(report.playbooks.table_sort_each_column).toEqual({ ok: 1, failed: 0, suspicious: 0 });
-    expect(report.playbooks.modal_lifecycle).toEqual({ ok: 1, failed: 0, suspicious: 0 });
     expect(report.playbooks.walk_wizard).toEqual({
       ok: 1,
       failed: 0,

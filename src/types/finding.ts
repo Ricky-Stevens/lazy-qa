@@ -1,50 +1,45 @@
+import { z } from 'zod';
+
 /**
- * A bug, regression, or unexpected behaviour reported by an agent.
- *
- * Schema lives inline in `tools/findings-server.ts` — that's where Zod
- * validates incoming MCP calls. This type is the runtime shape we pass
- * around the orchestrator and write to disk.
+ * Zod schema for persisted findings. Used to validate findings loaded from
+ * disk (loadFindings in review.ts) — prevents runtime errors from corrupt
+ * or partially-written findings.json files.
  */
-export interface Finding {
-  id: string;
-  ts: string;
-  severity: 'critical' | 'major' | 'minor' | 'cosmetic';
-  category:
-    | 'validation'
-    | 'error-handling'
-    | 'ux-confusion'
-    | 'visual-regression'
-    | 'broken-feature'
-    | 'performance'
-    | 'unexpected-behavior'
-    | 'accessibility'
-    | 'other';
-  title: string;
-  description: string;
-  stepsToReproduce: string[];
-  expected: string;
-  actual: string;
-  route?: string;
-  confidence: 'certain' | 'likely' | 'maybe-flake';
-  source: 'agent' | 'heuristic';
-  agentId?: string;
-  /** Set when source='heuristic'. Currently unused — heuristic finder was retired
-   * with note_step. Kept on the type so persisted findings from older runs still parse. */
-  ruleName?: string;
-  /** Path (relative to the run directory) to a screenshot captured at the moment
-   * the finding was filed. Set when the agent reports with `attach_screenshot: true`. */
-  screenshotPath?: string;
-  /** Optional list of tool calls the agent recommends a reviewer (or replay
-   * tool) execute to reproduce the finding. */
-  reproductionActions?: Array<{ tool: string; args: Record<string, unknown> }>;
-  httpStatus?: number;
-  httpMethod?: string;
-  requestUrl?: string;
-  consoleErrors?: string[];
-  /** URL of the page at the moment the finding was filed. Auto-captured by
-   *  the harness — agents do not set this directly. */
-  filedAtUrl?: string;
-  /** First N bytes of the HTTP response body at the time the finding was
-   *  filed (when available). Auto-captured by the harness. */
-  responseBodySample?: string;
-}
+export const FindingSchema = z.object({
+  id: z.string(),
+  ts: z.string(),
+  severity: z.enum(['critical', 'major', 'minor', 'cosmetic']),
+  category: z.enum([
+    'validation',
+    'error-handling',
+    'ux-confusion',
+    'visual-regression',
+    'broken-feature',
+    'performance',
+    'unexpected-behavior',
+    'accessibility',
+    'other',
+  ]),
+  title: z.string(),
+  description: z.string(),
+  stepsToReproduce: z.array(z.string()),
+  expected: z.string(),
+  actual: z.string(),
+  route: z.string().optional(),
+  confidence: z.enum(['certain', 'likely', 'maybe-flake']),
+  source: z.enum(['agent', 'heuristic']),
+  agentId: z.string().optional(),
+  ruleName: z.string().optional(),
+  screenshotPath: z.string().optional(),
+  reproductionActions: z
+    .array(z.object({ tool: z.string(), args: z.record(z.string(), z.unknown()) }))
+    .optional(),
+  httpStatus: z.number().optional(),
+  httpMethod: z.string().optional(),
+  requestUrl: z.string().optional(),
+  consoleErrors: z.array(z.string()).optional(),
+  filedAtUrl: z.string().optional(),
+  responseBodySample: z.string().optional(),
+});
+
+export type Finding = z.infer<typeof FindingSchema>;

@@ -17,23 +17,29 @@
  * "Me want it!" cookie banner because it's an `<a>` not a `<button>`).
  */
 
-import { writeFile } from 'node:fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
-import type { Page } from 'playwright';
 import { z } from 'zod';
-import { dismissPersistentBanners, launchBrowser } from '../auth/login.ts';
 import type { ApiLlmBackend } from '../llm/api-backend.ts';
-import { isHostAllowed } from '../safety/guards.ts';
 import { runAuthAgentSdk } from './auth-agent-sdk.ts';
 import {
   AUTH_AGENT_SYSTEM_PROMPT,
+  AUTH_TOOL_DESCRIPTIONS,
+  AUTH_TOOL_SHAPES,
   type AuthAgentInput,
   type AuthAgentResult,
   captureSessionInfo,
   DEFAULT_MAX_TURNS,
   decodeJwtClaim,
   findString,
-  makeNoopLogger,
+  handleAuthFailed,
+  handleAuthSuccess,
+  handleClick,
+  handleFillForm,
+  handleNavigate,
+  handlePressKey,
+  handleSnapshot,
+  handleType,
+  launchAuthBrowser,
   safeSnapshot,
 } from './auth-agent-shared.ts';
 import { computeCostUsd } from './cost.ts';
@@ -45,6 +51,13 @@ export { AUTH_AGENT_SYSTEM_PROMPT, captureSessionInfo, decodeJwtClaim, findStrin
 
 const MAX_OUTPUT_TOKENS = 1024;
 
+interface AuthRawTool {
+  name: string;
+  description: string;
+  shape: z.ZodRawShape;
+  handler: (args: Record<string, unknown>) => Promise<{ content: string }>;
+}
+
 export async function runAuthAgent(input: AuthAgentInput): Promise<AuthAgentResult> {
   // Dispatch to the SDK variant early — before we spin up a browser — so we
   // don't waste a launch/close cycle for non-API backends.
@@ -53,7 +66,6 @@ export async function runAuthAgent(input: AuthAgentInput): Promise<AuthAgentResu
   }
 
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
-  const startedAt = Date.now();
   input.logger.info('auth-agent.start', {
     targetUrl: input.targetUrl,
     loginUrl: input.loginUrl,
@@ -61,47 +73,104 @@ export async function runAuthAgent(input: AuthAgentInput): Promise<AuthAgentResu
     username: input.credentials.username,
   });
 
-  // 1. Launch a browser. Same launch path as the rest of the harness.
-  const browser = await launchBrowser(input.stealth, {
-    headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-    channel: 'chrome',
-  }).catch(async () =>
-    launchBrowser(input.stealth, { headless: process.env.PLAYWRIGHT_HEADLESS !== 'false' }),
-  );
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  // 1. Launch browser using the shared helper.
+  const { browser, context, page } = await launchAuthBrowser(input);
 
-  // 2. Initial navigation + best-effort banner dismiss before the agent
-  //    even sees the page. Saves a turn or two.
-  const startUrl = input.loginUrl ?? input.targetUrl;
-  try {
-    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-    await dismissPersistentBanners(page, input.logger.child({ phase: 'auth-agent.warmup' }));
-  } catch (err) {
-    input.logger.warn('auth-agent.goto.failed', {
-      url: startUrl,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // 3. Build the tight tool set. Inline so the auth agent doesn't depend on
-  //    the heavy createBrowserMcpServer machinery (sitemap, registry, etc).
+  // 2. Build the tight tool set. Handlers delegate to shared functions.
   let terminalSignal: 'success' | 'failed' | null = null;
   let terminalDetail = '';
-  const tools = buildAuthTools({
-    page,
-    allowedHosts: input.allowedHosts,
-    onSuccess: (detail) => {
-      terminalSignal = 'success';
-      terminalDetail = detail;
-    },
-    onFailed: (reason) => {
-      terminalSignal = 'failed';
-      terminalDetail = reason;
-    },
-  });
+  const onSuccess = (detail: string) => {
+    terminalSignal = 'success';
+    terminalDetail = detail;
+  };
+  const onFailed = (reason: string) => {
+    terminalSignal = 'failed';
+    terminalDetail = reason;
+  };
 
-  // 4. Run the loop. (SDK-mode was already dispatched above; only 'api' reaches here.)
+  const tools: AuthRawTool[] = [
+    {
+      name: 'snapshot',
+      description: AUTH_TOOL_DESCRIPTIONS.snapshot,
+      shape: AUTH_TOOL_SHAPES.snapshot,
+      handler: async () => {
+        const r = await handleSnapshot(page);
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'navigate',
+      description: AUTH_TOOL_DESCRIPTIONS.navigate,
+      shape: AUTH_TOOL_SHAPES.navigate,
+      handler: async (args) => {
+        const r = await handleNavigate(page, input.allowedHosts, String(args.url));
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'click',
+      description: AUTH_TOOL_DESCRIPTIONS.click,
+      shape: AUTH_TOOL_SHAPES.click,
+      handler: async (args) => {
+        const r = await handleClick(page, String(args.locator));
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'type',
+      description: AUTH_TOOL_DESCRIPTIONS.type,
+      shape: AUTH_TOOL_SHAPES.type,
+      handler: async (args) => {
+        const r = await handleType(page, String(args.locator), String(args.value));
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'fill_form',
+      description: AUTH_TOOL_DESCRIPTIONS.fill_form,
+      shape: AUTH_TOOL_SHAPES.fill_form,
+      handler: async (args) => {
+        const r = await handleFillForm(
+          page,
+          args.fields as Array<{ locator: string; value: string }>,
+        );
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'press_key',
+      description: AUTH_TOOL_DESCRIPTIONS.press_key,
+      shape: AUTH_TOOL_SHAPES.press_key,
+      handler: async (args) => {
+        const r = await handlePressKey(
+          page,
+          String(args.key),
+          args.locator ? String(args.locator) : undefined,
+        );
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'auth_success',
+      description: AUTH_TOOL_DESCRIPTIONS.auth_success,
+      shape: AUTH_TOOL_SHAPES.auth_success,
+      handler: async (args) => {
+        const r = handleAuthSuccess(page, onSuccess, args.detail ? String(args.detail) : undefined);
+        return { content: r.text };
+      },
+    },
+    {
+      name: 'auth_failed',
+      description: AUTH_TOOL_DESCRIPTIONS.auth_failed,
+      shape: AUTH_TOOL_SHAPES.auth_failed,
+      handler: async (args) => {
+        const r = handleAuthFailed(onFailed, String(args.reason));
+        return { content: r.text };
+      },
+    },
+  ];
+
+  // 3. Run the loop. (SDK-mode was already dispatched above; only 'api' reaches here.)
   const client = (input.backend as ApiLlmBackend).getRawClient();
   const anthropicTools: Anthropic.Tool[] = tools.map((t) => {
     const objSchema = z.object(t.shape);
@@ -205,7 +274,7 @@ export async function runAuthAgent(input: AuthAgentInput): Promise<AuthAgentResu
       terminalDetail = `Hit max turns (${maxTurns}) without resolution`;
     }
 
-    // 5. On success, capture storage state. Cast away TS narrowing — the
+    // 4. On success, capture storage state. Cast away TS narrowing — the
     //    onSuccess closure can mutate terminalSignal during awaited handlers.
     if ((terminalSignal as 'success' | 'failed') === 'success') {
       try {
@@ -265,162 +334,7 @@ export async function runAuthAgent(input: AuthAgentInput): Promise<AuthAgentResu
       turns: turn,
     };
   } finally {
-    void startedAt;
     await context.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
   }
 }
-
-interface AuthRawTool {
-  name: string;
-  description: string;
-  shape: z.ZodRawShape;
-  handler: (args: Record<string, unknown>) => Promise<{ content: string }>;
-}
-
-function buildAuthTools(deps: {
-  page: Page;
-  allowedHosts: string[];
-  onSuccess: (detail: string) => void;
-  onFailed: (reason: string) => void;
-}): AuthRawTool[] {
-  const { page, allowedHosts, onSuccess, onFailed } = deps;
-
-  return [
-    {
-      name: 'snapshot',
-      description:
-        'Re-take a structured snapshot of the current page. Use after any action whose effect you need to observe.',
-      shape: {},
-      handler: async () => {
-        const snap = await safeSnapshot(page);
-        return { content: snap };
-      },
-    },
-    {
-      name: 'navigate',
-      description:
-        'Navigate to a URL. Use only if the login flow takes you off the current page (e.g. you need to retry from a different starting point).',
-      shape: { url: z.string().url() },
-      handler: async (args) => {
-        const url = String(args.url);
-        if (allowedHosts.length > 0 && !isHostAllowed(url, allowedHosts)) {
-          return { content: `navigate refused: ${url} not in allowed_hosts.` };
-        }
-        try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-          await dismissPersistentBanners(page, makeNoopLogger());
-          return { content: `navigated to ${page.url()}` };
-        } catch (err) {
-          return {
-            content: `navigate failed: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-      },
-    },
-    {
-      name: 'click',
-      description:
-        'Click an element by Playwright locator (e.g. `role=button[name="Log in"]`, `#loginButton`, `a.cc-dismiss`).',
-      shape: { locator: z.string().min(1) },
-      handler: async (args) => {
-        const locator = String(args.locator);
-        try {
-          await page.locator(locator).first().click({ timeout: 5_000 });
-          await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-          return { content: `clicked ${locator}; now on ${page.url()}` };
-        } catch (err) {
-          return { content: `click failed: ${err instanceof Error ? err.message : String(err)}` };
-        }
-      },
-    },
-    {
-      name: 'type',
-      description: 'Fill a text input by locator. Replaces existing value.',
-      shape: { locator: z.string().min(1), value: z.string() },
-      handler: async (args) => {
-        const locator = String(args.locator);
-        const value = String(args.value);
-        try {
-          await page.locator(locator).first().fill(value, { timeout: 5_000 });
-          return { content: `filled ${locator} (${value.length} chars)` };
-        } catch (err) {
-          return { content: `type failed: ${err instanceof Error ? err.message : String(err)}` };
-        }
-      },
-    },
-    {
-      name: 'fill_form',
-      description:
-        'Fill multiple inputs in one call. Each entry is { locator, value }. More efficient than several `type` calls.',
-      shape: {
-        fields: z.array(z.object({ locator: z.string().min(1), value: z.string() })).min(1),
-      },
-      handler: async (args) => {
-        const fields = args.fields as Array<{ locator: string; value: string }>;
-        const lines: string[] = [];
-        for (const f of fields) {
-          try {
-            await page.locator(f.locator).first().fill(f.value, { timeout: 5_000 });
-            lines.push(`  ✓ ${f.locator}`);
-          } catch (err) {
-            lines.push(`  ✗ ${f.locator}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-        return { content: `fill_form (${fields.length} field(s)):\n${lines.join('\n')}` };
-      },
-    },
-    {
-      name: 'press_key',
-      description:
-        'Press a key on the focused element (or document). Useful for submitting via Enter when no submit button exists.',
-      shape: { key: z.string().min(1), locator: z.string().optional() },
-      handler: async (args) => {
-        const key = String(args.key);
-        const locator = args.locator ? String(args.locator) : undefined;
-        try {
-          if (locator) {
-            await page.locator(locator).first().press(key, { timeout: 5_000 });
-          } else {
-            await page.keyboard.press(key);
-          }
-          await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-          return { content: `pressed ${key}; now on ${page.url()}` };
-        } catch (err) {
-          return {
-            content: `press_key failed: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-      },
-    },
-    {
-      name: 'auth_success',
-      description:
-        'Call this once you have verified the login succeeded (URL changed, logged-in UI visible, no error). Terminal — the auth agent stops after this.',
-      shape: { detail: z.string().optional() },
-      handler: async (args) => {
-        const detail = args.detail
-          ? String(args.detail)
-          : `logged in successfully (final URL: ${page.url()})`;
-        onSuccess(detail);
-        return { content: `auth_success acknowledged: ${detail}` };
-      },
-    },
-    {
-      name: 'auth_failed',
-      description:
-        'Call this if you cannot log in (wrong credentials, captcha required, login form unreachable, etc.). Terminal.',
-      shape: { reason: z.string().min(1) },
-      handler: async (args) => {
-        const reason = String(args.reason);
-        onFailed(reason);
-        return { content: `auth_failed acknowledged: ${reason}` };
-      },
-    },
-  ];
-}
-
-// `writeFile` isn't currently used (storageState uses Playwright's built-in
-// path arg) but kept imported in case future callers want to override the
-// path serialisation. Suppress the unused-import warning.
-void writeFile;

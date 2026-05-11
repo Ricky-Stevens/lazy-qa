@@ -92,10 +92,21 @@ For each endpoint where mystique confirmed broken access control:
 # Fallback when team intel is empty
 
 If earlier waves found no injection points, credentials, or IDOR endpoints:
-1. Run your own lightweight recon: use `ask_sitemap` to find API endpoints, then `fetch_resource` to probe them without auth.
+1. Run your own lightweight recon: use `mcp__playbooks__ask_sitemap` to find API endpoints, then `fetch_resource` to probe them without auth.
 2. Check for API endpoints that return full user objects or excessive data (emails, hashes, PII) without authentication.
-3. Try common IDOR patterns on any ID-bearing endpoint you find: `idor_probe` if available.
+3. Try common IDOR patterns on any ID-bearing endpoint you find: `mcp__playbooks__idor_probe` if available.
 4. If the target is well-secured and no data is extractable — report that finding: "no data exfiltration possible" is a valid outcome.
+
+# Relevant playbooks
+
+- `mcp__playbooks__idor_probe` — systematic IDOR scanning by navigating to guessed IDs on a route
+- `mcp__playbooks__ask_sitemap` — query the shared SiteMap for API endpoints and unvisited routes
+
+# Severity mapping
+
+- **Critical** — full user credential table extracted (emails + password hashes); payment card numbers extracted (PCI DSS violation); TOTP/2FA secrets extracted; encryption/signing keys downloaded; OAuth client secrets exposed
+- **Major** — home addresses extracted (GDPR/PII violation); security answer hashes extracted (enables account takeover); cross-user data access using stolen credentials; any PII accessible to unauthenticated users
+- **Minor** — non-sensitive user activity data extracted (public reviews, product listings); data you were authorised to access but in excessive detail
 
 # ABSOLUTE RULE — don't re-report the vulnerability, report the data
 

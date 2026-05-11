@@ -72,6 +72,9 @@ export interface SpawnAgentInput {
   /** Persistent selector cache for find_and_click. Optional — undefined when
    *  selector_cache.enabled is false in the run config. */
   selectorCache?: SelectorCache;
+  /** Per-host rate limiter. When set, browser actions await a token before
+   *  proceeding. Prevents overwhelming staging environments. */
+  rateLimiter?: import('../safety/rate-limiter.ts').RateLimiter;
   /** Cross-agent finding cache. All parallel agents in this run share one
    *  instance so each turn the agent sees what others have already filed and
    *  skips rediscovery. */
@@ -190,6 +193,15 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
         childLogger.error('login.failed', { agentId: agent.id, error: msg });
         journey.terminationReason = 'error';
         journey.endedAt = new Date().toISOString();
+        setStatus(agent.id, 'errored');
+        await events?.write({
+          type: 'agent.end',
+          agentId: agent.id,
+          terminationReason: 'error',
+          turns: 0,
+          costUsd: 0,
+          findingCount: 0,
+        });
         await persistJourney(runDir, journey);
         return { journey };
       }
@@ -285,6 +297,7 @@ export async function spawnAgent(input: SpawnAgentInput): Promise<SpawnAgentResu
     events,
     selectorCache,
     sharedKnowledge: input.sharedKnowledge,
+    rateLimiter: input.rateLimiter,
   });
 
   // 4. AbortController — combines the per-agent wall-clock timeout with the
@@ -517,7 +530,14 @@ function buildSystemPrompt(args: {
       ]
     : [];
 
-  const playbookLines = Array.from(skillsBundle.playbooks.values())
+  // Filter playbook descriptions to only show persona-allowed playbooks —
+  // exposing security playbook descriptions to functional QA agents wastes
+  // ~200-400 tokens and encourages drift into security probing.
+  const visiblePlaybooks = Array.from(skillsBundle.playbooks.values()).filter((s: Skill) => {
+    if (!s.personaAllowlist || s.personaAllowlist.length === 0) return true;
+    return s.personaAllowlist.includes(agent.profileName);
+  });
+  const playbookLines = visiblePlaybooks
     .map((s: Skill) => `- \`${s.name}\` — ${s.description}`)
     .join('\n');
 
@@ -532,7 +552,7 @@ function buildSystemPrompt(args: {
   }
 
   return [
-    `You are NOT a QA agent. You are a real human user of ${targetUrl} — your character is described at the bottom of this prompt and you BEHAVE like that person.`,
+    `You are a tester of ${targetUrl}, but you stay in character — your persona is described at the bottom of this prompt and you BEHAVE like that person, not like a generic testing bot.`,
     '',
     `OUTPUT FORMAT — emit TOOL CALLS ONLY. Zero prose. Zero narration. Every word of prose you generate is wasted latency. The ONLY exceptions: report_finding arguments and end_session detail.`,
     '',
@@ -547,13 +567,13 @@ function buildSystemPrompt(args: {
     'BROWSER PRIMITIVES (`mcp__browser__*`) — your default action vocabulary:',
     ...(ATTACKER_PROFILES.has(agent.profileName)
       ? [
-          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`, `fetch_resource`, `request_with_session`, `decode_jwt`.',
+          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `hover`, `reload`, `get_text`, `get_value`, `scroll_to`, `submit_form`, `set_dialog_response`, `upload_file`, `read_recent`, `console_errors`, `evaluate`, `storage_inspect`, `fetch_resource`, `request_with_session`, `decode_jwt`.',
         ]
       : [
-          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `read_recent`, `console_errors`.',
+          '`snapshot`, `ax_snapshot`, `navigate`, `click`, `type`, `fill_form`, `find_and_click`, `select_option`, `press_key`, `back`, `hover`, `reload`, `get_text`, `get_value`, `scroll_to`, `submit_form`, `set_dialog_response`, `upload_file`, `read_recent`, `console_errors`.',
         ]),
     '',
-    "PRIMITIVES — `snapshot` is the full PageModel (forms, tables, modals, locators); `ax_snapshot` is a cheaper text outline of the accessibility tree (use when you just need to know what's on the page).",
+    '`snapshot` = full PageModel (forms, tables, modals, locators). `ax_snapshot` = cheaper text outline of the accessibility tree (use when you just need to know what is on the page).',
     '',
     'PLAYBOOK HELPERS (`mcp__playbooks__*`) — deterministic shortcuts for tasks that are easy to script and tedious to drive turn-by-turn. Use one when it fits exactly; otherwise just drive the primitives.',
     playbookLines,

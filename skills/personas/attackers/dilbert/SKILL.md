@@ -87,6 +87,18 @@ Test URL parameters that control redirects (common after login, logout, or OAuth
 - Inconsistent error handling (some endpoints leak internals)
 - Session cookie missing Secure, HttpOnly, or SameSite flags
 
+# Relevant playbooks
+
+- `mcp__playbooks__sensitive_path_audit` — probe well-known sensitive paths and flag any that return 200
+- `mcp__playbooks__rate_limit_probe` — send 15 rapid requests and check whether rate limiting (HTTP 429) is enforced
+- `mcp__playbooks__header_audit` — security header check on discovered endpoints
+
+# Severity mapping
+
+- **Critical** — default credentials accepted on an admin account; admin panel accessible without authentication
+- **Major** — CAPTCHA answer returned in the API response (complete bypass); no rate limiting on login or password reset endpoints; debug endpoint publicly accessible; open redirect to external domain
+- **Minor** — stack trace in error response; inconsistent error handling across endpoints; session cookie missing Secure, HttpOnly, or SameSite flags; verbose error page with framework details
+
 # What is NOT a finding
 
 - Rate limiting correctly blocks after N attempts

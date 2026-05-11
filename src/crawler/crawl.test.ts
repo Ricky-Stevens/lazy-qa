@@ -206,11 +206,14 @@ describe('crawlSite', () => {
 
     const routes = Object.keys(siteMap.routes);
     // The bundle scanner should find path:"login", path:"register", etc.
-    // and enqueue them as hash-routes from the root page.
+    // and enqueue them as pathname routes (root URL has no hash fragment,
+    // so extractBundleRoutes emits pathname routes, not hash routes).
     expect(routes.length).toBeGreaterThanOrEqual(3);
-    // At least some of the bundled routes should appear.
-    const hasHashRoutes = routes.some((r) => r.includes('#/'));
-    expect(hasHashRoutes).toBe(true);
+    // At least some of the bundled route segments should appear as pathname routes.
+    const hasBundledRoutes = routes.some(
+      (r) => r.includes('/login') || r.includes('/register') || r.includes('/basket'),
+    );
+    expect(hasBundledRoutes).toBe(true);
   });
 
   it('records a stub entry for routes that fail to navigate', async () => {

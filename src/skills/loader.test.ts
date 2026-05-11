@@ -20,9 +20,9 @@ describe('loadSkills', () => {
     expect(bundle.personas.size).toBe(24);
   });
 
-  it('discovers exactly 17 playbooks', async () => {
+  it('discovers exactly 19 playbooks', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
-    expect(bundle.playbooks.size).toBe(17);
+    expect(bundle.playbooks.size).toBe(19);
   });
 
   it('persona names match the expected slugs across both suites', async () => {
@@ -56,10 +56,11 @@ describe('loadSkills', () => {
     ]);
   });
 
-  it('playbook names match the 17 expected names', async () => {
+  it('playbook names match the 19 expected names', async () => {
     const bundle = await loadSkills(SKILLS_ROOT);
     const names = Array.from(bundle.playbooks.keys()).sort();
     expect(names).toEqual([
+      'accessibility_axe_audit',
       'ask_sitemap',
       'discover_route_affordances',
       'fill_and_verify',
@@ -75,6 +76,7 @@ describe('loadSkills', () => {
       'route_404_probe',
       'sensitive_path_audit',
       'table_sort_each_column',
+      'visual_regression_check',
       'walk_pagination',
       'walk_wizard',
     ]);

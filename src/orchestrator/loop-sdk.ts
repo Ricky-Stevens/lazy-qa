@@ -35,11 +35,12 @@ import { resolveClaudeBinaryPath } from '../llm/sdk-binary.ts';
 import { redactForLlm } from '../logging/logger.ts';
 import type { RawToolDef } from '../playbooks/framework.ts';
 import { ATTACKER_PROFILES, BROWSER_TOOL_NAMES } from '../tools/browser-server.ts';
-import { computeCostUsd } from './cost.ts';
 import { capToolCallInput, capToolResultContent } from './events.ts';
 import {
-  buildTaskQueue,
+  accumulateTurnCost,
   buildUserMessage,
+  checkScopeComplete,
+  createTurnTracker,
   extractPersonaTagline,
   extractRoute,
   extractTargetId,
@@ -48,6 +49,7 @@ import {
   oneLineSummary,
   PLAYBOOK_TOOL_PREFIX,
   tryParsePlaybookOutcome,
+  updateTurnTracking,
 } from './loop-shared.ts';
 import { consumeNudge, getAgentState, updateOnTurn } from './registry.ts';
 import type { MemoryEntry } from './summary-memory.ts';
@@ -128,10 +130,11 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
       const TOOL_TIMEOUT_MS = isPlaybook ? 180_000 : 60_000;
       let result: { content: { type: 'text'; text: string }[] };
       try {
+        let timeoutHandle: ReturnType<typeof setTimeout>;
         result = await Promise.race([
-          rt.handler(args),
-          new Promise<never>((_, reject) =>
-            setTimeout(
+          rt.handler(args).finally(() => clearTimeout(timeoutHandle)),
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(
               () =>
                 reject(
                   new Error(
@@ -139,8 +142,11 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
                   ),
                 ),
               TOOL_TIMEOUT_MS,
-            ),
-          ),
+            );
+            if (typeof timeoutHandle === 'object' && timeoutHandle !== null && 'unref' in timeoutHandle) {
+              (timeoutHandle as { unref: () => void }).unref();
+            }
+          }),
         ]);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -255,10 +261,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
   // Pre-compute the persona tagline — the personality text is static per-agent.
   const personaTagline = extractPersonaTagline(agent.personality);
 
-  let lastFindingTurn = 0;
-  let previousFindingsCount = 0;
-  let turnsOnSameUrl = 0;
-  let previousUrl: string | undefined;
+  const turnTracker = createTurnTracker();
 
   // Per-turn user message generator. The SDK pulls a new user message from
   // this iterator before each assistant turn — that gives us the API-mode
@@ -343,16 +346,7 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
 
       const agentState = getAgentState(agent.id);
       const currentAgentUrl = agentState?.currentUrl ?? undefined;
-      if (currentAgentUrl && currentAgentUrl === previousUrl) {
-        turnsOnSameUrl += 1;
-      } else {
-        turnsOnSameUrl = 0;
-        previousUrl = currentAgentUrl;
-      }
-      if (journey.findings.length > previousFindingsCount) {
-        lastFindingTurn = journey.turns;
-        previousFindingsCount = journey.findings.length;
-      }
+      updateTurnTracking(turnTracker, currentAgentUrl, journey);
 
       const userContent = buildUserMessage({
         isFirstTurn: journey.turns === 0,
@@ -373,24 +367,21 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
         personaTagline,
         personaName: agent.profileName,
         currentUrl: currentAgentUrl,
-        turnsOnSameUrl,
-        lastFindingTurn,
+        turnsOnSameUrl: turnTracker.turnsOnSameUrl,
+        lastFindingTurn: turnTracker.lastFindingTurn,
       });
 
       // Scope-completion: QA agents whose personal task queue is empty have
       // finished their job. Only applies to agents WITH a task profile —
       // attackers and unmapped personas run to their natural budget.
-      if (!isAttacker && journey.turns >= 8) {
-        const queue = buildTaskQueue(agent.profileName, input.siteMap, fuzzedFormIds);
-        if (queue.length === 0) {
-          journey.terminationReason = 'scope-complete';
-          logger.info('loop-sdk.scope-complete', {
-            agentId: agent.id,
-            turns: journey.turns,
-            findings: journey.findings.length,
-          });
-          break;
-        }
+      if (checkScopeComplete(agent, input.siteMap, fuzzedFormIds, journey, isAttacker)) {
+        journey.terminationReason = 'scope-complete';
+        logger.info('loop-sdk.scope-complete', {
+          agentId: agent.id,
+          turns: journey.turns,
+          findings: journey.findings.length,
+        });
+        break;
       }
 
       await events?.write({
@@ -491,19 +482,9 @@ export async function runAgentLoopSdk(input: LoopInput): Promise<void> {
                 cacheWrite: m.usage.cache_creation_input_tokens ?? 0,
               }
             : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-          if (m.usage) {
-            journey.tokenUsage.input += turnUsage.input;
-            journey.tokenUsage.output += turnUsage.output;
-            journey.tokenUsage.cacheRead += turnUsage.cacheRead;
-            journey.tokenUsage.cacheWrite += turnUsage.cacheWrite;
-          }
-          let costUsdDelta = 0;
-          try {
-            costUsdDelta = computeCostUsd(agent.model, turnUsage);
-            journey.costUsd += costUsdDelta;
-          } catch {
-            // Unknown model — token totals only; cost stays at 0 delta.
-          }
+          const costUsdDelta = m.usage
+            ? accumulateTurnCost(journey, agent.model, turnUsage)
+            : 0;
           journey.turns += 1;
           updateOnTurn(agent.id, {
             turnsCompleted: journey.turns,

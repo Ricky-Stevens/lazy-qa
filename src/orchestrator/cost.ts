@@ -1,6 +1,8 @@
 // CHECK: verify against current anthropic pricing; update as needed
 // Prices are per 1,000,000 tokens in USD
 
+const warnedModels = new Set<string>();
+
 export interface PricePerMillion {
   input: number;
   output: number;
@@ -41,6 +43,12 @@ export function computeCostUsd(
 ): number {
   const pricing = MODEL_PRICING[model];
   if (!pricing) {
+    if (!warnedModels.has(model)) {
+      warnedModels.add(model);
+      process.stderr.write(
+        `[cost] Unknown model '${model}' — using conservative $15/M fallback rate. Update MODEL_PRICING if this is a new model.\n`,
+      );
+    }
     const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     const conservativePerMillion = 15;
     return (totalTokens * conservativePerMillion) / 1_000_000;

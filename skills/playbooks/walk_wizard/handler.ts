@@ -11,6 +11,7 @@ export const inputShape = {
   wizardId: z.string(),
   stepInputs: z.array(z.record(z.string(), z.string())),
   expectFinish: z.boolean().optional(),
+  testBackNav: z.boolean().optional().describe('Test back-navigation state preservation after the last step'),
 } as const satisfies z.ZodRawShape;
 
 export async function handler(

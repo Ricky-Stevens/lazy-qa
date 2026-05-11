@@ -70,6 +70,9 @@ target:
   # Default Playwright Chromium — Juice Shop has no bot-detection. Set true
   # for targets behind Cloudflare / DataDome / similar.
   stealth: false
+  # Max requests per second per host across all agents. Prevents overwhelming
+  # staging environments. 0 = unlimited. Default: 10.
+  max_rps: 10
 
 # ═══════════════════════════════════════════════════════════════════════
 # ANTHROPIC — LLM configuration
@@ -105,7 +108,9 @@ review:
   model: claude-sonnet-4-6
   batch_mode: inline          # 'inline' | 'auto' | 'force_batch'
   verify_with_browser: true   # re-check findings against the live app
+  verify_model: claude-haiku-4-5-20251001  # cheaper model for single-finding verification
   verify_concurrency: 4
+  verify_only_uncertain: true  # skip browser verification for 'certain' confidence findings
 
 # ═══════════════════════════════════════════════════════════════════════
 # CRAWLER — pre-run site discovery
@@ -134,6 +139,12 @@ memory:
 run:
   max_budget_usd: 18.00
   output_dir: ./runs
+  # Optional: POST confirmed findings to an external endpoint after review.
+  # Payloads include title, description, severity, steps, route, category.
+  # webhook_url: https://hooks.example.com/findings
+  # webhook_min_severity: major   # only send findings >= this severity
+  # webhook_headers:               # optional auth headers
+  #   Authorization: Bearer ${WEBHOOK_TOKEN}
 
 # ═══════════════════════════════════════════════════════════════════════
 # AGENTS — auto mode (recommended)
@@ -146,35 +157,35 @@ run:
 # Available personas (auto mode picks from these):
 #
 #   Security (attacker):
-#     mitnick        privileged insider (IDOR, privesc, JWT abuse)
-#     sudo           broken access control (IDOR, forced browsing)
-#     mystique       auth bypass (JWT manipulation, password reset abuse)
-#     johnny-five    injection (SQL, NoSQL, command, SSRF, path traversal)
-#     dilbert        security misconfiguration (defaults, headers, cookies)
-#     zero-cool      XSS (stored, reflected, DOM-based)
-#     bobby-tables   data integrity / request forgery (mass assignment, CSRF)
+#     bobby-tables   privileged insider (IDOR, privesc, JWT abuse)
 #     clippy         recon — tech fingerprinting and security headers
-#     trust-me-bro   recon — path/file/API surface discovery
-#     rickroll       data exfiltration via injection and access control flaws
+#     dilbert        security misconfiguration (defaults, headers, cookies)
+#     johnny-five    recon — path/file/API surface discovery
+#     mitnick        data exfiltration via injection and access control flaws
+#     mystique       broken access control (IDOR, forced browsing)
+#     rickroll       XSS (stored, reflected, DOM-based)
+#     sudo           auth bypass (JWT manipulation, password reset abuse)
+#     trust-me-bro   data integrity / request forgery (mass assignment, CSRF)
+#     zero-cool      injection (SQL, NoSQL, command, SSRF, path traversal)
 #
 #   QA:
-#     sheldon        accessibility and semantic QA (ARIA, tab order, focus)
+#     all-your-base  routing and error handling (404s, bad params)
+#     bonzi-buddy    empty form submission (required-field validation)
+#     copy-pasta     double-submit and idempotency
+#     karen          happy-path smoke test (core journeys end-to-end)
+#     konami         hidden UI discovery (accordions, kebabs, hover menus)
+#     leeroy-jenkins browser interruption (refresh mid-save, back button)
+#     longcat        layout breaker (long strings, emoji, special chars)
+#     marty-mcfly    workflow sequence breaker (skip steps, stale tabs)
 #     mulder         save persistence (fill, save, reload, verify)
 #     pac-man        volume and duplicates (bulk create, pagination)
-#     leeroy-jenkins browser interruption (refresh mid-save, back button)
-#     karen          wrong-type input (postcodes in name fields)
-#     wreck-it-ralph layout breaker (long strings, emoji, special chars)
-#     copy-pasta     double-submit and idempotency
 #     press-f        stale state and deletion (back to deleted items)
-#     konami         hidden UI discovery (accordions, kebabs, hover menus)
-#     bonzi-buddy    empty form submission (required-field validation)
-#     marty-mcfly    workflow sequence breaker (skip steps, stale tabs)
-#     longcat        boundary values (min/max, negatives, extremes)
-#     all-your-base  routing and error handling (404s, bad params)
-#     there-is-no-spoon  happy-path smoke test (core journeys end-to-end)
+#     sheldon        accessibility and semantic QA (ARIA, tab order, focus)
+#     there-is-no-spoon  empty form submitter (required-field validation)
+#     wreck-it-ralph wrong-type input (postcodes in name fields)
 
 agent_selection:
-  max_agents: 10              # cap on total personas spawned
+  # max_agents: 10            # @deprecated — no longer used, all agents cycle through slots
   security_slots: 2           # concurrent security agent slots
   qa_slots: 2                 # concurrent QA agent slots
   attacker_model: claude-sonnet-4-6

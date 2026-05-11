@@ -112,7 +112,7 @@ export async function saveLearningState(
   state.lastUpdated = new Date().toISOString();
   // Atomic write: write to a .tmp sibling then rename, so a crash mid-write
   // never produces a truncated JSON file that corrupts cross-run state.
-  const tmp = `${filePath}.tmp`;
+  const tmp = `${filePath}.tmp.${Date.now()}`;
   await writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
   await rename(tmp, filePath);
   logger.info('learning.saved', {

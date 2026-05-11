@@ -1,65 +1,34 @@
 /**
  * Orchestrator entry point for the regression harness.
  *
- * Orchestrates the full scan lifecycle: config → safety → crawler → agents →
- * findings review. The crawler builds a shared `SiteMap` that every agent
- * consumes via `SiteMapAccessor`. After all agents finish, writes a
- * `coverage.md` aggregating sitemap stats and per-agent playbook outcomes.
+ * Orchestrates the full scan lifecycle: config -> safety -> crawler -> agents ->
+ * findings review. Each phase is implemented in a dedicated module under
+ * `./phases/`. This file is the pipeline that threads results between them.
  */
 
-import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-import { acquireSession } from '../auth/session-pool.ts';
 import { loadConfig, resolveApiKey, resolveTargetCredentials } from '../config/load.ts';
-import { crawlSite } from '../crawler/crawl.ts';
-import { discoverModals } from '../crawler/discover-modals.ts';
-import { SiteMapImpl } from '../crawler/sitemap.ts';
 import type { SiteMap } from '../crawler/types.ts';
-import { type PlaybookOutcomeRecord, writeCoverageReport } from '../findings/coverage.ts';
-import { dedupeFindings } from '../findings/evaluate.ts';
-import {
-  persistFindings,
-  type RunManifest,
-  writeRunManifest,
-  writeSummaryMarkdown,
-} from '../findings/persist.ts';
-import { writeReviewArtefacts } from '../findings/report.ts';
-import { reviewRun } from '../findings/review.ts';
-import { selectBackend } from '../llm/factory.ts';
 import type { Logger } from '../logging/logger.ts';
-import { createLogger } from '../logging/logger.ts';
-import { assertAllowedTarget, assertHostsTrusted, assertNonProdHost } from '../safety/guards.ts';
+import { selectBackend } from '../llm/factory.ts';
 import { loadSkills } from '../skills/loader.ts';
-import { ATTACKER_PROFILES } from '../tools/browser-server.ts';
-import { SelectorCache } from '../tools/selector-cache.ts';
 import type { ResolvedAgent } from '../types/agent.ts';
 import type { Finding } from '../types/finding.ts';
 import type { Journey } from '../types/journey.ts';
-import { buildApplicationModel, renderApplicationModelForPrompt } from './app-model.ts';
-import { runAuthAgent } from './auth-agent.ts';
-import { EventWriter, formatEventLine } from './events.ts';
-import { FindingCache } from './finding-cache.ts';
 import {
-  buildRouteSnapshots,
-  deduplicateFpPatterns,
-  diffRoutes,
-  extractFalsePositivePatterns,
-  type LearningState,
-  loadLearningState,
-  renderLearningContext,
-  saveLearningState,
-  shouldRegenerateAppModel,
-  updateKnownFindings,
-} from './learning.ts';
-import { resolveMemoryPath } from './memory.ts';
-import { startRebalancer } from './rebalancer.ts';
-import { buildAgentQueues, resolveAgents } from './resolve.ts';
-import { SharedKnowledge } from './shared-knowledge.ts';
-import { classifySite, type SitePlaybookResult } from './site-playbook.ts';
-import { spawnAgent } from './spawn-agent.ts';
-import { runSupervisor } from './supervisor.ts';
-import { generateTestPlan, matchEventToTestPlan } from './test-plan.ts';
+  assertAllHostsNonProd,
+  assertAllowedTarget,
+  assertHostsTrusted,
+  assertNonProdHost,
+} from '../safety/guards.ts';
+import { resolveAgents } from './resolve.ts';
+
+import { runAuthPhase } from './phases/authenticate.ts';
+import { cleanupRun } from './phases/cleanup.ts';
+import { runCrawlPhase } from './phases/crawl-phase.ts';
+import { executeAgents } from './phases/execute.ts';
+import { finalizeRun } from './phases/finalize.ts';
+import { buildIntelligence } from './phases/intelligence.ts';
+import { setupRun } from './phases/setup.ts';
 
 export interface RunOptions {
   configPath: string;
@@ -77,1009 +46,185 @@ export interface RunResult {
 }
 
 export async function runScan(opts: RunOptions): Promise<RunResult> {
-  // 1. Config + safety guards. Order matters: trusted-hosts first, then
-  // target ∈ allowed_hosts, then a positive non-prod check. Any failure
-  // aborts before we touch creds.
+  // 1. Config + safety guards.
   const cfg = await loadConfig(opts.configPath);
   assertHostsTrusted(cfg.target.allowed_hosts);
   assertAllowedTarget(cfg.target.url, cfg.target.allowed_hosts);
   assertNonProdHost(cfg.target.url);
+  assertAllHostsNonProd(cfg.target.allowed_hosts);
 
-  // 2. Resolve auth. ANTHROPIC_API_KEY is required when LLM_AUTH=api (the default);
-  // optional when LLM_AUTH=subscription (the SDK falls back to the local
-  // `claude` CLI's cached OAuth token). selectBackend throws a useful error if
-  // we're in api mode without a key.
+  // 2. Resolve auth backend.
   const apiKey = resolveApiKey(cfg);
   const llmAuth = process.env.LLM_AUTH;
-
-  // Build one shared backend for all LLM calls in this run (review,
-  // site-playbook, supervisor, auth-agent). The persona loop is dispatched
-  // separately based on backend.kind — see runScan body below.
   const backend = selectBackend({ apiKey: apiKey ?? undefined, llmAuth });
 
-  // Load the skills bundle once here — both resolveAgents (personas) and
-  // spawnAgent (playbook tools) consume it.
+  // 3. Load skills + resolve agents (manual mode).
   const skillsBundle = await loadSkills();
   const isAutoMode = cfg.agents === 'auto';
-  // In manual mode, resolve agents up front. In auto mode, agents are resolved
-  // after crawl + site-playbook into two ordered queues (security + QA).
   const agents: ResolvedAgent[] = isAutoMode ? [] : await resolveAgents(cfg, skillsBundle);
-  let securityQueue: ResolvedAgent[] = [];
-  let qaQueue: ResolvedAgent[] = [];
 
-  // 3. Run ID + output directory.
-  const runId = randomUUID();
-  const outputDir = opts.outputDir ?? cfg.run.output_dir;
-  const runDir = path.resolve(outputDir, runId);
-  await mkdir(runDir, { recursive: true });
-
-  // 3a. Event writer — append-only JSONL for the full run trace. Optionally
-  // teed to stderr in human-readable form when LOG_FORMAT=pretty (or when
-  // stdout is a TTY). Tap writes to stderr so JSON consumers piping stdout
-  // see only the JSON log.
-  const eventsPath = path.join(runDir, 'events.jsonl');
-  const events = new EventWriter(eventsPath, runId);
-  await events.open();
-  const wantPretty =
-    process.env.LOG_FORMAT === 'pretty' ||
-    (process.env.LOG_FORMAT !== 'json' && process.stdout.isTTY === true);
-  if (wantPretty) {
-    events.consoleTap = (e) => {
-      const line = formatEventLine(e);
-      if (line) process.stderr.write(`${line}\n`);
-    };
+  if (!isAutoMode && agents.length === 0) {
+    throw new Error('runScan: no agents resolved from config');
   }
-  // Mutable ref for test plan — populated after crawl, consumed by event tap.
-  let testPlanLive: import('./test-plan.ts').TestPlan | undefined;
-  const prettyTap = events.consoleTap;
-  events.consoleTap = (e) => {
-    prettyTap?.(e);
-    if (testPlanLive && 'type' in e && (e as { type: string }).type === 'playbook.outcome') {
-      matchEventToTestPlan(
-        testPlanLive,
-        e as {
-          type: string;
-          agentId?: string;
-          playbookName?: string;
-          route?: string;
-          targetId?: string;
-        },
-      );
-    }
-  };
 
-  // 5. Logger — hoisted above the try so the finally block can use it.
-  const logger = opts.logger ?? createLogger({ runId });
+  // In auto mode, credentials come from target.auth.credentials.
+  // In manual mode, use the first agent's credentials.
+  const runCredentials = isAutoMode
+    ? resolveTargetCredentials(cfg)
+    : (agents[0]?.credentials ?? resolveTargetCredentials(cfg));
 
-  // Outer-scope accumulators so the run.end/close finally block sees whatever
-  // was computed before any throw — partial state is better than no state.
+  // 4. Setup: run ID, directories, events, logger, manifest stub.
+  const setup = await setupRun(cfg, opts);
+  const { runId, runDir, events, logger, testPlanRef, removeUnhandledRejectionListener } = setup;
+
+  // Re-emit run.start with the resolved agent count now that we know it.
+  logger.info('run.start', {
+    runId,
+    runDir,
+    targetUrl: cfg.target.url,
+    agentCount: isAutoMode ? 'auto' : agents.length,
+    auth: backend.kind === 'sdk' ? 'claude-subscription' : 'anthropic-api-key',
+    version: 'v2',
+  });
+
+  // Outer-scope accumulators for the finally block.
   let aggregateFindings: Finding[] = [];
   let aggregateCostUsd = 0;
   const aggregateTerminationReasons: Record<string, string> = {};
-  // Hoisted so the finally block can flush the cache regardless of where in
-  // the try body control flow exits.
-  let selectorCache: SelectorCache | undefined;
+  let selectorCache: import('../tools/selector-cache.ts').SelectorCache | undefined;
   let appModel: import('./app-model.ts').ApplicationModel | undefined;
-  let priorLearning: LearningState | null = null;
+  let priorLearning: import('./learning.ts').LearningState | null = null;
   let reviewClassifications: Array<{
     title: string;
     route?: string;
     classification: string;
     reasoning: string;
   }> = [];
-  let crawledMap: SiteMap | undefined;
-  let siteMap: SiteMapImpl | undefined;
-  /** True once at least one agent has been spawned. Guards the learning save
-   *  in the finally block: if no agent ran, aggregateFindings=[] would mark
-   *  all prior known findings as 'fixed', corrupting the cross-run state. */
+  let siteMapForCleanup: import('../crawler/sitemap.ts').SiteMapImpl | undefined;
   let agentPhaseStarted = false;
-  const learningLogger = logger.child({ phase: 'learning' });
 
-  // Hoisted above try so finally can remove the listener even if the try
-  // body throws before the const would have been initialized.
-  const onUnhandledRejection = (err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/EBADF|bad file descriptor/i.test(msg)) {
-      logger.warn('run.ebadf.swallowed', { error: msg });
-      return;
-    }
-    if (/cannot be parsed as a URL/i.test(msg)) {
-      logger.debug('run.url-parse.swallowed', { error: msg });
-      return;
-    }
-    logger.error('run.unhandledRejection', { error: msg });
-  };
-  process.on('unhandledRejection', onUnhandledRejection);
+  // Shared abort controller.
+  const runAbortController = new AbortController();
+  let shuttingDown = false;
+  function handleSignal(signal: string) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.warn('run.signal', { signal, message: 'Graceful shutdown initiated' });
+    runAbortController.abort();
+  }
+  const onSigint = () => handleSignal('SIGINT');
+  const onSigterm = () => handleSignal('SIGTERM');
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
 
   try {
-    // 4. Best-effort `last` symlink so `runs/last` always points at the most
-    // recent run for ad-hoc inspection.
-    try {
-      const lastLink = path.resolve(outputDir, 'last');
-      await unlink(lastLink).catch(() => undefined);
-      await symlink(runId, lastLink);
-    } catch {
-      // Some filesystems (FAT, certain Windows paths) don't support symlinks —
-      // silently degrade.
-    }
-
-    // 6. Early pre-run manifest stub — useful when the run crashes before
-    // completing. In auto mode, agentIds is empty until site-playbook resolves.
-    await writeRunManifest(runDir, {
-      runId,
-      startedAt: new Date().toISOString(),
-      endedAt: '',
-      targetUrl: cfg.target.url,
-      agentIds: agents.map((a) => a.id),
-      totalCostUsd: 0,
-      totalFindings: 0,
-      terminationReasons: {},
-    });
-
-    logger.info('run.start', {
-      runId,
+    // 5. Authentication.
+    const authResult = await runAuthPhase(
+      cfg,
+      backend,
       runDir,
-      targetUrl: cfg.target.url,
-      agentCount: isAutoMode ? 'auto' : agents.length,
-      auth: backend.kind === 'sdk' ? 'claude-subscription' : 'anthropic-api-key',
-      version: 'v2',
-    });
-
-    await events.write({
-      type: 'run.start',
-      targetUrl: cfg.target.url,
-      agentIds: isAutoMode ? ['auto'] : agents.map((a) => a.id),
-    });
-
-    // 7. Shared abort controller — SIGINT/SIGTERM aborts every agent + the
-    // supervisor + the in-flight crawler at once.
-    const runAbortController = new AbortController();
-    let shuttingDown = false;
-    function handleSignal(signal: string) {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      logger.warn('run.signal', { signal, message: 'Graceful shutdown initiated' });
-      runAbortController.abort();
-    }
-    process.once('SIGINT', () => handleSignal('SIGINT'));
-    process.once('SIGTERM', () => handleSignal('SIGTERM'));
-
-    // In auto mode, credentials come from target.auth.credentials.
-    // In manual mode, use the first agent's credentials.
-    const runCredentials = isAutoMode
-      ? resolveTargetCredentials(cfg)
-      : (agents[0]?.credentials ?? resolveTargetCredentials(cfg));
-
-    if (!isAutoMode && agents.length === 0) {
-      throw new Error('runScan: no agents resolved from config');
-    }
-
-    // 7a. AI-driven authentication phase. Replaces the brittle CSS-selector
-    // form-fill — a small Haiku agent reads the page, dismisses banners,
-    // fills the form, and verifies success. On success the captured
-    // storageState is written to runs/<runId>/auth-state.json; the crawler
-    // and every agent session below loads it and inherits the auth.
-    let sessionInfo: { username: string; role?: string } | undefined;
-    let authCostUsd = 0;
-    if (cfg.target.auth.type === 'form' && runCredentials) {
-      const authStatePath = path.join(runDir, 'auth-state.json');
-      const authResult = await runAuthAgent({
-        targetUrl: cfg.target.url,
-        loginUrl: cfg.target.auth.login_url,
-        credentials: runCredentials,
-        allowedHosts: cfg.target.allowed_hosts,
-        backend,
-        model: 'claude-haiku-4-5-20251001',
-        storageStatePath: authStatePath,
-        logger: logger.child({ phase: 'auth-agent' }),
-        events,
-        stealth: cfg.target.stealth,
-        abortSignal: runAbortController.signal,
-      });
-      authCostUsd = authResult.costUsd;
-      if (!authResult.ok) {
-        logger.warn('auth-agent.unsuccessful', {
-          detail: authResult.detail,
-          turns: authResult.turns,
-          costUsd: authResult.costUsd.toFixed(4),
-        });
-      } else {
-        sessionInfo = authResult.sessionInfo;
-      }
-    }
-
-    // 8. Pre-run crawl. Crawlee launches its own browser and handles
-    // concurrency, link discovery, and SPA navigation natively. Auth is
-    // inherited via the storageState file saved by the auth-agent.
-
-    const crawlerLogger = logger.child({ phase: 'crawl' });
-    const crawlStartedAt = Date.now();
-    const authStatePath = path.join(runDir, 'auth-state.json');
-
-    try {
-      crawledMap = await crawlSite({
-        rootUrl: cfg.target.url,
-        maxRoutes: cfg.crawler.max_routes,
-        maxWallClockMs: cfg.crawler.max_wall_clock_s * 1_000,
-        allowedHosts: cfg.target.allowed_hosts,
-        bannedPathPrefixes: cfg.target.banned_path_prefixes,
-        storageStatePath: cfg.target.auth.type === 'form' ? authStatePath : undefined,
-        logger: crawlerLogger,
-        parallelism: cfg.crawler.parallelism,
-        stealth: cfg.target.stealth,
-        events,
-      });
-    } catch (err) {
-      crawlerLogger.error('crawl.failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      crawledMap = {
-        startedAt: new Date(crawlStartedAt).toISOString(),
-        rootUrl: cfg.target.url,
-        routes: {},
-        pageModels: {},
-      };
-    }
-
-    // Persist the crawler output before agents start. Agents will mutate the
-    // live in-memory map (recordVisit / recordPlaybookOutcome / on-demand
-    // expansion), but having the pristine pre-run snapshot on disk means we
-    // can diff after the run to see what agents discovered.
-    await writeFile(path.join(runDir, 'sitemap.json'), JSON.stringify(crawledMap, null, 2), 'utf8');
-
-    logger.info('crawl.done', {
-      routes: Object.keys(crawledMap.routes).length,
-      durationMs: Date.now() - crawlStartedAt,
-    });
-
-    // Build the live, mutable accessor agents will share. Hydrate it from the
-    // pristine crawler output.
-    siteMap = new SiteMapImpl({
-      rootUrl: crawledMap.rootUrl,
-      startedAt: crawledMap.startedAt,
-      allowedHosts: cfg.target.allowed_hosts,
-    });
-    for (const route of Object.values(crawledMap.routes)) {
-      const model = crawledMap.pageModels[route.route];
-      if (!model) continue;
-      siteMap.upsertRoute(route, model);
-    }
-
-    // 8-modal. Post-crawl modal/drawer discovery. Opens pages and clicks
-    // buttons that look like they'd open creation/edit forms (Add, Create,
-    // Edit, Import, etc.), captures the resulting modal's form into the
-    // sitemap so agents and the test plan know those forms exist.
-    let modalDiscoverySession: Awaited<ReturnType<typeof acquireSession>> | null = null;
-    try {
-      modalDiscoverySession = await acquireSession({
-        targetUrl: cfg.target.url,
-        auth: cfg.target.auth,
-        allowedHosts: cfg.target.allowed_hosts,
-        credentials: runCredentials,
-        runDir,
-        agentId: 'modal-discovery',
-        logger: logger.child({ phase: 'discover-modals' }),
-        stealth: cfg.target.stealth,
-      });
-      const discoveryResult = await discoverModals({
-        sitemap: siteMap,
-        page: modalDiscoverySession.page,
-        logger: logger.child({ phase: 'discover-modals' }),
-      });
-      logger.info('discover-modals.done', {
-        routesProbed: discoveryResult.routesProbed,
-        modalsFound: discoveryResult.modalsFound,
-        formsDiscovered: discoveryResult.formsDiscovered,
-      });
-
-      // Re-serialize the enriched sitemap so the snapshot on disk reflects
-      // the modal-discovered forms/modals before agents start.
-      const enrichedMap = siteMap.serialize();
-      crawledMap = enrichedMap;
-      await writeFile(
-        path.join(runDir, 'sitemap.json'),
-        JSON.stringify(enrichedMap, null, 2),
-        'utf8',
-      );
-    } catch (err) {
-      logger.warn('discover-modals.failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      if (modalDiscoverySession) {
-        try {
-          await modalDiscoverySession.release();
-        } catch {
-          // Best-effort release.
-        }
-      }
-    }
-
-    // 8-pre. Cross-run learning — load prior knowledge for this target.
-    priorLearning = await loadLearningState(cfg.target.url, learningLogger);
-    const currentRoutes = Object.keys(crawledMap.routes);
-    const routeDiff = priorLearning
-      ? diffRoutes(
-          currentRoutes,
-          priorLearning.routeSnapshots,
-          Object.fromEntries(
-            Object.entries(crawledMap.pageModels)
-              .filter(([, m]) => m?.textHash)
-              .map(([route, m]) => [route, m.textHash]),
-          ),
-        )
-      : { newRoutes: currentRoutes, removedRoutes: [], changedRoutes: [], unchangedRoutes: [] };
-
-    if (priorLearning) {
-      learningLogger.info('learning.diff', {
-        newRoutes: routeDiff.newRoutes.length,
-        removedRoutes: routeDiff.removedRoutes.length,
-        unchangedRoutes: routeDiff.unchangedRoutes.length,
-      });
-    }
-
-    // Seed the finding cache with known false positive patterns.
-    const learningFpPatterns = priorLearning?.falsePositivePatterns ?? [];
-
-    // 8a. Site-playbook generation. Sonnet reads the crawler's sitemap and
-    // produces a per-persona concrete plan ("on /#/foo click X then go to
-    // /#/bar"). This separates persona character (who you are) from
-    // site-specific intent (what to do here), which fixes the regression
-    // where personas navigated without ever completing a flow.
-    //
-    // Site classifier — heuristic, no LLM call, instant.
-    // Produces siteShape + siteSummary for agent orientation.
-    const sitePlaybook = classifySite({
-      rootUrl: cfg.target.url,
-      sitemap: crawledMap,
-      logger: logger.child({ phase: 'site-classify' }),
+      runCredentials,
+      logger,
       events,
-    });
-    await writeFile(
-      path.join(runDir, 'site-playbook.json'),
-      JSON.stringify(sitePlaybook, null, 2),
-      'utf8',
+      runAbortController.signal,
     );
 
-    // 8b. Application Model — one Sonnet call to understand the app's UI patterns.
-    // Reuse prior model when the app hasn't changed significantly (≤30% new routes).
-    let appModelCostUsd = 0;
-    const needsNewAppModel =
-      !priorLearning?.appModel || shouldRegenerateAppModel(currentRoutes.length, routeDiff);
-    try {
-      if (needsNewAppModel) {
-        const appModelResult = await buildApplicationModel({
-          sitemap: crawledMap,
-          siteShape: sitePlaybook.siteShape,
-          siteSummary: sitePlaybook.siteSummary,
-          backend,
-          model: cfg.supervisor.model ?? 'claude-sonnet-4-6',
-          logger: logger.child({ phase: 'app-model' }),
-        });
-        appModel = appModelResult.model;
-        appModelCostUsd = appModelResult.costUsd;
-      } else {
-        appModel = priorLearning!.appModel;
-        logger.info('app-model.reused', { reason: 'app unchanged (<30% new routes)' });
-      }
-      await writeFile(
-        path.join(runDir, 'app-model.json'),
-        JSON.stringify(appModel, null, 2),
-        'utf8',
-      );
-    } catch (err) {
-      logger.warn('app-model.skipped', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // 6. Crawl + modal discovery.
+    const crawlResult = await runCrawlPhase(cfg, runDir, runCredentials, logger, events);
+    const { crawledMap, siteMap } = crawlResult;
+    siteMapForCleanup = siteMap;
 
-    // 8c. Test plan — deterministic checklist of what needs testing, derived
-    // from the sitemap page models. The supervisor tracks completion.
-    const testPlan: import('./test-plan.ts').TestPlan = generateTestPlan({
-      sitemap: crawledMap,
-      appModel,
-      personas: skillsBundle.personas,
-    });
-    await writeFile(path.join(runDir, 'test-plan.json'), JSON.stringify(testPlan, null, 2), 'utf8');
-    testPlanLive = testPlan;
-    logger.info('test-plan.generated', { items: testPlan.totalItems });
-
-    // Auto mode: build two ordered queues from ALL personas.
-    if (isAutoMode) {
-      const queues = buildAgentQueues(cfg, skillsBundle);
-      securityQueue = queues.securityQueue;
-      qaQueue = queues.qaQueue;
-      logger.info('auto-agents.queued', {
-        securityTotal: securityQueue.length,
-        qaTotal: qaQueue.length,
-        securityOrder: securityQueue.map((a) => {
-          const w = skillsBundle.personas.get(a.profileName)?.wave ?? 0;
-          return `${a.id}(w${w})`;
-        }),
-        qaOrder: qaQueue.map((a) => a.id),
-      });
-    }
-
-    if (!isAutoMode && agents.length === 0) {
-      throw new Error('runScan: no agents resolved — check config or site-playbook output');
-    }
-
-    // 9. Resolve and initialise the per-target memory directory. Created once
-    // before any agents spawn so concurrent agents share the same path.
-    const memoryEnabled = cfg.memory.enabled;
-    const memoryPath = resolveMemoryPath(cfg.target.url, cfg.memory.path);
-    if (memoryEnabled) {
-      await mkdir(memoryPath, { recursive: true });
-    }
-
-    // 9a. Selector cache — load once per run (per-target file). Shared across
-    // all agents in the run; each agent receives the same instance so cache
-    // hits on one agent immediately benefit others in the same run.
-    const selectorCacheEnabled = cfg.selector_cache.enabled;
-    if (selectorCacheEnabled) {
-      selectorCache = await SelectorCache.load(cfg.target.url);
-    }
-
-    // 9b. Cross-agent finding cache. In-process only (per-run). Every agent
-    // shares this instance so each turn's user message includes findings
-    // already filed by others. Stops the duplicate-rediscovery waste that
-    // dominated the previous Juice Shop run (10 of 18 findings were dupes).
-    const findingCache = new FindingCache();
-    if (learningFpPatterns.length > 0) {
-      findingCache.seedFalsePositivePatterns(learningFpPatterns);
-      learningLogger.info('learning.fp-patterns-seeded', { count: learningFpPatterns.length });
-    }
-
-    // 9c. Shared cross-agent intelligence. Credentials dumped via SQLi,
-    // routes discovered post-login, JWTs scraped from page state — anything
-    // an agent thinks the team should know goes here. Every agent's per-turn
-    // user message renders the contents; the supervisor reads it via
-    // list_agents and broadcasts directives ("creds available, log in NOW").
-    // Try_login also writes here on successful login (auto-marks the
-    // credential as verified).
-    const sharedKnowledge = new SharedKnowledge();
-
-    // 10. Slot-based agent spawning. Only `security_slots + qa_slots` agents
-    // run concurrently (default 2+2=4). The rebalancer fills empty slots
-    // from the queues every 15s. Attackers respect wave ordering.
-    const runStartedAt = new Date().toISOString();
-
-    const supervisorEnabled = cfg.supervisor.enabled;
-    const SPAWN_STAGGER_MS = 2_000;
-    const explorerPromises: ReturnType<typeof spawnAgent>[] = [];
-    const liveJourneys = new Map<string, import('../types/journey.ts').Journey>();
-
-    const spawnOne = (agent: ResolvedAgent) =>
-      spawnAgent({
-        runId,
-        runDir,
-        targetUrl: cfg.target.url,
-        allowedHosts: cfg.target.allowed_hosts,
-        bannedPathPrefixes: cfg.target.banned_path_prefixes,
-        auth: cfg.target.auth,
-        agent,
-        backend,
-        siteMap: siteMap!,
-        logger,
-        abortSignal: runAbortController.signal,
-        stealth: cfg.target.stealth,
-        memoryEnabled,
-        memoryPath,
-        skillsBundle,
-        events,
-        selectorCache,
-        findingCache,
-        sharedKnowledge,
-        sessionInfo,
-        siteSummary: sitePlaybook.siteSummary,
-        siteShape: sitePlaybook.siteShape,
-        appModelContext: appModel ? renderApplicationModelForPrompt(appModel) : undefined,
-        learningContext: priorLearning
-          ? renderLearningContext(priorLearning, routeDiff)
-          : undefined,
-        journeyMap: liveJourneys,
-      });
-
-    // Dequeue initial agents to fill slots.
-    const sel = cfg.agent_selection;
-    const initialAgents: ResolvedAgent[] = [];
-
-    for (let i = 0; i < sel.security_slots && securityQueue.length > 0; i++) {
-      const agent = securityQueue.shift()!;
-      initialAgents.push(agent);
-      agents.push(agent);
-    }
-    for (let i = 0; i < sel.qa_slots && qaQueue.length > 0; i++) {
-      const agent = qaQueue.shift()!;
-      initialAgents.push(agent);
-      agents.push(agent);
-    }
-
-    // Spawn initial agents with stagger.
-    agentPhaseStarted = initialAgents.length > 0 || (!isAutoMode && agents.length > 0);
-    for (let i = 0; i < initialAgents.length; i++) {
-      explorerPromises.push(spawnOne(initialAgents[i]!));
-      if (i < initialAgents.length - 1) {
-        await new Promise((r) => setTimeout(r, SPAWN_STAGGER_MS));
-      }
-    }
-
-    logger.info('slot.initial', {
-      security: initialAgents.filter((a) => ATTACKER_PROFILES.has(a.profileName)).map((a) => a.id),
-      qa: initialAgents.filter((a) => !ATTACKER_PROFILES.has(a.profileName)).map((a) => a.id),
-      securityQueued: securityQueue.length,
-      qaQueued: qaQueue.length,
-    });
-
-    // 10a. Slot manager (rebalancer). Scores health every 15s, terminates
-    // stagnant agents, and fills empty slots from the queues. Handles wave
-    // gating for attackers (wave N only dequeues when wave N-1 is done).
-    const replacementPromises: ReturnType<typeof spawnAgent>[] = [];
-    const stopRebalancer = startRebalancer({
-      agents,
-      journeys: liveJourneys,
+    // 7. Intelligence: learning, site classify, app model, test plan.
+    const intel = await buildIntelligence(
+      cfg,
+      crawledMap,
+      siteMap,
+      backend,
       skillsBundle,
-      defaultModel: cfg.anthropic.default_model,
-      authType: cfg.target.auth.type,
-      credentials: runCredentials,
-      securityQueue,
-      qaQueue,
-      securitySlots: sel.security_slots,
-      qaSlots: sel.qa_slots,
-      spawnReplacement: (newAgent) => {
-        replacementPromises.push(spawnOne(newAgent));
-      },
-      logger: logger.child({ phase: 'rebalancer' }),
+      runDir,
+      logger,
       events,
-      abortSignal: runAbortController.signal,
-    });
-
-    const supervisorPromise = supervisorEnabled
-      ? runSupervisor({
-          backend,
-          model: cfg.supervisor.model,
-          maxMinutes: cfg.supervisor.max_minutes,
-          maxUsd: cfg.supervisor.max_usd,
-          maxTurns: cfg.supervisor.max_turns,
-          abortSignal: runAbortController.signal,
-          logger: logger.child({ agentId: 'supervisor' }),
-          events,
-          authType: cfg.target.auth.type,
-          sharedKnowledge,
-          siteMap,
-          testPlan,
-        }).catch((err) => {
-          logger.error('supervisor.crashed', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return null;
-        })
-      : Promise.resolve(null);
-
-    // Wall-clock deadline. With slot-based rotation all agents run
-    // sequentially in groups, so estimate total time from queue sizes.
-    const totalAgentCount = agents.length + securityQueue.length + qaQueue.length;
-    const totalSlots = sel.security_slots + sel.qa_slots;
-    const avgMinutes = 10;
-    const estimatedWaves = Math.ceil(totalAgentCount / Math.max(totalSlots, 1));
-    const OUTER_WAIT_DEADLINE_MS = Math.max(
-      estimatedWaves * avgMinutes * 60_000 * 1.5 + 5 * 60_000,
-      cfg.supervisor.max_minutes * 60_000 * 2,
     );
-    const outerDeadlineHandle = setTimeout(() => {
-      logger.error('explorer.allSettled.deadline.fired', {
-        deadlineMs: OUTER_WAIT_DEADLINE_MS,
-      });
-      runAbortController.abort();
-    }, OUTER_WAIT_DEADLINE_MS);
-    if (
-      typeof outerDeadlineHandle === 'object' &&
-      outerDeadlineHandle !== null &&
-      'unref' in outerDeadlineHandle
-    ) {
-      (outerDeadlineHandle as { unref: () => void }).unref();
-    }
+    testPlanRef.current = intel.testPlan;
+    appModel = intel.appModel;
+    priorLearning = intel.priorLearning;
 
-    // Wait for initial agents to complete.
-    const initialResults = (await Promise.allSettled(explorerPromises)) as PromiseSettledResult<{
-      journey: Journey;
-    }>[];
 
-    // Drain slot-filled replacement agents until all queues empty and all done.
-    const allSettledResults = [...initialResults];
-    const DRAIN_TIMEOUT_MS = 5 * 60_000;
-    const drainStart = Date.now();
-    while (!runAbortController.signal.aborted) {
-      // Batch any pending replacement promises.
-      if (replacementPromises.length > 0) {
-        const batch = replacementPromises.splice(0);
-        const batchResults = (await Promise.allSettled(batch)) as PromiseSettledResult<{
-          journey: Journey;
-        }>[];
-        allSettledResults.push(...batchResults);
-        continue;
-      }
-
-      // Check whether all agents are truly done via the liveJourneys map.
-      const allTerminated = Array.from(liveJourneys.values()).every((j) => !!j.terminationReason);
-      const queuesEmpty = securityQueue.length === 0 && qaQueue.length === 0;
-      if (queuesEmpty && allTerminated) break;
-
-      // Safety: don't spin forever if something is stuck.
-      if (Date.now() - drainStart > DRAIN_TIMEOUT_MS) {
-        logger.warn('drain.timeout', {
-          elapsed: Date.now() - drainStart,
-          liveJourneyCount: liveJourneys.size,
-          pendingReplacements: replacementPromises.length,
-          unterminated: Array.from(liveJourneys.entries())
-            .filter(([, j]) => !j.terminationReason)
-            .map(([id]) => id),
-        });
-        break;
-      }
-
-      await new Promise((r) => setTimeout(r, 2_000));
-    }
-
-    stopRebalancer();
-    clearTimeout(outerDeadlineHandle);
-    // Signal the supervisor to stop now that all agents are done.
-    if (!runAbortController.signal.aborted) runAbortController.abort();
-    const supervisorResult = await Promise.race([
-      supervisorPromise,
-      new Promise<undefined>((r) => setTimeout(() => r(undefined), 15_000)),
-    ]);
-    const supervisorCostUsd =
-      supervisorResult && typeof supervisorResult === 'object' && 'costUsd' in supervisorResult
-        ? (supervisorResult as { costUsd: number }).costUsd
-        : 0;
-    const explorerResults = allSettledResults;
-
-    // 10. Collect journeys from all agents (initial + slot-filled).
-    const journeys: Journey[] = [];
-    for (const result of explorerResults) {
-      if (result.status === 'fulfilled') {
-        journeys.push(result.value.journey);
-      } else {
-        journeys.push({
-          runId,
-          agentId: 'unknown',
-          startedAt: runStartedAt,
-          endedAt: new Date().toISOString(),
-          startUrl: cfg.target.url,
-          turns: 0,
-          findings: [],
-          tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          costUsd: 0,
-          terminationReason: 'error',
-        });
-      }
-    }
-
-    // 11. Aggregate findings.
-    const allFindings = dedupeFindings(journeys.flatMap((j) => j.findings));
-    aggregateFindings = allFindings;
-
-    // 12. Persist run manifest, findings, summary.
-    const runEndedAt = new Date().toISOString();
-    const totalCostUsd =
-      journeys.reduce((sum, j) => sum + j.costUsd, 0) +
-      authCostUsd +
-      supervisorCostUsd +
-      appModelCostUsd;
-    aggregateCostUsd = totalCostUsd;
-    const terminationReasons: Record<string, string> = {};
-    for (const j of journeys) {
-      terminationReasons[j.agentId] = j.terminationReason ?? 'unknown';
-      aggregateTerminationReasons[j.agentId] = j.terminationReason ?? 'unknown';
-    }
-
-    const manifest: RunManifest = {
-      runId,
-      startedAt: runStartedAt,
-      endedAt: runEndedAt,
-      targetUrl: cfg.target.url,
-      agentIds: agents.map((a) => a.id),
-      totalCostUsd,
-      totalFindings: allFindings.length,
-      terminationReasons,
-    };
-
-    await persistFindings(runDir, allFindings);
-    await writeRunManifest(runDir, manifest);
-    await writeSummaryMarkdown(runDir, journeys, allFindings);
-    // Write the final sitemap (includes agent-discovered routes).
-    await writeFile(
-      path.join(runDir, 'sitemap-final.json'),
-      JSON.stringify(siteMap.serialize(), null, 2),
-      'utf8',
-    );
-
-    // 13. Coverage report. Reads playbook.outcome events from the run's
-    // events.jsonl trace — every runPlaybook call emits one.
-    try {
-      const { playbookOutcomes, primitiveActivity } = await collectEventStats(eventsPath);
-      await writeCoverageReport(runDir, {
-        runId,
-        siteMap: siteMap.serialize(),
-        journeys,
-        playbookOutcomes,
-        primitiveActivity,
-      });
-    } catch (err) {
-      logger.error('coverage.failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    // 14. Post-run reviewer. Re-reads the artefacts we just wrote and produces
-    // review.md / review.json. Best-effort — a reviewer crash never fails the
-    // run; the raw findings are already on disk for manual triage.
-    const reviewEnabled = cfg.review.enabled && allFindings.length > 0;
-    let reviewSummary: {
-      confirmedBug: number;
-      likelyBug: number;
-      duplicate: number;
-      environmental: number;
-      notABug: number;
-      themes: number;
-      reviewCostUsd: number;
-      verifyCostUsd: number;
-    } | null = null;
-    if (reviewEnabled) {
-      // Acquire a verifier session if critic-with-browser verification is on.
-      // We re-use the session pool's de-duplication: this will share the
-      // browser/context with any agent session still alive, otherwise it
-      // performs a fresh login. Released in a finally block below.
-      let verifySession: Awaited<ReturnType<typeof acquireSession>> | null = null;
-      if (cfg.review.verify_with_browser) {
-        try {
-          // Reuse the first resolved agent's credentials (they were already
-          // env-resolved upstream). The session pool de-duplicates against
-          // existing sessions for the same target+credentials.
-          const firstResolved = agents[0];
-          if (firstResolved) {
-            verifySession = await acquireSession({
-              targetUrl: cfg.target.url,
-              auth: cfg.target.auth,
-              allowedHosts: cfg.target.allowed_hosts,
-              credentials: firstResolved.credentials,
-              runDir,
-              agentId: 'verifier',
-              logger: logger.child({ tool: 'verify' }),
-              stealth: cfg.target.stealth,
-            });
-          }
-        } catch (err) {
-          logger.warn('verify.session.acquire.failed', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-          // Fall through — review proceeds without verification.
-        }
-      }
-
-      try {
-        const review = await reviewRun({
-          runDir,
-          backend,
-          model: cfg.review.model,
-          batchMode: cfg.review.batch_mode,
-          logger: logger.child({ tool: 'review' }),
-          events,
-          appModel,
-          ...(verifySession
-            ? {
-                verify: {
-                  context: verifySession.context,
-                  rootUrl: cfg.target.url,
-                  allowedHosts: cfg.target.allowed_hosts,
-                  model: cfg.review.verify_model ?? cfg.review.model,
-                  concurrency: cfg.review.verify_concurrency,
-                  verifyOnlyUncertain: cfg.review.verify_only_uncertain,
-                },
-              }
-            : {}),
-        });
-        await writeReviewArtefacts(runDir, review);
-        reviewClassifications = review.reviews.map(({ finding, review: r }) => ({
-          title: finding.title,
-          route: finding.route,
-          classification: r.classification,
-          reasoning: r.reasoning,
-        }));
-        reviewSummary = {
-          confirmedBug: review.counts.confirmed_bug,
-          likelyBug: review.counts.likely_bug,
-          duplicate: review.counts.duplicate,
-          environmental: review.counts.environmental,
-          notABug: review.counts.not_a_bug,
-          themes: review.clusters.length,
-          reviewCostUsd: review.reviewCostUsd,
-          verifyCostUsd: review.verifyCostUsd,
-        };
-      } catch (err) {
-        logger.error('review.crashed', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      } finally {
-        if (verifySession) {
-          try {
-            await verifySession.release();
-          } catch (err) {
-            logger.warn('verify.session.release.failed', {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-      }
-    }
-
-    // 15. Run-level budget warning (informational only — can't enforce mid-run).
-    if (totalCostUsd > cfg.run.max_budget_usd) {
-      logger.warn('run.budget.exceeded', {
-        totalCostUsd: totalCostUsd.toFixed(4),
-        maxBudgetUsd: cfg.run.max_budget_usd,
-        message:
-          'Run exceeded the configured max_budget_usd. Consider reducing agent budgets or agent count.',
-      });
-    }
-
-    // Add review + verify cost to the total now that the review phase is done.
-    const reviewCost = reviewSummary?.reviewCostUsd ?? 0;
-    const verifyCost = reviewSummary?.verifyCostUsd ?? 0;
-    const finalTotalCostUsd = totalCostUsd + reviewCost + verifyCost;
-    aggregateCostUsd = finalTotalCostUsd;
-
-    // Re-write the manifest with the final cost that includes review + verify.
-    const finalManifest: RunManifest = {
-      ...manifest,
-      totalCostUsd: finalTotalCostUsd,
-    };
-    await writeRunManifest(runDir, finalManifest);
-
-    logger.info('run.complete', {
+    // 8. Execute agents.
+    const execResult = await executeAgents({
       runId,
       runDir,
-      totalFindings: allFindings.length,
-      totalCostUsd: finalTotalCostUsd.toFixed(4),
-      agentCount: journeys.length,
-      review: reviewSummary,
+      cfg,
+      backend,
+      siteMap,
+      skillsBundle,
+      agents,
+      securityQueue: intel.securityQueue,
+      qaQueue: intel.qaQueue,
+      isAutoMode,
+      runCredentials,
+      sessionInfo: authResult.sessionInfo,
+      sitePlaybook: intel.sitePlaybook,
+      appModel: intel.appModel,
+      priorLearning: intel.priorLearning,
+      routeDiff: intel.routeDiff,
+      learningFpPatterns: intel.learningFpPatterns,
+      testPlan: intel.testPlan,
+      logger,
+      events,
+      abortController: runAbortController,
     });
+    selectorCache = execResult.selectorCache;
+    agentPhaseStarted = execResult.agentPhaseStarted;
+
+    // 9. Finalize: aggregate, persist, review.
+    const finalResult = await finalizeRun({
+      runId,
+      runDir,
+      cfg,
+      backend,
+      siteMap,
+      agents,
+      journeys: execResult.journeys,
+      authCostUsd: authResult.authCostUsd,
+      supervisorCostUsd: execResult.supervisorCostUsd,
+      appModelCostUsd: intel.appModelCostUsd,
+      appModel: intel.appModel,
+      logger,
+      events,
+    });
+
+    aggregateFindings = finalResult.findings;
+    aggregateCostUsd = finalResult.totalCostUsd;
+    reviewClassifications = finalResult.reviewClassifications;
+    Object.assign(aggregateTerminationReasons, finalResult.terminationReasons);
 
     return {
       runId,
       runDir,
-      journeys,
-      findings: allFindings,
-      totalCostUsd: finalTotalCostUsd,
+      journeys: execResult.journeys,
+      findings: finalResult.findings,
+      totalCostUsd: finalResult.totalCostUsd,
       siteMap: siteMap.serialize(),
     };
   } finally {
-    // Emit run.end and close the writer. Best-effort — a failure here must not
-    // mask the run result. Runs that throw mid-execution still get a terminal
-    // event with whatever was accumulated before the throw.
-    try {
-      await events.write({
-        type: 'run.end',
-        totalCostUsd: aggregateCostUsd,
-        terminationReasons: aggregateTerminationReasons,
-        totalFindings: aggregateFindings.length,
-      });
-      await events.close();
-    } catch (err) {
-      logger.error('events.close.failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    process.removeListener('unhandledRejection', onUnhandledRejection);
-
-    if (selectorCache) {
-      try {
-        await selectorCache.close();
-      } catch (err) {
-        logger.error('selector-cache.close.failed', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    // Only persist learning state when the run reached the agent phase AND
-    // at least one agent was spawned. Without the agentPhaseStarted guard, a
-    // crash between sitemap init and agent spawn would save with
-    // aggregateFindings=[] and flip all prior known findings to 'fixed',
-    // corrupting the cross-run state.
-    if (siteMap && agentPhaseStarted) {
-      try {
-        const updatedLearning: LearningState = {
-          targetUrl: cfg.target.url,
-          lastUpdated: new Date().toISOString(),
-          appModel,
-          knownFindings: updateKnownFindings(
-            priorLearning?.knownFindings ?? [],
-            aggregateFindings,
-            runId,
-          ),
-          falsePositivePatterns: deduplicateFpPatterns([
-            ...(priorLearning?.falsePositivePatterns ?? []),
-            ...extractFalsePositivePatterns(reviewClassifications),
-          ]),
-          routeSnapshots: buildRouteSnapshots(siteMap.serialize()),
-        };
-        await saveLearningState(cfg.target.url, updatedLearning, learningLogger);
-      } catch {
-        // Best-effort — don't mask the real result.
-      }
-    }
+    await cleanupRun({
+      runId,
+      targetUrl: cfg.target.url,
+      events,
+      logger,
+      aggregateFindings,
+      aggregateCostUsd,
+      aggregateTerminationReasons,
+      selectorCache,
+      siteMap: siteMapForCleanup,
+      agentPhaseStarted,
+      appModel,
+      priorLearning,
+      reviewClassifications,
+      removeUnhandledRejectionListener,
+    });
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
   }
-}
-
-/** Read the run's events.jsonl and reconstruct PlaybookOutcomeRecords from
- *  every `playbook.outcome` event. Source of truth for "which playbooks did
- *  the agents actually execute?" — used by the coverage builder. */
-async function collectEventStats(eventsPath: string): Promise<{
-  playbookOutcomes: PlaybookOutcomeRecord[];
-  primitiveActivity: Array<{
-    agentId: string;
-    fillForm: number;
-    click: number;
-    type: number;
-    navigate: number;
-    reportFinding: number;
-  }>;
-}> {
-  let raw: string;
-  try {
-    raw = await readFile(eventsPath, 'utf8');
-  } catch {
-    return { playbookOutcomes: [], primitiveActivity: [] };
-  }
-  const playbookOutcomes: PlaybookOutcomeRecord[] = [];
-  const toolMap = new Map<
-    string,
-    { fillForm: number; click: number; type: number; navigate: number; reportFinding: number }
-  >();
-  function bucket(agentId: string) {
-    let b = toolMap.get(agentId);
-    if (!b) {
-      b = { fillForm: 0, click: 0, type: 0, navigate: 0, reportFinding: 0 };
-      toolMap.set(agentId, b);
-    }
-    return b;
-  }
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    let e: Record<string, unknown>;
-    try {
-      e = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (e.type === 'playbook.outcome') {
-      const status = e.status as string;
-      if (status === 'ok' || status === 'failed' || status === 'suspicious') {
-        playbookOutcomes.push({
-          agentId: String(e.agentId ?? ''),
-          playbookName: String(e.playbookName ?? ''),
-          route: typeof e.route === 'string' ? e.route : '',
-          targetId: typeof e.targetId === 'string' ? e.targetId : null,
-          status,
-        });
-      }
-    } else if (e.type === 'tool.call') {
-      const agentId = String(e.agentId ?? '');
-      if (!agentId) continue;
-      const name = String(e.name ?? '');
-      if (name === 'fill_form') bucket(agentId).fillForm += 1;
-      else if (name === 'click' || name === 'find_and_click') bucket(agentId).click += 1;
-      else if (name === 'type') bucket(agentId).type += 1;
-      else if (name === 'navigate') bucket(agentId).navigate += 1;
-      else if (name === 'report_finding' || name === 'mcp__harness__report_finding')
-        bucket(agentId).reportFinding += 1;
-    }
-  }
-  const primitiveActivity = Array.from(toolMap.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([agentId, counts]) => ({ agentId, ...counts }));
-  return { playbookOutcomes, primitiveActivity };
 }

@@ -5,11 +5,10 @@ export const AgentIdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/);
 export type AgentId = z.infer<typeof AgentIdSchema>;
 
 // Model options
-export const ModelSchema = z.enum([
-  'claude-opus-4-7',
-  'claude-sonnet-4-6',
-  'claude-haiku-4-5-20251001',
-]);
+export const ModelSchema = z.string().min(1).refine(
+  (s) => s.startsWith('claude-'),
+  { message: 'Model must start with "claude-"' },
+);
 export type Model = z.infer<typeof ModelSchema>;
 
 // Budget constraints for an agent
@@ -42,6 +41,17 @@ const FORBIDDEN_ENV_PREFIXES = [
   'SLACK_',
   'LINEAR_',
   'STRIPE_',
+  'SENDGRID_',
+  'TWILIO_',
+  'MAILGUN_',
+  'DATADOG_',
+  'SENTRY_',
+  'DATABASE_',
+  'DB_',
+  'MONGO_',
+  'POSTGRES_',
+  'PG_',
+  'REDIS_',
 ] as const;
 
 function validateCredentialEnvName(name: string, field: string): true | string {
@@ -129,7 +139,20 @@ export const AuthConfigSchema = z
     password_selector: z.string().default(DEFAULT_PASSWORD_SELECTOR),
     submit_selector: z.string().default(DEFAULT_SUBMIT_SELECTOR),
     // Optional regex applied to page.url() after submit to confirm success
-    success_url_pattern: z.string().optional(),
+    success_url_pattern: z
+      .string()
+      .refine(
+        (s) => {
+          try {
+            new RegExp(s);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { message: 'success_url_pattern must be a valid regular expression' },
+      )
+      .optional(),
     // Optional selector to wait for after submit (visible = success)
     wait_for_selector: z.string().optional(),
     // Pre-built storage state file (only used with type='none' — e.g. for SSO portals)
@@ -170,6 +193,9 @@ export const TargetConfigSchema = z
      *  Recommended for portals behind Cloudflare/Akamai/PerimeterX bot-detection.
      *  First use auto-downloads ~200 MB binary. Default: false. */
     stealth: z.boolean().default(false),
+    /** Maximum requests per second across all agents against each target host.
+     *  Prevents overwhelming staging environments. 0 = unlimited. Default: 10. */
+    max_rps: z.number().int().min(0).default(10),
   })
   .superRefine((t, ctx) => {
     // target.url's host must be in allowed_hosts.
@@ -232,8 +258,15 @@ export const RunConfigSchema = z
     max_budget_usd: z.number().positive().default(20),
     // Directory where run outputs are written — MUST resolve within cwd
     output_dir: z.string().default('./runs'),
+    // Optional webhook URL for sending confirmed findings to external systems
+    // (Jira, Linear, GitHub Issues, generic endpoint). POSTed as JSON.
+    webhook_url: z.string().url().optional(),
+    // Minimum severity for webhook delivery. Default: major.
+    webhook_min_severity: z.enum(['critical', 'major', 'minor', 'cosmetic']).default('major'),
+    // Optional extra headers for webhook requests (e.g. auth tokens)
+    webhook_headers: z.record(z.string(), z.string()).optional(),
   })
-  .default({ max_budget_usd: 20, output_dir: './runs' });
+  .default({ max_budget_usd: 20, output_dir: './runs', webhook_min_severity: 'major' });
 export type RunConfig = z.infer<typeof RunConfigSchema>;
 
 // Supervisor (the "grown-up") configuration. A 6th concurrent agent that
@@ -304,9 +337,9 @@ export type ReviewConfig = z.infer<typeof ReviewConfigSchema>;
 export const MemoryConfigSchema = z
   .object({
     /** When true, agents have a persistent Memory tool that survives across runs.
-     *  Storage: <homedir>/.regress-harness/memory/<targetUrlHash>/. Default: true. */
+     *  Storage: <homedir>/.lazy-qa/memory/<targetUrlHash>/. Default: true. */
     enabled: z.boolean().default(true),
-    /** Override the storage directory. Default: per-target path under ~/.regress-harness/memory/. */
+    /** Override the storage directory. Default: per-target path under ~/.lazy-qa/memory/. */
     path: z.string().optional(),
   })
   .default({ enabled: true });
@@ -316,7 +349,7 @@ export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 export const SelectorCacheConfigSchema = z
   .object({
     /** When true, find_and_click uses a persistent cache of resolved locators.
-     *  Cache file: ~/.regress-harness/cache/selectors/<targetHash>.json */
+     *  Cache file: ~/.lazy-qa/cache/selectors/<targetHash>.json */
     enabled: z.boolean().default(true),
   })
   .default({ enabled: true });

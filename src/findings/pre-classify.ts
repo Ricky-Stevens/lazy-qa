@@ -7,6 +7,7 @@
  */
 
 import type { ApplicationModel } from '../orchestrator/app-model.ts';
+import { SENSITIVE_PATHS } from '../safety/paths.ts';
 import type { Finding } from '../types/finding.ts';
 
 export type PreClassification = 'confirmed_bug' | 'not_a_bug' | 'needs_review';
@@ -26,16 +27,6 @@ export function preClassifyFinding(
   }
 
   // 3. Sensitive path returning 200 = confirmed exposure
-  const sensitivePaths = [
-    '/.git/HEAD',
-    '/.git/config',
-    '/.env',
-    '/server-status',
-    '/server-info',
-    '/.htaccess',
-    '/web.config',
-    '/WEB-INF/web.xml',
-  ];
   if (finding.httpStatus === 200 && finding.route) {
     let routePath: string | null = null;
     try {
@@ -43,7 +34,7 @@ export function preClassifyFinding(
     } catch {
       // Malformed route — skip sensitive-path check rather than crashing.
     }
-    if (routePath && sensitivePaths.some((p) => routePath!.endsWith(p) || routePath === p)) {
+    if (routePath && SENSITIVE_PATHS.some((p) => routePath!.endsWith(p) || routePath === p)) {
       return {
         classification: 'confirmed_bug',
         reason: `Sensitive path ${routePath} returned 200`,
@@ -56,17 +47,11 @@ export function preClassifyFinding(
     return { classification: 'not_a_bug', reason: 'Auth provider 400 is expected OAuth behavior' };
   }
 
-  // 5. Error-handling category with HTTP 200 and no console errors = suspicious
-  if (
-    finding.category === 'error-handling' &&
-    finding.httpStatus === 200 &&
-    (!finding.consoleErrors || finding.consoleErrors.length === 0)
-  ) {
-    return {
-      classification: 'not_a_bug',
-      reason: 'Claims error-handling issue but HTTP 200 and no console errors',
-    };
-  }
+  // 5. Error-handling category with HTTP 200 and no console errors — send to
+  // the LLM critic rather than auto-dismissing. Legitimate findings like
+  // "form silently swallows invalid input and shows success" are HTTP 200
+  // with no console errors but are real bugs.
+  // (Previously auto-classified as not_a_bug, which killed legitimate findings.)
 
   // 6. App model sort behavior check
   if (appModel?.sortBehavior && /server.side/i.test(appModel.sortBehavior)) {

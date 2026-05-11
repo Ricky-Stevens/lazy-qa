@@ -5,7 +5,7 @@
  * that `find_and_click` can skip its multi-strategy probe on subsequent runs
  * against the same target.
  *
- * Storage: ~/.regress-harness/cache/selectors/<sha1(targetUrl).slice(0,16)>.json
+ * Storage: ~/.lazy-qa/cache/selectors/<sha1(targetUrl).slice(0,16)>.json
  *
  * Atomic writes: content is written to a .tmp sibling then renamed. A
  * debounced 2-second timer gates routine saves; a final forced flush is
@@ -30,6 +30,7 @@ export interface SelectorCacheEntry {
   locator: string;
   hits: number;
   lastHitAt: string; // ISO
+  resolvedAt?: string; // ISO — when the locator was last resolved (for TTL)
   pageTextHash?: string; // optional invalidation hint
 }
 
@@ -53,7 +54,7 @@ export function resolveCachePath(targetUrl: string, override?: string): string {
     return path.resolve(override);
   }
   const hash = createHash('sha1').update(targetUrl).digest('hex').slice(0, 16);
-  return path.join(homedir(), '.regress-harness', 'cache', 'selectors', `${hash}.json`);
+  return path.join(homedir(), '.lazy-qa', 'cache', 'selectors', `${hash}.json`);
 }
 
 // ─── SelectorCache class ──────────────────────────────────────────────────────
@@ -103,7 +104,7 @@ export class SelectorCache {
   async save(): Promise<void> {
     if (!this.dirty) return;
     this.dirty = false;
-    const tmp = `${this.filepath}.tmp`;
+    const tmp = `${this.filepath}.tmp.${Date.now()}`;
     const content = JSON.stringify(this.file, null, 2);
     // Ensure the parent directory exists.
     await mkdir(path.dirname(this.filepath), { recursive: true });
@@ -146,11 +147,34 @@ export class SelectorCache {
   /**
    * Look up a cached locator. Records hit metadata if found and marks dirty.
    */
-  get(pathname: string, hint: string, role: string | undefined): string | null {
+  /**
+   * Look up a cached locator. Returns null if: no entry, entry is stale
+   * (older than TTL), or the page content has changed (textHash mismatch).
+   */
+  get(
+    pathname: string,
+    hint: string,
+    role: string | undefined,
+    currentPageTextHash?: string,
+  ): string | null {
     const key = buildCacheKey(pathname, hint, role);
     const entry = this.file.entries[key];
     if (!entry) return null;
-    // Record the hit.
+    // TTL check — entries resolved more than 24h ago are stale. Uses
+    // `resolvedAt` (set on write) rather than `lastHitAt` (updated on read),
+    // so frequently-accessed entries still expire.
+    const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+    const resolvedAt = entry.resolvedAt;
+    const ageRef = resolvedAt ?? entry.lastHitAt;
+    if (ageRef) {
+      const age = Date.now() - new Date(ageRef).getTime();
+      if (age > CACHE_TTL_MS) return null;
+    }
+    // Page content hash check — if the page has changed, the cached locator
+    // may be stale (element renamed, testid changed, DOM restructured).
+    if (currentPageTextHash && entry.pageTextHash && entry.pageTextHash !== currentPageTextHash) {
+      return null;
+    }
     entry.hits += 1;
     entry.lastHitAt = new Date().toISOString();
     this.dirty = true;
@@ -174,6 +198,7 @@ export class SelectorCache {
       locator,
       hits: existing ? existing.hits : 0,
       lastHitAt: existing ? existing.lastHitAt : new Date().toISOString(),
+      resolvedAt: new Date().toISOString(),
       ...(pageTextHash !== undefined ? { pageTextHash } : {}),
     };
     this.dirty = true;

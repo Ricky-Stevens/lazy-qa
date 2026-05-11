@@ -13,6 +13,7 @@ export const inputShape = {
   query: z.enum([
     'unvisited routes',
     'untested forms',
+    'unfuzzed forms',
     'unsorted tables',
     'unexercised modals',
     'unexercised wizards',
